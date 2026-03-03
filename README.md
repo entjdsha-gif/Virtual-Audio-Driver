@@ -140,6 +140,19 @@ By installing these drivers, you can process or forward audio without physical h
 - **New Modes & Additional Formats**: Continued expansion of supported audio qualities.  
 - **Additional Features**: Such as Automatic Volume Leveling (AVL), further spatial audio improvements, and custom routing tools.
 
+---
+
+## Attribution
+
+This project is built with the Microsoft Windows Driver Kit (WDK) and includes code derived from Microsoft Windows Driver Samples (notably the Sysvad / "Simple Audio Sample" audio driver).
+
+- **Windows Driver Kit (WDK)**: https://learn.microsoft.com/en-us/windows-hardware/drivers/download-the-wdk  
+- **Windows Driver Samples (Sysvad)**: https://github.com/microsoft/Windows-driver-samples/tree/main/audio/sysvad  
+
+Original code in this repository is provided under the MIT License (see `LICENSE`). Third-party Microsoft sample code is provided under the Microsoft Public License (MS-PL); see `THIRD_PARTY_NOTICES.md` for the full license text and details.
+
+Microsoft, Windows, and Windows Driver Kit are trademarks of Microsoft Corporation.
+
 > This project is maintained and actively improved. We welcome contributions, suggestions, and issue reports!
 
 ---
