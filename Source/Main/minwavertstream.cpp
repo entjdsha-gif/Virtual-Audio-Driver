@@ -4,6 +4,7 @@
 #include "endpoints.h"
 #include "minwavert.h"
 #include "minwavertstream.h"
+#include "loopback.h"
 #define MINWAVERTSTREAM_POOLTAG 'SRWM'
 
 #pragma warning (disable : 4127)
@@ -1330,6 +1331,9 @@ VOID CMiniportWaveRTStream::UpdatePosition
     // Increment presentation position even after last buffer is rendered.
     m_ullPresentationPosition += ByteDisplacement;
 
+    DbgPrint("AO_DBG UpdatePosition: Capture=%d, ByteDisp=%lu, TimeElapsedMS=%lu\n",
+        (int)m_bCapture, ByteDisplacement, TimeElapsedInMS);
+
     if (m_bCapture)
     {
         // Write sine wave to buffer.
@@ -1364,10 +1368,16 @@ VOID CMiniportWaveRTStream::UpdatePosition
             m_bLastBufferRendered = TRUE;
         }
 
-        if (!g_DoNotCreateDataFiles)
         {
-            // Read from buffer and write to a file.
-            ReadBytes(ByteDisplacement);
+            // Cable A/B always calls ReadBytes for loopback.
+            // Non-cable devices only call ReadBytes when saving to file.
+            CMiniportWaveRT* pMp = m_pMiniport;
+            BOOL isCable = (pMp && (pMp->m_DeviceType == eCableASpeaker ||
+                                     pMp->m_DeviceType == eCableBSpeaker));
+            if (isCable || !g_DoNotCreateDataFiles)
+            {
+                ReadBytes(ByteDisplacement);
+            }
         }
     }
     
@@ -1397,25 +1407,46 @@ VOID CMiniportWaveRTStream::WriteBytes
 
 Routine Description:
 
-This function writes the audio buffer using silence instead of a tone generator
-
-Arguments:
-
-ByteDisplacement - # of bytes to process.
+WriteBytes is called by CAPTURE devices (writes data INTO DMA for app to read).
+For Cable A/B mic: pull from loopback ring buffer into DMA buffer.
+For other devices: output silence (original behavior).
 
 --*/
 {
     ULONG bufferOffset = m_ullLinearPosition % m_ulDmaBufferSize;
 
-    // Normally this will loop no more than once for a single wrap, but if
-    // many bytes have been displaced then this may loops many times.
+    // WriteBytes = capture device. Cable MIC reads from loopback ring.
+    PLOOPBACK_BUFFER pLoopback = NULL;
+    CMiniportWaveRT* pMiniport = m_pMiniport;
+    eDeviceType devType = eMaxDeviceType;
+    if (pMiniport)
+    {
+        devType = pMiniport->m_DeviceType;
+        if (devType == eCableAMic)
+            pLoopback = &g_CableALoopback;
+        else if (devType == eCableBMic)
+            pLoopback = &g_CableBLoopback;
+    }
+
+    DbgPrint("AO_DBG WriteBytes: DeviceType=%d, ByteDisp=%lu, pLoopback=%p, DataCount=%lu\n",
+        (int)devType, ByteDisplacement, pLoopback,
+        pLoopback ? pLoopback->DataCount : 0);
+
     while (ByteDisplacement > 0)
     {
         ULONG runWrite = min(ByteDisplacement, m_ulDmaBufferSize - bufferOffset);
-        
-        // Instead of generating a tone, just output silence
-        RtlZeroMemory(m_pDmaBuffer + bufferOffset, runWrite);
-           	
+
+        if (pLoopback)
+        {
+            // Cable mic: pull audio from loopback ring into DMA
+            LoopbackRead(pLoopback, m_pDmaBuffer + bufferOffset, runWrite);
+        }
+        else
+        {
+            // Default: silence
+            RtlZeroMemory(m_pDmaBuffer + bufferOffset, runWrite);
+        }
+
         bufferOffset = (bufferOffset + runWrite) % m_ulDmaBufferSize;
         ByteDisplacement -= runWrite;
     }
@@ -1431,22 +1462,45 @@ VOID CMiniportWaveRTStream::ReadBytes
 
 Routine Description:
 
-This function reads the audio buffer and saves the data in a file.
-
-Arguments:
-
-ByteDisplacement - # of bytes to process.
+ReadBytes is called by RENDER devices (reads app data FROM DMA buffer).
+For Cable A/B speaker: push app audio into loopback ring buffer.
+For other devices: save data to file (original behavior).
 
 --*/
 {
     ULONG bufferOffset = m_ullLinearPosition % m_ulDmaBufferSize;
 
-    // Normally this will loop no more than once for a single wrap, but if
-    // many bytes have been displaced then this may loops many times.
+    // ReadBytes = render device. Cable SPEAKER writes to loopback ring.
+    PLOOPBACK_BUFFER pLoopback = NULL;
+    CMiniportWaveRT* pMiniport = m_pMiniport;
+    eDeviceType devType = eMaxDeviceType;
+    if (pMiniport)
+    {
+        devType = pMiniport->m_DeviceType;
+        if (devType == eCableASpeaker)
+            pLoopback = &g_CableALoopback;
+        else if (devType == eCableBSpeaker)
+            pLoopback = &g_CableBLoopback;
+    }
+
+    DbgPrint("AO_DBG ReadBytes: DeviceType=%d, ByteDisp=%lu, pLoopback=%p\n",
+        (int)devType, ByteDisplacement, pLoopback);
+
     while (ByteDisplacement > 0)
     {
         ULONG runWrite = min(ByteDisplacement, m_ulDmaBufferSize - bufferOffset);
-        m_SaveData.WriteData(m_pDmaBuffer + bufferOffset, runWrite);
+
+        if (pLoopback)
+        {
+            // Cable speaker: push app audio into loopback ring buffer
+            LoopbackWrite(pLoopback, m_pDmaBuffer + bufferOffset, runWrite);
+        }
+        else
+        {
+            // Default: save to file
+            m_SaveData.WriteData(m_pDmaBuffer + bufferOffset, runWrite);
+        }
+
         bufferOffset = (bufferOffset + runWrite) % m_ulDmaBufferSize;
         ByteDisplacement -= runWrite;
     }

@@ -207,4 +207,151 @@ PCFILTER_DESCRIPTOR MicArray1TopoMiniportFilterDescriptor =
   NULL                                          // Categories
 };
 
+//=============================================================================
+//
+// Cable A Mic - unique topology so Windows Endpoint Builder creates a
+// separate WASAPI capture endpoint (distinct pin-Name GUID).
+//
+//=============================================================================
+
+// {A1B2C3D4-1111-4000-8000-AABBCCDDEEF1}
+DEFINE_GUID(CABLEA_MIC_CUSTOM_NAME,
+    0xa1b2c3d4, 0x1111, 0x4000, 0x80, 0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xf1);
+
+static
+PCPIN_DESCRIPTOR CableAMicTopoMiniportPins[] =
+{
+    // KSPIN_TOPO_MIC_ELEMENTS
+    {
+      0,
+      0,
+      0,                                              // InstanceCount
+      NULL,                                           // AutomationTable
+      {                                               // KsPinDescriptor
+        0,                                            // InterfacesCount
+        NULL,                                         // Interfaces
+        0,                                            // MediumsCount
+        NULL,                                         // Mediums
+        SIZEOF_ARRAY(MicArray1TopoPinDataRangePointersBridge),
+        MicArray1TopoPinDataRangePointersBridge,
+        KSPIN_DATAFLOW_IN,                            // DataFlow
+        KSPIN_COMMUNICATION_NONE,                     // Communication
+        &KSNODETYPE_MICROPHONE_ARRAY,                 // Category
+        NULL,                                         // Name (NULL = use INF FriendlyName)
+        0                                             // Reserved
+      }
+    },
+
+    // KSPIN_TOPO_BRIDGE
+    {
+      0,
+      0,
+      0,                                              // InstanceCount
+      NULL,                                           // AutomationTable
+      {                                               // KsPinDescriptor
+        0,                                            // InterfacesCount
+        NULL,                                         // Interfaces
+        0,                                            // MediumsCount
+        NULL,                                         // Mediums
+        SIZEOF_ARRAY(MicArray1TopoPinDataRangePointersBridge),
+        MicArray1TopoPinDataRangePointersBridge,
+        KSPIN_DATAFLOW_OUT,                           // DataFlow
+        KSPIN_COMMUNICATION_NONE,                     // Communication
+        &KSCATEGORY_AUDIO,                            // Category
+        NULL,                                         // Name
+        0                                             // Reserved
+      }
+    }
+};
+
+static
+PCFILTER_DESCRIPTOR CableAMicTopoMiniportFilterDescriptor =
+{
+  0,                                            // Version
+  &AutomationMicArray1TopoFilter,               // AutomationTable (reuse)
+  sizeof(PCPIN_DESCRIPTOR),                     // PinSize
+  SIZEOF_ARRAY(CableAMicTopoMiniportPins),      // PinCount
+  CableAMicTopoMiniportPins,                    // Pins - unique
+  sizeof(PCNODE_DESCRIPTOR),                    // NodeSize
+  SIZEOF_ARRAY(MicArray1TopologyNodes),         // NodeCount
+  MicArray1TopologyNodes,                       // Nodes (reuse)
+  SIZEOF_ARRAY(MicArray1TopoMiniportConnections),// ConnectionCount
+  MicArray1TopoMiniportConnections,             // Connections (reuse)
+  0,                                            // CategoryCount
+  NULL                                          // Categories
+};
+
+//=============================================================================
+//
+// Cable B Mic - same idea, different GUID.
+//
+//=============================================================================
+
+// {A1B2C3D4-2222-4000-8000-AABBCCDDEEF2}
+DEFINE_GUID(CABLEB_MIC_CUSTOM_NAME,
+    0xa1b2c3d4, 0x2222, 0x4000, 0x80, 0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xf2);
+
+static
+PCPIN_DESCRIPTOR CableBMicTopoMiniportPins[] =
+{
+    // KSPIN_TOPO_MIC_ELEMENTS
+    {
+      0,
+      0,
+      0,                                              // InstanceCount
+      NULL,                                           // AutomationTable
+      {                                               // KsPinDescriptor
+        0,                                            // InterfacesCount
+        NULL,                                         // Interfaces
+        0,                                            // MediumsCount
+        NULL,                                         // Mediums
+        SIZEOF_ARRAY(MicArray1TopoPinDataRangePointersBridge),
+        MicArray1TopoPinDataRangePointersBridge,
+        KSPIN_DATAFLOW_IN,                            // DataFlow
+        KSPIN_COMMUNICATION_NONE,                     // Communication
+        &KSNODETYPE_MICROPHONE_ARRAY,                 // Category
+        NULL,                                         // Name (NULL = use INF FriendlyName)
+        0                                             // Reserved
+      }
+    },
+
+    // KSPIN_TOPO_BRIDGE
+    {
+      0,
+      0,
+      0,                                              // InstanceCount
+      NULL,                                           // AutomationTable
+      {                                               // KsPinDescriptor
+        0,                                            // InterfacesCount
+        NULL,                                         // Interfaces
+        0,                                            // MediumsCount
+        NULL,                                         // Mediums
+        SIZEOF_ARRAY(MicArray1TopoPinDataRangePointersBridge),
+        MicArray1TopoPinDataRangePointersBridge,
+        KSPIN_DATAFLOW_OUT,                           // DataFlow
+        KSPIN_COMMUNICATION_NONE,                     // Communication
+        &KSCATEGORY_AUDIO,                            // Category
+        NULL,                                         // Name
+        0                                             // Reserved
+      }
+    }
+};
+
+static
+PCFILTER_DESCRIPTOR CableBMicTopoMiniportFilterDescriptor =
+{
+  0,                                            // Version
+  &AutomationMicArray1TopoFilter,               // AutomationTable (reuse)
+  sizeof(PCPIN_DESCRIPTOR),                     // PinSize
+  SIZEOF_ARRAY(CableBMicTopoMiniportPins),      // PinCount
+  CableBMicTopoMiniportPins,                    // Pins - unique
+  sizeof(PCNODE_DESCRIPTOR),                    // NodeSize
+  SIZEOF_ARRAY(MicArray1TopologyNodes),         // NodeCount
+  MicArray1TopologyNodes,                       // Nodes (reuse)
+  SIZEOF_ARRAY(MicArray1TopoMiniportConnections),// ConnectionCount
+  MicArray1TopoMiniportConnections,             // Connections (reuse)
+  0,                                            // CategoryCount
+  NULL                                          // Categories
+};
+
 #endif // _VIRTUALAUDIODRIVER_MICARRAY1TOPTABLE_H_

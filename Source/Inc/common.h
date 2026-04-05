@@ -124,6 +124,10 @@ typedef enum
 {
     eSpeakerDevice = 0,
     eMicArrayDevice1,
+    eCableASpeaker,
+    eCableAMic,
+    eCableBSpeaker,
+    eCableBMic,
     eMaxDeviceType,
 } eDeviceType;
 

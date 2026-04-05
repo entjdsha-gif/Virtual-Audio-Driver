@@ -228,7 +228,9 @@ protected:
 #pragma code_seg()
     BOOL IsRenderDevice()
     {
-        return m_DeviceType == eSpeakerDevice ? TRUE : FALSE;
+        return (m_DeviceType == eSpeakerDevice ||
+                m_DeviceType == eCableASpeaker ||
+                m_DeviceType == eCableBSpeaker) ? TRUE : FALSE;
     }
 
     BOOL IsSystemRenderPin(ULONG nPinId);

@@ -203,4 +203,124 @@ PCFILTER_DESCRIPTOR SpeakerTopoMiniportFilterDescriptor =
   NULL                                          // Categories
 };
 
+//=============================================================================
+//
+// Cable A Speaker - unique topology (separate WASAPI render endpoint)
+//
+//=============================================================================
+
+// {B2C3D4E5-3333-4000-8000-AABBCCDDEEF3}
+DEFINE_GUID(CABLEA_SPEAKER_CUSTOM_NAME,
+    0xb2c3d4e5, 0x3333, 0x4000, 0x80, 0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xf3);
+
+static
+PCPIN_DESCRIPTOR CableASpeakerTopoMiniportPins[] =
+{
+  // KSPIN_TOPO_WAVEOUT_SOURCE
+  {
+    0, 0, 0, NULL,
+    {
+      0, NULL, 0, NULL,
+      SIZEOF_ARRAY(SpeakerTopoPinDataRangePointersBridge),
+      SpeakerTopoPinDataRangePointersBridge,
+      KSPIN_DATAFLOW_IN,
+      KSPIN_COMMUNICATION_NONE,
+      &KSCATEGORY_AUDIO,
+      NULL,                               // Name (NULL = use INF FriendlyName)
+      0
+    }
+  },
+  // KSPIN_TOPO_LINEOUT_DEST
+  {
+    0, 0, 0, NULL,
+    {
+      0, NULL, 0, NULL,
+      SIZEOF_ARRAY(SpeakerTopoPinDataRangePointersBridge),
+      SpeakerTopoPinDataRangePointersBridge,
+      KSPIN_DATAFLOW_OUT,
+      KSPIN_COMMUNICATION_NONE,
+      &KSNODETYPE_SPEAKER,
+      NULL,
+      0
+    }
+  }
+};
+
+static
+PCFILTER_DESCRIPTOR CableASpeakerTopoMiniportFilterDescriptor =
+{
+  0,
+  &AutomationSpeakerTopoFilter,                // reuse automation
+  sizeof(PCPIN_DESCRIPTOR),
+  SIZEOF_ARRAY(CableASpeakerTopoMiniportPins),
+  CableASpeakerTopoMiniportPins,                // unique pins
+  sizeof(PCNODE_DESCRIPTOR),
+  SIZEOF_ARRAY(SpeakerTopologyNodes),
+  SpeakerTopologyNodes,                         // reuse nodes
+  SIZEOF_ARRAY(SpeakerTopoMiniportConnections),
+  SpeakerTopoMiniportConnections,               // reuse connections
+  0,
+  NULL
+};
+
+//=============================================================================
+//
+// Cable B Speaker - unique topology
+//
+//=============================================================================
+
+// {B2C3D4E5-4444-4000-8000-AABBCCDDEEF4}
+DEFINE_GUID(CABLEB_SPEAKER_CUSTOM_NAME,
+    0xb2c3d4e5, 0x4444, 0x4000, 0x80, 0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xf4);
+
+static
+PCPIN_DESCRIPTOR CableBSpeakerTopoMiniportPins[] =
+{
+  // KSPIN_TOPO_WAVEOUT_SOURCE
+  {
+    0, 0, 0, NULL,
+    {
+      0, NULL, 0, NULL,
+      SIZEOF_ARRAY(SpeakerTopoPinDataRangePointersBridge),
+      SpeakerTopoPinDataRangePointersBridge,
+      KSPIN_DATAFLOW_IN,
+      KSPIN_COMMUNICATION_NONE,
+      &KSCATEGORY_AUDIO,
+      NULL,                               // Name (NULL = use INF FriendlyName)
+      0
+    }
+  },
+  // KSPIN_TOPO_LINEOUT_DEST
+  {
+    0, 0, 0, NULL,
+    {
+      0, NULL, 0, NULL,
+      SIZEOF_ARRAY(SpeakerTopoPinDataRangePointersBridge),
+      SpeakerTopoPinDataRangePointersBridge,
+      KSPIN_DATAFLOW_OUT,
+      KSPIN_COMMUNICATION_NONE,
+      &KSNODETYPE_SPEAKER,
+      NULL,
+      0
+    }
+  }
+};
+
+static
+PCFILTER_DESCRIPTOR CableBSpeakerTopoMiniportFilterDescriptor =
+{
+  0,
+  &AutomationSpeakerTopoFilter,
+  sizeof(PCPIN_DESCRIPTOR),
+  SIZEOF_ARRAY(CableBSpeakerTopoMiniportPins),
+  CableBSpeakerTopoMiniportPins,                // unique pins
+  sizeof(PCNODE_DESCRIPTOR),
+  SIZEOF_ARRAY(SpeakerTopologyNodes),
+  SpeakerTopologyNodes,
+  SIZEOF_ARRAY(SpeakerTopoMiniportConnections),
+  SpeakerTopoMiniportConnections,
+  0,
+  NULL
+};
+
 #endif // _VIRTUALAUDIODRIVER_SPEAKERTOPTABLE_H_

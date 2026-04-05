@@ -22,6 +22,7 @@ Abstract:
 #include "definitions.h"
 #include "endpoints.h"
 #include "minipairs.h"
+#include "loopback.h"
 
 typedef void (*fnPcDriverUnload) (PDRIVER_OBJECT);
 fnPcDriverUnload gPCDriverUnloadRoutine = NULL;
@@ -119,6 +120,13 @@ Environment:
     {
         WdfDriverMiniportUnload(WdfGetDriver());
     }
+
+    //
+    // Cleanup loopback buffers.
+    //
+    LoopbackCleanup(&g_CableALoopback);
+    LoopbackCleanup(&g_CableBLoopback);
+
 Done:
     return;
 }
@@ -347,14 +355,32 @@ Return Value:
     DriverObject->DriverUnload = DriverUnload;
 
     //
+    // Initialize loopback buffers for Cable A and Cable B.
+    //
+    ntStatus = LoopbackInit(&g_CableALoopback);
+    IF_FAILED_ACTION_JUMP(
+        ntStatus,
+        DPF(D_ERROR, ("LoopbackInit CableA failed, 0x%x", ntStatus)),
+        Done);
+
+    ntStatus = LoopbackInit(&g_CableBLoopback);
+    IF_FAILED_ACTION_JUMP(
+        ntStatus,
+        DPF(D_ERROR, ("LoopbackInit CableB failed, 0x%x", ntStatus)),
+        Done);
+
+    //
     // All done.
     //
     ntStatus = STATUS_SUCCESS;
-    
+
 Done:
 
     if (!NT_SUCCESS(ntStatus))
     {
+        LoopbackCleanup(&g_CableALoopback);
+        LoopbackCleanup(&g_CableBLoopback);
+
         if (WdfGetDriver() != NULL)
         {
             WdfDriverMiniportUnload(WdfGetDriver());
@@ -362,7 +388,7 @@ Done:
 
         ReleaseRegistryStringBuffer();
     }
-    
+
     return ntStatus;
 } // DriverEntry
 
@@ -740,16 +766,52 @@ Return Value:
     IF_FAILED_JUMP(ntStatus, Exit);
 
     //
-    // Install wave+topology filters for render devices
+    // Determine which endpoints to install based on hardware ID.
+    // ROOT\AOCableA  -> Cable A only
+    // ROOT\AOCableB  -> Cable B only
+    // ROOT\AOVirtualAudio (or legacy ROOT\VirtualAudioDriver) -> Speaker + Mic
     //
-    ntStatus = InstallAllRenderFilters(DeviceObject, Irp, pAdapterCommon);
-    IF_FAILED_JUMP(ntStatus, Exit);
+    {
+        PDEVICE_OBJECT pdo = NULL;
+        ntStatus = PcGetPhysicalDeviceObject(DeviceObject, &pdo);
+        IF_FAILED_JUMP(ntStatus, Exit);
 
-    //
-    // Install wave+topology filters for capture devices
-    //
-    ntStatus = InstallAllCaptureFilters(DeviceObject, Irp, pAdapterCommon);
-    IF_FAILED_JUMP(ntStatus, Exit);
+        WCHAR hardwareId[256] = {0};
+        ULONG resultLen = 0;
+        ntStatus = IoGetDeviceProperty(
+            pdo,
+            DevicePropertyHardwareID,
+            sizeof(hardwareId),
+            hardwareId,
+            &resultLen);
+        IF_FAILED_JUMP(ntStatus, Exit);
+
+        if (wcsstr(hardwareId, L"AOCableA") != NULL)
+        {
+            DPF(D_TERSE, ("[StartDevice] Hardware ID: AOCableA"));
+            ntStatus = InstallEndpointRenderFilters(DeviceObject, Irp, pAdapterCommon, &CableASpeakerMiniports);
+            IF_FAILED_JUMP(ntStatus, Exit);
+            ntStatus = InstallEndpointCaptureFilters(DeviceObject, Irp, pAdapterCommon, &CableAMicMiniports);
+            IF_FAILED_JUMP(ntStatus, Exit);
+        }
+        else if (wcsstr(hardwareId, L"AOCableB") != NULL)
+        {
+            DPF(D_TERSE, ("[StartDevice] Hardware ID: AOCableB"));
+            ntStatus = InstallEndpointRenderFilters(DeviceObject, Irp, pAdapterCommon, &CableBSpeakerMiniports);
+            IF_FAILED_JUMP(ntStatus, Exit);
+            ntStatus = InstallEndpointCaptureFilters(DeviceObject, Irp, pAdapterCommon, &CableBMicMiniports);
+            IF_FAILED_JUMP(ntStatus, Exit);
+        }
+        else
+        {
+            // AOVirtualAudio or legacy VirtualAudioDriver - install Speaker + Mic
+            DPF(D_TERSE, ("[StartDevice] Hardware ID: AOVirtualAudio (default)"));
+            ntStatus = InstallEndpointRenderFilters(DeviceObject, Irp, pAdapterCommon, &SpeakerMiniports);
+            IF_FAILED_JUMP(ntStatus, Exit);
+            ntStatus = InstallEndpointCaptureFilters(DeviceObject, Irp, pAdapterCommon, &MicArray1Miniports);
+            IF_FAILED_JUMP(ntStatus, Exit);
+        }
+    }
 
 Exit:
 
