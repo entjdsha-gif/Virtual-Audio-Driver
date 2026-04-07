@@ -461,30 +461,40 @@ ENDPOINT_MINIPAIR CableBMicMiniports =
 
 //=============================================================================
 //
-// Render miniport pairs. NOTE: the split of render and capture is arbitrary and
-// unnessary, this array could contain capture endpoints.
+// Render miniport pairs.
 //
 static
 PENDPOINT_MINIPAIR  g_RenderEndpoints[] =
 {
+#if defined(CABLE_A)
+    &CableASpeakerMiniports,
+#elif defined(CABLE_B)
+    &CableBSpeakerMiniports,
+#else
     &SpeakerMiniports,
-    &CableASpeakerMiniports,       // Cable A  Phone Link 
-    &CableBSpeakerMiniports,       // Cable B  AI 
+    &CableASpeakerMiniports,       // Cable A  Phone Link
+    &CableBSpeakerMiniports,       // Cable B  AI
+#endif
 };
 
 #define g_cRenderEndpoints  (SIZEOF_ARRAY(g_RenderEndpoints))
 
 //=============================================================================
 //
-// Capture miniport pairs. NOTE: the split of render and capture is arbitrary and
-// unnessary, this array could contain render endpoints.
+// Capture miniport pairs.
 //
 static
 PENDPOINT_MINIPAIR  g_CaptureEndpoints[] =
 {
+#if defined(CABLE_A)
+    &CableAMicMiniports,
+#elif defined(CABLE_B)
+    &CableBMicMiniports,
+#else
     &MicArray1Miniports,
-    &CableAMicMiniports,           // Cable A  
-    &CableBMicMiniports,           // Cable B  Phone Link AI 
+    &CableAMicMiniports,           // Cable A
+    &CableBMicMiniports,           // Cable B  Phone Link AI
+#endif
 };
 
 #define g_cCaptureEndpoints (SIZEOF_ARRAY(g_CaptureEndpoints))

@@ -104,44 +104,60 @@ exit /b 0
 :build_start
 if %BUILD_ALL%==1 goto build_all
 
-echo Building Virtual Audio Driver...
+echo Building AO Virtual Cable Drivers...
 echo Configuration: %CONFIG%
 echo Platform: %PLATFORM%
 echo.
 
+REM -- Build dependencies first (Utilities + Filters)
+echo [1/3] Building dependencies (Utilities + Filters)...
+call "%MSBUILD_CMD%" "Source\Utilities\Utilities.vcxproj" /p:Configuration=%CONFIG% /p:Platform=%PLATFORM%
+if %errorlevel% neq 0 ( echo ERROR: Utilities build failed & pause >nul & exit /b %errorlevel% )
+call "%MSBUILD_CMD%" "Source\Filters\Filters.vcxproj" /p:Configuration=%CONFIG% /p:Platform=%PLATFORM%
+if %errorlevel% neq 0 ( echo ERROR: Filters build failed & pause >nul & exit /b %errorlevel% )
+
+REM -- Build Cable A
+echo [2/3] Building Cable A (aocablea.sys)...
 if /i "%PLATFORM%"=="ARM64" (
-    echo Building ARM64 with validation disabled...
-    call "%MSBUILD_CMD%" "VirtualAudioDriver.sln" ^
-        /p:Configuration=%CONFIG% ^
-        /p:Platform=ARM64 ^
-        /p:RunCodeAnalysis=false ^
-        /p:DriverTargetPlatform=Universal ^
-        /p:UseInfVerifierEx=false ^
-        /p:ValidateDrivers=false ^
-        /p:StampInf=false ^
-        /p:ApiValidator_Enable=false ^
-        /p:InfVerif_Enable=false ^
-        /p:DisableVerification=true ^
-        /p:SignMode=Off ^
-        /p:ApiValidator_ExcludedTargets=ARM64 ^
-        /p:EnableInf2cat=false
+    call "%MSBUILD_CMD%" "Source\Main\CableA.vcxproj" ^
+        /p:Configuration=%CONFIG% /p:Platform=ARM64 ^
+        /p:RunCodeAnalysis=false /p:DriverTargetPlatform=Universal ^
+        /p:UseInfVerifierEx=false /p:ValidateDrivers=false ^
+        /p:StampInf=false /p:ApiValidator_Enable=false ^
+        /p:InfVerif_Enable=false /p:DisableVerification=true ^
+        /p:SignMode=Off /p:EnableInf2cat=false
 ) else (
-    echo Building x64 with full validation...
-    call "%MSBUILD_CMD%" "VirtualAudioDriver.sln" /p:Configuration=%CONFIG% /p:Platform=%PLATFORM%
+    call "%MSBUILD_CMD%" "Source\Main\CableA.vcxproj" /p:Configuration=%CONFIG% /p:Platform=%PLATFORM%
+)
+if %errorlevel% neq 0 (
+    echo ERROR: Cable A build failed with exit code %errorlevel%
+    pause >nul
+    exit /b %errorlevel%
 )
 
+REM -- Build Cable B
+echo [3/3] Building Cable B (aocableb.sys)...
+if /i "%PLATFORM%"=="ARM64" (
+    call "%MSBUILD_CMD%" "Source\Main\CableB.vcxproj" ^
+        /p:Configuration=%CONFIG% /p:Platform=ARM64 ^
+        /p:RunCodeAnalysis=false /p:DriverTargetPlatform=Universal ^
+        /p:UseInfVerifierEx=false /p:ValidateDrivers=false ^
+        /p:StampInf=false /p:ApiValidator_Enable=false ^
+        /p:InfVerif_Enable=false /p:DisableVerification=true ^
+        /p:SignMode=Off /p:EnableInf2cat=false
+) else (
+    call "%MSBUILD_CMD%" "Source\Main\CableB.vcxproj" /p:Configuration=%CONFIG% /p:Platform=%PLATFORM%
+)
 if %errorlevel% neq 0 (
-    echo.
-    echo ERROR: Build failed with exit code %errorlevel%
-    echo.
-    echo Press any key to close...
+    echo ERROR: Cable B build failed with exit code %errorlevel%
     pause >nul
     exit /b %errorlevel%
 )
 
 echo.
 echo Build completed successfully!
-echo Output directory: %PLATFORM%\%CONFIG%\package
+echo   aocablea.sys and aocableb.sys are DIFFERENT binaries.
+echo Output directory: Source\Main\%PLATFORM%\%CONFIG%\
 goto show_output
 
 :build_all
@@ -157,37 +173,36 @@ for %%c in (%CONFIGS%) do (
         echo ========================================
         echo Building %%c %%p
         echo ========================================
-        
+
+        call "%MSBUILD_CMD%" "Source\Utilities\Utilities.vcxproj" /p:Configuration=%%c /p:Platform=%%p
+        if !errorlevel! neq 0 ( echo ERROR: Utilities %%c %%p failed & pause >nul & exit /b !errorlevel! )
+        call "%MSBUILD_CMD%" "Source\Filters\Filters.vcxproj" /p:Configuration=%%c /p:Platform=%%p
+        if !errorlevel! neq 0 ( echo ERROR: Filters %%c %%p failed & pause >nul & exit /b !errorlevel! )
+
         if /i "%%p"=="ARM64" (
-            echo Building ARM64 with validation disabled...
-            call "%MSBUILD_CMD%" "VirtualAudioDriver.sln" ^
-                /p:Configuration=%%c ^
-                /p:Platform=ARM64 ^
-                /p:RunCodeAnalysis=false ^
-                /p:DriverTargetPlatform=Universal ^
-                /p:UseInfVerifierEx=false ^
-                /p:ValidateDrivers=false ^
-                /p:StampInf=false ^
-                /p:ApiValidator_Enable=false ^
-                /p:InfVerif_Enable=false ^
-                /p:DisableVerification=true ^
-                /p:SignMode=Off ^
-                /p:ApiValidator_ExcludedTargets=ARM64 ^
-                /p:EnableInf2cat=false
+            call "%MSBUILD_CMD%" "Source\Main\CableA.vcxproj" ^
+                /p:Configuration=%%c /p:Platform=ARM64 ^
+                /p:RunCodeAnalysis=false /p:DriverTargetPlatform=Universal ^
+                /p:UseInfVerifierEx=false /p:ValidateDrivers=false ^
+                /p:StampInf=false /p:ApiValidator_Enable=false ^
+                /p:InfVerif_Enable=false /p:DisableVerification=true ^
+                /p:SignMode=Off /p:EnableInf2cat=false
+            if !errorlevel! neq 0 ( echo ERROR: CableA %%c %%p failed & pause >nul & exit /b !errorlevel! )
+            call "%MSBUILD_CMD%" "Source\Main\CableB.vcxproj" ^
+                /p:Configuration=%%c /p:Platform=ARM64 ^
+                /p:RunCodeAnalysis=false /p:DriverTargetPlatform=Universal ^
+                /p:UseInfVerifierEx=false /p:ValidateDrivers=false ^
+                /p:StampInf=false /p:ApiValidator_Enable=false ^
+                /p:InfVerif_Enable=false /p:DisableVerification=true ^
+                /p:SignMode=Off /p:EnableInf2cat=false
+            if !errorlevel! neq 0 ( echo ERROR: CableB %%c %%p failed & pause >nul & exit /b !errorlevel! )
         ) else (
-            echo Building x64 with full validation...
-            call "%MSBUILD_CMD%" "VirtualAudioDriver.sln" /p:Configuration=%%c /p:Platform=%%p
+            call "%MSBUILD_CMD%" "Source\Main\CableA.vcxproj" /p:Configuration=%%c /p:Platform=%%p
+            if !errorlevel! neq 0 ( echo ERROR: CableA %%c %%p failed & pause >nul & exit /b !errorlevel! )
+            call "%MSBUILD_CMD%" "Source\Main\CableB.vcxproj" /p:Configuration=%%c /p:Platform=%%p
+            if !errorlevel! neq 0 ( echo ERROR: CableB %%c %%p failed & pause >nul & exit /b !errorlevel! )
         )
-        
-        if !errorlevel! neq 0 (
-            echo.
-            echo ERROR: Build failed for %%c %%p with exit code !errorlevel!
-            echo.
-            echo Press any key to close...
-            pause >nul
-            exit /b !errorlevel!
-        )
-        
+
         echo Build %%c %%p completed successfully!
     )
 )
@@ -210,9 +225,10 @@ if %BUILD_ALL%==1 (
 )
 echo.
 echo Key files:
-echo   - VirtualAudioDriver.sys  (driver binary)
-echo   - VirtualAudioDriver.inf  (installation file)
-echo   - virtualaudiodriver.cat  (catalog file)
+echo   - aocablea.sys  (Cable A driver binary)
+echo   - aocableb.sys  (Cable B driver binary)
+echo   - aocablea.inf  (Cable A installation file)
+echo   - aocableb.inf  (Cable B installation file)
 
 echo.
 echo Press any key to close...

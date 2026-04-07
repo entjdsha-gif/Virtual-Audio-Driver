@@ -104,6 +104,7 @@ protected:
     ULONGLONG                   m_ullLastDPCTimeStamp;
     ULONGLONG                   m_hnsDPCTimeCarryForward;
     ULONG                       m_byteDisplacementCarryForward;
+    ULONG                       m_ulBlockAlignCarryForward;
     ULONG                       m_ulDmaMovementRate;
     BOOL                        m_bLfxEnabled;
     PBOOL                       m_pbMuted;
@@ -117,6 +118,7 @@ protected:
     BOOLEAN                     m_bEoSReceived;
     BOOLEAN                     m_bLastBufferRendered;
     KSPIN_LOCK                  m_PositionSpinLock;
+    ULONG                       m_ulFadeInRemaining;
     // Member variable as config params for tone generator
     ULONG                       m_ulHostCaptureToneFrequency;
     // If abs(m_dwHostCaptureToneAmplitude) + abs(m_dwHostCaptureToneDCValue) > 100

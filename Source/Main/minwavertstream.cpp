@@ -6,6 +6,7 @@
 #include "minwavertstream.h"
 #include "loopback.h"
 #define MINWAVERTSTREAM_POOLTAG 'SRWM'
+#define FADE_SAMPLES 192  // ~4ms fade-in at 48kHz to prevent pop/click
 
 #pragma warning (disable : 4127)
 
@@ -213,6 +214,7 @@ Return Value:
     m_hnsDPCTimeCarryForward = 0;
     m_ulDmaMovementRate = 0;
     m_byteDisplacementCarryForward = 0;
+    m_ulBlockAlignCarryForward = 0;
     m_bLfxEnabled = FALSE;
     m_pbMuted = NULL;
     m_plVolumeLevel = NULL;
@@ -228,6 +230,7 @@ Return Value:
     m_SignalProcessingMode = SignalProcessingMode;
     m_bEoSReceived = FALSE;
     m_bLastBufferRendered = FALSE;
+    m_ulFadeInRemaining = 0;
 
     m_ulHostCaptureToneFrequency = IsEqualGUID(SignalProcessingMode, AUDIO_SIGNALPROCESSINGMODE_RAW) ? 1000 : 2000;
     m_dwHostCaptureToneAmplitude = 50;
@@ -1182,6 +1185,54 @@ NTSTATUS CMiniportWaveRTStream::SetState
             {
                 // Acquire stream resources
             }
+
+            // Ensure Mic sink is unregistered on stop.
+            if (m_bCapture && m_pMiniport)
+            {
+                PLOOPBACK_BUFFER pLB = NULL;
+                if (m_pMiniport->m_DeviceType == eCableAMic)
+                    pLB = &g_CableALoopback;
+                else if (m_pMiniport->m_DeviceType == eCableBMic)
+                    pLB = &g_CableBLoopback;
+                if (pLB)
+                    LoopbackUnregisterMicSink(pLB);
+            }
+
+            // Phase 4: Speaker stop - reset loopback ring buffer.
+            // Only unregister MicSink if Mic is NOT currently active,
+            // so Speaker restart can resume direct-push without Mic re-registering.
+            if (!m_bCapture && m_pMiniport)
+            {
+                PLOOPBACK_BUFFER pLB = NULL;
+                if (m_pMiniport->m_DeviceType == eCableASpeaker)
+                    pLB = &g_CableALoopback;
+                else if (m_pMiniport->m_DeviceType == eCableBSpeaker)
+                    pLB = &g_CableBLoopback;
+                if (pLB)
+                {
+                    LoopbackReset(pLB);
+                    // Keep MicSink registered if Mic is still running,
+                    // so Speaker restart resumes direct-push immediately.
+                    // MicSink.TotalBytesWritten is reset so the new session
+                    // starts with correct position tracking.
+                    KIRQL lbIrql;
+                    KeAcquireSpinLock(&pLB->SpinLock, &lbIrql);
+                    if (!pLB->MicSink.Active)
+                    {
+                        // Mic already stopped - safe to fully unregister
+                        KeReleaseSpinLock(&pLB->SpinLock, lbIrql);
+                        LoopbackUnregisterMicSink(pLB);
+                    }
+                    else
+                    {
+                        // Mic still active - reset counters but keep sink registered
+                        pLB->MicSink.WritePos = 0;
+                        pLB->MicSink.TotalBytesWritten = 0;
+                        KeReleaseSpinLock(&pLB->SpinLock, lbIrql);
+                    }
+                }
+            }
+
             KeAcquireSpinLock(&m_PositionSpinLock, &oldIrql);
             // Reset DMA
             m_llPacketCounter = 0;
@@ -1221,6 +1272,18 @@ NTSTATUS CMiniportWaveRTStream::SetState
                 // Run -> Pause
                 //
 
+                // Unregister Mic DMA sink before stopping timer.
+                if (m_bCapture && m_pMiniport)
+                {
+                    PLOOPBACK_BUFFER pLB = NULL;
+                    if (m_pMiniport->m_DeviceType == eCableAMic)
+                        pLB = &g_CableALoopback;
+                    else if (m_pMiniport->m_DeviceType == eCableBMic)
+                        pLB = &g_CableBLoopback;
+                    if (pLB)
+                        LoopbackUnregisterMicSink(pLB);
+                }
+
                 // Pause DMA
                 if (m_ulNotificationIntervalMs > 0)
                 {
@@ -1248,6 +1311,33 @@ NTSTATUS CMiniportWaveRTStream::SetState
             break;
 
         case KSSTATE_RUN:
+            // Register Mic DMA as direct-push sink for loopback (eliminates async gap).
+            if (m_bCapture && m_pMiniport && m_pDmaBuffer)
+            {
+                PLOOPBACK_BUFFER pLB = NULL;
+                if (m_pMiniport->m_DeviceType == eCableAMic)
+                    pLB = &g_CableALoopback;
+                else if (m_pMiniport->m_DeviceType == eCableBMic)
+                    pLB = &g_CableBLoopback;
+                if (pLB)
+                    LoopbackRegisterMicSink(pLB, m_pDmaBuffer, m_ulDmaBufferSize);
+            }
+
+            // Phase 2: Zero-fill DMA buffer to prevent garbage data at stream start
+            if (m_pDmaBuffer && m_ulDmaBufferSize > 0)
+            {
+                RtlZeroMemory(m_pDmaBuffer, m_ulDmaBufferSize);
+            }
+
+            // Phase 6: Initialize fade-in for capture to prevent pop/click
+            if (m_bCapture)
+            {
+                m_ulFadeInRemaining = FADE_SAMPLES;
+            }
+
+            // Reset block alignment carry for clean start
+            m_ulBlockAlignCarryForward = 0;
+
             // Start DMA
             LARGE_INTEGER ullPerfCounterTemp;
             ullPerfCounterTemp = KeQueryPerformanceCounter(&m_ullPerformanceCounterFrequency);
@@ -1328,15 +1418,71 @@ VOID CMiniportWaveRTStream::UpdatePosition
     ULONG ByteDisplacement = ((m_ulDmaMovementRate * TimeElapsedInMS) + m_byteDisplacementCarryForward) / 1000 ;
     m_byteDisplacementCarryForward = ((m_ulDmaMovementRate * TimeElapsedInMS) + m_byteDisplacementCarryForward) % 1000;
 
+    // Phase 1: Block-align ByteDisplacement to prevent sample boundary misalignment.
+    // Carry forward sub-block remainder to avoid long-term drift.
+    if (m_pWfExt)
+    {
+        ULONG nBlockAlign = m_pWfExt->Format.nBlockAlign;
+        ULONG totalBytes = ByteDisplacement + m_ulBlockAlignCarryForward;
+        ByteDisplacement = (totalBytes / nBlockAlign) * nBlockAlign;
+        m_ulBlockAlignCarryForward = totalBytes - ByteDisplacement;
+    }
+
+    // Phase 3+8: For Cable Mic with active MicSink, ensure position always
+    // advances at normal rate (glitch-free). When Mic is ahead of Speaker,
+    // zero-fill the DMA gap to replace stale data with silence.
+    if (m_bCapture && m_pMiniport && m_pDmaBuffer)
+    {
+        PLOOPBACK_BUFFER pLB = NULL;
+        eDeviceType dt = m_pMiniport->GetDeviceType();
+        if (dt == eCableAMic)
+            pLB = &g_CableALoopback;
+        else if (dt == eCableBMic)
+            pLB = &g_CableBLoopback;
+
+        if (pLB)
+        {
+            KIRQL lbIrql;
+            KeAcquireSpinLock(&pLB->SpinLock, &lbIrql);
+
+            if (pLB->MicSink.Active)
+            {
+                // Use monotonic counters to avoid circular buffer math ambiguity
+                ULONGLONG spkWritten = pLB->MicSink.TotalBytesWritten;
+                ULONGLONG micPos = m_ullLinearPosition;
+                ULONGLONG micEnd = micPos + ByteDisplacement;
+
+                if (micEnd > spkWritten)
+                {
+                    // Mic is ahead of Speaker - zero-fill gap in DMA
+                    ULONG availBytes = (spkWritten > micPos) ?
+                        (ULONG)(spkWritten - micPos) : 0;
+                    ULONG gapBytes = ByteDisplacement - availBytes;
+                    ULONG gapStart = (ULONG)((micPos + availBytes) % m_ulDmaBufferSize);
+
+                    // Zero-fill to replace stale data with silence
+                    ULONG rem = gapBytes;
+                    ULONG pos = gapStart;
+                    while (rem > 0)
+                    {
+                        ULONG chunk = min(rem, m_ulDmaBufferSize - pos);
+                        RtlZeroMemory(m_pDmaBuffer + pos, chunk);
+                        pos = (pos + chunk) % m_ulDmaBufferSize;
+                        rem -= chunk;
+                    }
+                    // Position advances normally - no clamping
+                }
+            }
+
+            KeReleaseSpinLock(&pLB->SpinLock, lbIrql);
+        }
+    }
+
     // Increment presentation position even after last buffer is rendered.
     m_ullPresentationPosition += ByteDisplacement;
 
-    DbgPrint("AO_DBG UpdatePosition: Capture=%d, ByteDisp=%lu, TimeElapsedMS=%lu\n",
-        (int)m_bCapture, ByteDisplacement, TimeElapsedInMS);
-
     if (m_bCapture)
     {
-        // Write sine wave to buffer.
         WriteBytes(ByteDisplacement);
     }
     else
@@ -1414,6 +1560,8 @@ For other devices: output silence (original behavior).
 --*/
 {
     ULONG bufferOffset = m_ullLinearPosition % m_ulDmaBufferSize;
+    ULONG fadeStartOffset = bufferOffset;
+    ULONG totalBytes = ByteDisplacement;
 
     // WriteBytes = capture device. Cable MIC reads from loopback ring.
     PLOOPBACK_BUFFER pLoopback = NULL;
@@ -1428,27 +1576,54 @@ For other devices: output silence (original behavior).
             pLoopback = &g_CableBLoopback;
     }
 
-    DbgPrint("AO_DBG WriteBytes: DeviceType=%d, ByteDisp=%lu, pLoopback=%p, DataCount=%lu\n",
-        (int)devType, ByteDisplacement, pLoopback,
-        pLoopback ? pLoopback->DataCount : 0);
-
-    while (ByteDisplacement > 0)
+    if (pLoopback && pLoopback->MicSink.Active)
     {
-        ULONG runWrite = min(ByteDisplacement, m_ulDmaBufferSize - bufferOffset);
-
-        if (pLoopback)
+        // Speaker DPC already pushed data directly into our DMA buffer.
+        // Gap regions were zero-filled by UpdatePosition (Phase 8).
+        // No copy needed here.
+    }
+    else
+    {
+        // Phase 5: MicSink not active (Speaker stopped or not started).
+        // Pull from loopback ring (returns silence if ring was reset).
+        while (ByteDisplacement > 0)
         {
-            // Cable mic: pull audio from loopback ring into DMA
-            LoopbackRead(pLoopback, m_pDmaBuffer + bufferOffset, runWrite);
-        }
-        else
-        {
-            // Default: silence
-            RtlZeroMemory(m_pDmaBuffer + bufferOffset, runWrite);
-        }
+            ULONG runWrite = min(ByteDisplacement, m_ulDmaBufferSize - bufferOffset);
 
-        bufferOffset = (bufferOffset + runWrite) % m_ulDmaBufferSize;
-        ByteDisplacement -= runWrite;
+            if (pLoopback)
+            {
+                LoopbackRead(pLoopback, m_pDmaBuffer + bufferOffset, runWrite);
+            }
+            else
+            {
+                RtlZeroMemory(m_pDmaBuffer + bufferOffset, runWrite);
+            }
+
+            bufferOffset = (bufferOffset + runWrite) % m_ulDmaBufferSize;
+            ByteDisplacement -= runWrite;
+        }
+    }
+
+    // Phase 6: Apply fade-in ramp to prevent pop/click at capture stream start.
+    // Applies to data from both paths (MicSink direct-push or LoopbackRead).
+    if (m_ulFadeInRemaining > 0 && totalBytes > 0 && m_pWfExt)
+    {
+        ULONG nBlockAlign = m_pWfExt->Format.nBlockAlign;
+        ULONG nChannels = m_pWfExt->Format.nChannels;
+        ULONG sampleCount = totalBytes / nBlockAlign;
+        ULONG fadePos = fadeStartOffset;
+
+        for (ULONG i = 0; i < sampleCount && m_ulFadeInRemaining > 0; i++)
+        {
+            ULONG rampPos = FADE_SAMPLES - m_ulFadeInRemaining;
+            INT16* pSample = (INT16*)(m_pDmaBuffer + fadePos);
+            for (ULONG ch = 0; ch < nChannels; ch++)
+            {
+                pSample[ch] = (INT16)(((INT32)pSample[ch] * rampPos) / FADE_SAMPLES);
+            }
+            fadePos = (fadePos + nBlockAlign) % m_ulDmaBufferSize;
+            m_ulFadeInRemaining--;
+        }
     }
 }
 
@@ -1483,8 +1658,10 @@ For other devices: save data to file (original behavior).
             pLoopback = &g_CableBLoopback;
     }
 
+#if DBG
     DbgPrint("AO_DBG ReadBytes: DeviceType=%d, ByteDisp=%lu, pLoopback=%p\n",
         (int)devType, ByteDisplacement, pLoopback);
+#endif
 
     while (ByteDisplacement > 0)
     {
@@ -1642,60 +1819,92 @@ TimerNotifyRT
         bufferCompleted = TRUE;
     }
 
-    if (!bufferCompleted && !_this->m_bEoSReceived)
+    // Cable endpoints: update position every tick for smooth data flow.
+    // Non-cable endpoints: only update at notification interval (original behavior).
+    BOOL isCableEndpoint = FALSE;
+    if (_this->m_pMiniport)
     {
-        goto End;
+        eDeviceType dt = _this->m_pMiniport->GetDeviceType();
+        isCableEndpoint = (dt == eCableASpeaker || dt == eCableAMic ||
+                           dt == eCableBSpeaker || dt == eCableBMic);
     }
 
-    _this->UpdatePosition(qpc);
-
-    if (!_this->m_bEoSReceived)
+    if (isCableEndpoint)
     {
-        _this->m_llPacketCounter++;
+        // Always update position for cable endpoints (every 1ms tick).
+        _this->UpdatePosition(qpc);
+
+        if (bufferCompleted && !_this->m_bEoSReceived)
+        {
+            _this->m_llPacketCounter++;
+        }
+    }
+    else
+    {
+        if (!bufferCompleted && !_this->m_bEoSReceived)
+        {
+            goto End;
+        }
+
+        _this->UpdatePosition(qpc);
+
+        if (!_this->m_bEoSReceived)
+        {
+            _this->m_llPacketCounter++;
+        }
     }
 
     if (_this->m_KsState != KSSTATE_RUN)
     {
         goto End;
     }
-    
-    PADAPTERCOMMON  pAdapterComm = _this->m_pMiniport->GetAdapterCommObj();
 
-    // Simple buffer underrun detection.
-    if (!_this->IsCurrentWaveRTWritePositionUpdated() && !_this->m_bEoSReceived)
+    // Cable endpoints call UpdatePosition every tick but notifications/underrun
+    // checks only at buffer completion boundaries.
+    if (!bufferCompleted && isCableEndpoint && !_this->m_bEoSReceived)
     {
-        //Event type: eMINIPORT_GLITCH_REPORT
-        //Parameter 1: Current linear buffer position 
-        //Parameter 2: Previous WaveRtBufferWritePosition that the driver received 
-        //Parameter 3: Major glitch code: 1:WaveRT buffer is underrun
-        //Parameter 4: Minor code for the glitch cause
-        pAdapterComm->WriteEtwEvent(eMINIPORT_GLITCH_REPORT, 
-                                    _this->m_ullLinearPosition,
-                                    _this->GetCurrentWaveRTWritePosition(),
-                                    1,      // WaveRT buffer is underrun
-                                    0); 
+        goto End;
     }
 
-    // Send buffer completion event if either of the following is true
-    // 1. Driver consumed a complete buffer for this stream
-    // 2. Driver consumed a partial buffer containing EoS for this stream
-
-    if (!IsListEmpty(&_this->m_NotificationList) && 
-        (bufferCompleted || _this->m_bLastBufferRendered))
     {
-        PLIST_ENTRY leCurrent = _this->m_NotificationList.Flink;
-        while (leCurrent != &_this->m_NotificationList)
+        PADAPTERCOMMON  pAdapterComm = _this->m_pMiniport->GetAdapterCommObj();
+
+        // Simple buffer underrun detection.
+        if (!_this->IsCurrentWaveRTWritePositionUpdated() && !_this->m_bEoSReceived)
         {
-            NotificationListEntry* nleCurrent = CONTAINING_RECORD( leCurrent, NotificationListEntry, ListEntry);
-            KeSetEvent(nleCurrent->NotificationEvent, 0, 0);
-
-            leCurrent = leCurrent->Flink;
+            //Event type: eMINIPORT_GLITCH_REPORT
+            //Parameter 1: Current linear buffer position
+            //Parameter 2: Previous WaveRtBufferWritePosition that the driver received
+            //Parameter 3: Major glitch code: 1:WaveRT buffer is underrun
+            //Parameter 4: Minor code for the glitch cause
+            pAdapterComm->WriteEtwEvent(eMINIPORT_GLITCH_REPORT,
+                                        _this->m_ullLinearPosition,
+                                        _this->GetCurrentWaveRTWritePosition(),
+                                        1,      // WaveRT buffer is underrun
+                                        0);
         }
-    }
 
-    if (_this->m_bLastBufferRendered)
-    {
-        ExCancelTimer(_this->m_pNotificationTimer, NULL);
+        // Send buffer completion event if either of the following is true
+        // 1. Driver consumed a complete buffer for this stream
+        // 2. Driver consumed a partial buffer containing EoS for this stream
+
+        if (!IsListEmpty(&_this->m_NotificationList) &&
+            (bufferCompleted || _this->m_bLastBufferRendered))
+        {
+            PLIST_ENTRY leCurrent = _this->m_NotificationList.Flink;
+            while (leCurrent != &_this->m_NotificationList)
+            {
+                NotificationListEntry* nleCurrent = CONTAINING_RECORD( leCurrent, NotificationListEntry, ListEntry);
+                KeSetEvent(nleCurrent->NotificationEvent, 0, 0);
+
+                leCurrent = leCurrent->Flink;
+            }
+        }
+
+        if (_this->m_bLastBufferRendered)
+        {
+            ExCancelTimer(_this->m_pNotificationTimer, NULL);
+        }
     }
 
 End:

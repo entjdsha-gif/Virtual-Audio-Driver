@@ -16,9 +16,20 @@ Abstract:
 
 #define VER_FILETYPE                VFT_DRV
 #define VER_FILESUBTYPE             VFT2_DRV_SOUND
-#define VER_FILEDESCRIPTION_STR     "Microsoft Virtual Simple Audio Sample Driver"
+
+#if defined(CABLE_A)
+#define VER_FILEDESCRIPTION_STR     "AO Virtual Cable A Driver"
+#define VER_INTERNALNAME_STR        "aocablea.sys"
+#define VER_ORIGINALFILENAME_STR    "aocablea.sys"
+#elif defined(CABLE_B)
+#define VER_FILEDESCRIPTION_STR     "AO Virtual Cable B Driver"
+#define VER_INTERNALNAME_STR        "aocableb.sys"
+#define VER_ORIGINALFILENAME_STR    "aocableb.sys"
+#else
+#define VER_FILEDESCRIPTION_STR     "AO Virtual Audio Driver"
 #define VER_INTERNALNAME_STR        "VirtualAudioDriver.sys"
 #define VER_ORIGINALFILENAME_STR    "VirtualAudioDriver.sys"
+#endif
 
 #define VER_LEGALCOPYRIGHT_YEARS    "2013"
 #define VER_LEGALCOPYRIGHT_STR	    "Copyright (C) Microsoft Corp." VER_LEGALCOPYRIGHT_YEARS

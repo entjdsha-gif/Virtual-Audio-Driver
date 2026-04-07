@@ -124,8 +124,14 @@ Environment:
     //
     // Cleanup loopback buffers.
     //
+#if defined(CABLE_A)
+    LoopbackCleanup(&g_CableALoopback);
+#elif defined(CABLE_B)
+    LoopbackCleanup(&g_CableBLoopback);
+#else
     LoopbackCleanup(&g_CableALoopback);
     LoopbackCleanup(&g_CableBLoopback);
+#endif
 
 Done:
     return;
@@ -291,7 +297,13 @@ Return Value:
     NTSTATUS                    ntStatus;
     WDF_DRIVER_CONFIG           config;
 
+#if defined(CABLE_A)
+    DPF(D_TERSE, ("[DriverEntry] AO Cable A"));
+#elif defined(CABLE_B)
+    DPF(D_TERSE, ("[DriverEntry] AO Cable B"));
+#else
     DPF(D_TERSE, ("[DriverEntry]"));
+#endif
 
     // Copy registry Path name in a global variable to be used by modules inside driver.
     // !! NOTE !! Inside this function we are initializing the registrypath, so we MUST NOT add any failing calls
@@ -355,8 +367,21 @@ Return Value:
     DriverObject->DriverUnload = DriverUnload;
 
     //
-    // Initialize loopback buffers for Cable A and Cable B.
+    // Initialize loopback buffers.
     //
+#if defined(CABLE_A)
+    ntStatus = LoopbackInit(&g_CableALoopback);
+    IF_FAILED_ACTION_JUMP(
+        ntStatus,
+        DPF(D_ERROR, ("LoopbackInit CableA failed, 0x%x", ntStatus)),
+        Done);
+#elif defined(CABLE_B)
+    ntStatus = LoopbackInit(&g_CableBLoopback);
+    IF_FAILED_ACTION_JUMP(
+        ntStatus,
+        DPF(D_ERROR, ("LoopbackInit CableB failed, 0x%x", ntStatus)),
+        Done);
+#else
     ntStatus = LoopbackInit(&g_CableALoopback);
     IF_FAILED_ACTION_JUMP(
         ntStatus,
@@ -368,6 +393,7 @@ Return Value:
         ntStatus,
         DPF(D_ERROR, ("LoopbackInit CableB failed, 0x%x", ntStatus)),
         Done);
+#endif
 
     //
     // All done.
@@ -378,8 +404,14 @@ Done:
 
     if (!NT_SUCCESS(ntStatus))
     {
+#if defined(CABLE_A)
+        LoopbackCleanup(&g_CableALoopback);
+#elif defined(CABLE_B)
+        LoopbackCleanup(&g_CableBLoopback);
+#else
         LoopbackCleanup(&g_CableALoopback);
         LoopbackCleanup(&g_CableBLoopback);
+#endif
 
         if (WdfGetDriver() != NULL)
         {

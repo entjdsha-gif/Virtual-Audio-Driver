@@ -34,6 +34,14 @@ NTSTATUS LoopbackInit(PLOOPBACK_BUFFER pLoopback)
     pLoopback->ReadPos = 0;
     pLoopback->DataCount = 0;
     KeInitializeSpinLock(&pLoopback->SpinLock);
+
+    // MicSink starts inactive - registered when Mic stream opens.
+    pLoopback->MicSink.DmaBuffer = NULL;
+    pLoopback->MicSink.DmaBufferSize = 0;
+    pLoopback->MicSink.WritePos = 0;
+    pLoopback->MicSink.Active = FALSE;
+    pLoopback->MicSink.TotalBytesWritten = 0;
+
     pLoopback->Initialized = TRUE;
 
     return STATUS_SUCCESS;
@@ -92,6 +100,28 @@ VOID LoopbackWrite(
         pLoopback->ReadPos = writePos;
     }
 
+    // Direct push to Mic DMA - eliminates async timing gap.
+    if (pLoopback->MicSink.Active && pLoopback->MicSink.DmaBuffer)
+    {
+        BYTE*  micBuf   = pLoopback->MicSink.DmaBuffer;
+        ULONG  micSize  = pLoopback->MicSink.DmaBufferSize;
+        ULONG  micPos   = pLoopback->MicSink.WritePos;
+        ULONG  rem      = Count;
+        ULONG  src      = 0;
+
+        while (rem > 0)
+        {
+            ULONG chunk = min(rem, micSize - micPos);
+            RtlCopyMemory(micBuf + micPos, Data + src, chunk);
+            micPos = (micPos + chunk) % micSize;
+            src   += chunk;
+            rem   -= chunk;
+        }
+
+        pLoopback->MicSink.WritePos = micPos;
+        pLoopback->MicSink.TotalBytesWritten += Count;
+    }
+
     KeReleaseSpinLock(&pLoopback->SpinLock, oldIrql);
 }
 
@@ -140,6 +170,68 @@ VOID LoopbackRead(
     {
         RtlZeroMemory(Data + toRead, Count - toRead);
     }
+
+    KeReleaseSpinLock(&pLoopback->SpinLock, oldIrql);
+}
+
+//=============================================================================
+// Mic DMA sink registration
+//=============================================================================
+#pragma code_seg()
+VOID LoopbackRegisterMicSink(
+    PLOOPBACK_BUFFER pLoopback,
+    BYTE* DmaBuffer,
+    ULONG DmaBufferSize
+)
+{
+    if (!pLoopback || !pLoopback->Initialized)
+        return;
+
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&pLoopback->SpinLock, &oldIrql);
+
+    pLoopback->MicSink.DmaBuffer     = DmaBuffer;
+    pLoopback->MicSink.DmaBufferSize = DmaBufferSize;
+    pLoopback->MicSink.WritePos      = 0;
+    pLoopback->MicSink.TotalBytesWritten = 0;
+    pLoopback->MicSink.Active        = TRUE;
+
+    KeReleaseSpinLock(&pLoopback->SpinLock, oldIrql);
+}
+
+#pragma code_seg()
+VOID LoopbackUnregisterMicSink(
+    PLOOPBACK_BUFFER pLoopback
+)
+{
+    if (!pLoopback || !pLoopback->Initialized)
+        return;
+
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&pLoopback->SpinLock, &oldIrql);
+
+    pLoopback->MicSink.Active        = FALSE;
+    pLoopback->MicSink.DmaBuffer     = NULL;
+    pLoopback->MicSink.DmaBufferSize = 0;
+    pLoopback->MicSink.WritePos      = 0;
+    pLoopback->MicSink.TotalBytesWritten = 0;
+
+    KeReleaseSpinLock(&pLoopback->SpinLock, oldIrql);
+}
+
+#pragma code_seg()
+VOID LoopbackReset(PLOOPBACK_BUFFER pLoopback)
+{
+    if (!pLoopback || !pLoopback->Initialized || !pLoopback->Buffer)
+        return;
+
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&pLoopback->SpinLock, &oldIrql);
+
+    pLoopback->WritePos = 0;
+    pLoopback->ReadPos = 0;
+    pLoopback->DataCount = 0;
+    RtlZeroMemory(pLoopback->Buffer, pLoopback->BufferSize);
 
     KeReleaseSpinLock(&pLoopback->SpinLock, oldIrql);
 }

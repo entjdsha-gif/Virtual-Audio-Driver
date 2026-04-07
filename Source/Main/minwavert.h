@@ -198,9 +198,14 @@ public:
         _In_ PPCPROPERTY_REQUEST PropertyRequest
     );
 
-    PADAPTERCOMMON GetAdapterCommObj() 
+    PADAPTERCOMMON GetAdapterCommObj()
     {
-        return m_pAdapterCommon; 
+        return m_pAdapterCommon;
+    };
+
+    eDeviceType GetDeviceType()
+    {
+        return m_DeviceType;
     };
 #pragma code_seg()
 
