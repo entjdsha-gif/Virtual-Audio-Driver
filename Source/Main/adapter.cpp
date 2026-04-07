@@ -23,16 +23,30 @@ Abstract:
 #include "endpoints.h"
 #include "minipairs.h"
 #include "loopback.h"
+#include "ioctl.h"
 
 typedef void (*fnPcDriverUnload) (PDRIVER_OBJECT);
 fnPcDriverUnload gPCDriverUnloadRoutine = NULL;
 extern "C" DRIVER_UNLOAD DriverUnload;
+
+// Saved original IRP_MJ_DEVICE_CONTROL handler from PortCls
+static PDRIVER_DISPATCH g_OriginalDeviceControl = NULL;
+
+// Device interface symbolic link name (for control panel access)
+static UNICODE_STRING g_DeviceInterfaceName = { 0, 0, NULL };
 
 //-----------------------------------------------------------------------------
 // Referenced forward.
 //-----------------------------------------------------------------------------
 
 DRIVER_ADD_DEVICE AddDevice;
+
+_Dispatch_type_(IRP_MJ_DEVICE_CONTROL)
+DRIVER_DISPATCH AoDeviceControlHandler;
+
+// Forward declarations for registry persistence
+static VOID AoReadRegistryConfig(_Out_ PULONG pInternalRate, _Out_ PULONG pMaxLatencyMs);
+static VOID AoWriteRegistryValue(_In_ PCWSTR ValueName, _In_ ULONG Value);
 
 NTSTATUS
 StartDevice
@@ -361,6 +375,12 @@ Return Value:
     DriverObject->MajorFunction[IRP_MJ_PNP] = PnpHandler;
 
     //
+    // Hook IRP_MJ_DEVICE_CONTROL for IOCTL support (control panel).
+    //
+    g_OriginalDeviceControl = DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL];
+    DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = AoDeviceControlHandler;
+
+    //
     // Hook the port class unload function
     //
     gPCDriverUnloadRoutine = DriverObject->DriverUnload;
@@ -394,6 +414,29 @@ Return Value:
         DPF(D_ERROR, ("LoopbackInit CableB failed, 0x%x", ntStatus)),
         Done);
 #endif
+
+    //
+    // Apply saved registry settings to loopback buffers.
+    //
+    {
+        ULONG savedRate = LB_DEFAULT_INTERNAL_RATE;
+        ULONG savedLatency = LB_DEFAULT_LATENCY_MS;
+        AoReadRegistryConfig(&savedRate, &savedLatency);
+
+#if defined(CABLE_A)
+        LoopbackSetInternalRate(&g_CableALoopback, savedRate);
+        LoopbackResizeBuffer(&g_CableALoopback, savedLatency);
+#elif defined(CABLE_B)
+        LoopbackSetInternalRate(&g_CableBLoopback, savedRate);
+        LoopbackResizeBuffer(&g_CableBLoopback, savedLatency);
+#else
+        LoopbackSetInternalRate(&g_CableALoopback, savedRate);
+        LoopbackResizeBuffer(&g_CableALoopback, savedLatency);
+        LoopbackSetInternalRate(&g_CableBLoopback, savedRate);
+        LoopbackResizeBuffer(&g_CableBLoopback, savedLatency);
+#endif
+        DPF(D_TERSE, ("[DriverEntry] Registry config: Rate=%u, Latency=%ums", savedRate, savedLatency));
+    }
 
     //
     // All done.
@@ -808,6 +851,24 @@ Return Value:
         ntStatus = PcGetPhysicalDeviceObject(DeviceObject, &pdo);
         IF_FAILED_JUMP(ntStatus, Exit);
 
+        // Register device interface for control panel IOCTL access
+        ntStatus = IoRegisterDeviceInterface(
+            pdo,
+            &GUID_DEVINTERFACE_AO_VIRTUAL_CABLE,
+            NULL,
+            &g_DeviceInterfaceName);
+        if (NT_SUCCESS(ntStatus))
+        {
+            IoSetDeviceInterfaceState(&g_DeviceInterfaceName, TRUE);
+            DPF(D_TERSE, ("[StartDevice] Device interface registered"));
+        }
+        else
+        {
+            DPF(D_TERSE, ("[StartDevice] IoRegisterDeviceInterface failed 0x%x", ntStatus));
+            // Non-fatal: driver works without control panel
+            ntStatus = STATUS_SUCCESS;
+        }
+
         WCHAR hardwareId[256] = {0};
         ULONG resultLen = 0;
         ntStatus = IoGetDeviceProperty(
@@ -866,8 +927,244 @@ Exit:
 } // StartDevice
 
 //=============================================================================
+// Registry persistence for driver settings
+//=============================================================================
 #pragma code_seg("PAGE")
-NTSTATUS 
+static VOID AoWriteRegistryValue(
+    _In_ PCWSTR ValueName,
+    _In_ ULONG  Value
+)
+{
+    PAGED_CODE();
+
+    UNICODE_STRING keyPath;
+    RtlInitUnicodeString(&keyPath, L"\\Registry\\Machine\\" AO_REGISTRY_PATH);
+
+    OBJECT_ATTRIBUTES oa;
+    InitializeObjectAttributes(&oa, &keyPath, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+
+    HANDLE hKey = NULL;
+    ULONG disposition = 0;
+    NTSTATUS st = ZwCreateKey(&hKey, KEY_WRITE, &oa, 0, NULL, REG_OPTION_NON_VOLATILE, &disposition);
+    if (!NT_SUCCESS(st))
+        return;
+
+    UNICODE_STRING valueName;
+    RtlInitUnicodeString(&valueName, ValueName);
+    ZwSetValueKey(hKey, &valueName, 0, REG_DWORD, &Value, sizeof(ULONG));
+    ZwClose(hKey);
+}
+
+#pragma code_seg("PAGE")
+static VOID AoReadRegistryConfig(
+    _Out_ PULONG pInternalRate,
+    _Out_ PULONG pMaxLatencyMs
+)
+{
+    PAGED_CODE();
+
+    *pInternalRate = LB_DEFAULT_INTERNAL_RATE;
+    *pMaxLatencyMs = LB_DEFAULT_LATENCY_MS;
+
+    UNICODE_STRING keyPath;
+    RtlInitUnicodeString(&keyPath, L"\\Registry\\Machine\\" AO_REGISTRY_PATH);
+
+    OBJECT_ATTRIBUTES oa;
+    InitializeObjectAttributes(&oa, &keyPath, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+
+    HANDLE hKey = NULL;
+    NTSTATUS st = ZwOpenKey(&hKey, KEY_READ, &oa);
+    if (!NT_SUCCESS(st))
+        return;
+
+    // Read InternalRate
+    {
+        UNICODE_STRING valName;
+        RtlInitUnicodeString(&valName, AO_REG_INTERNAL_RATE);
+
+        UCHAR buf[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + sizeof(ULONG)];
+        ULONG resultLen = 0;
+        st = ZwQueryValueKey(hKey, &valName, KeyValuePartialInformation, buf, sizeof(buf), &resultLen);
+        if (NT_SUCCESS(st))
+        {
+            PKEY_VALUE_PARTIAL_INFORMATION info = (PKEY_VALUE_PARTIAL_INFORMATION)buf;
+            if (info->Type == REG_DWORD && info->DataLength == sizeof(ULONG))
+            {
+                ULONG val = *(PULONG)info->Data;
+                if (val == 44100 || val == 48000 || val == 96000 || val == 192000)
+                    *pInternalRate = val;
+            }
+        }
+    }
+
+    // Read MaxLatencyMs
+    {
+        UNICODE_STRING valName;
+        RtlInitUnicodeString(&valName, AO_REG_MAX_LATENCY);
+
+        UCHAR buf[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + sizeof(ULONG)];
+        ULONG resultLen = 0;
+        st = ZwQueryValueKey(hKey, &valName, KeyValuePartialInformation, buf, sizeof(buf), &resultLen);
+        if (NT_SUCCESS(st))
+        {
+            PKEY_VALUE_PARTIAL_INFORMATION info = (PKEY_VALUE_PARTIAL_INFORMATION)buf;
+            if (info->Type == REG_DWORD && info->DataLength == sizeof(ULONG))
+            {
+                ULONG val = *(PULONG)info->Data;
+                if (val >= LB_MIN_LATENCY_MS && val <= LB_MAX_LATENCY_MS)
+                    *pMaxLatencyMs = val;
+            }
+        }
+    }
+
+    ZwClose(hKey);
+}
+
+//=============================================================================
+// IOCTL dispatch for AO Virtual Cable control panel communication
+//=============================================================================
+#pragma code_seg("PAGE")
+NTSTATUS
+AoDeviceControlHandler(
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _Inout_ PIRP Irp
+)
+{
+    PAGED_CODE();
+
+    PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
+    ULONG ioctl = irpSp->Parameters.DeviceIoControl.IoControlCode;
+    NTSTATUS status = STATUS_NOT_SUPPORTED;
+    ULONG bytesReturned = 0;
+
+    // Only handle our custom IOCTLs
+    switch (ioctl)
+    {
+    case IOCTL_AO_GET_CONFIG:
+    {
+        if (irpSp->Parameters.DeviceIoControl.OutputBufferLength < sizeof(AO_CONFIG))
+        {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        AO_CONFIG* pConfig = (AO_CONFIG*)Irp->AssociatedIrp.SystemBuffer;
+#if defined(CABLE_A)
+        pConfig->InternalRate = g_CableALoopback.InternalRate;
+        pConfig->MaxLatencyMs = g_CableALoopback.MaxLatencyMs;
+#elif defined(CABLE_B)
+        pConfig->InternalRate = g_CableBLoopback.InternalRate;
+        pConfig->MaxLatencyMs = g_CableBLoopback.MaxLatencyMs;
+#else
+        pConfig->InternalRate = g_CableALoopback.InternalRate;
+        pConfig->MaxLatencyMs = g_CableALoopback.MaxLatencyMs;
+#endif
+        pConfig->InternalBits = LB_INTERNAL_BITS;
+        pConfig->InternalChannels = LB_INTERNAL_CHANNELS;
+        bytesReturned = sizeof(AO_CONFIG);
+        status = STATUS_SUCCESS;
+        break;
+    }
+
+    case IOCTL_AO_SET_INTERNAL_RATE:
+    {
+        if (irpSp->Parameters.DeviceIoControl.InputBufferLength < sizeof(ULONG))
+        {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        ULONG newRate = *(ULONG*)Irp->AssociatedIrp.SystemBuffer;
+#if defined(CABLE_A)
+        status = LoopbackSetInternalRate(&g_CableALoopback, newRate);
+#elif defined(CABLE_B)
+        status = LoopbackSetInternalRate(&g_CableBLoopback, newRate);
+#else
+        status = LoopbackSetInternalRate(&g_CableALoopback, newRate);
+        if (NT_SUCCESS(status))
+            status = LoopbackSetInternalRate(&g_CableBLoopback, newRate);
+#endif
+        if (NT_SUCCESS(status))
+            AoWriteRegistryValue(AO_REG_INTERNAL_RATE, newRate);
+        break;
+    }
+
+    case IOCTL_AO_SET_MAX_LATENCY:
+    {
+        if (irpSp->Parameters.DeviceIoControl.InputBufferLength < sizeof(ULONG))
+        {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        ULONG newLatency = *(ULONG*)Irp->AssociatedIrp.SystemBuffer;
+#if defined(CABLE_A)
+        status = LoopbackResizeBuffer(&g_CableALoopback, newLatency);
+#elif defined(CABLE_B)
+        status = LoopbackResizeBuffer(&g_CableBLoopback, newLatency);
+#else
+        status = LoopbackResizeBuffer(&g_CableALoopback, newLatency);
+        if (NT_SUCCESS(status))
+            status = LoopbackResizeBuffer(&g_CableBLoopback, newLatency);
+#endif
+        if (NT_SUCCESS(status))
+            AoWriteRegistryValue(AO_REG_MAX_LATENCY, newLatency);
+        break;
+    }
+
+    case IOCTL_AO_GET_STREAM_STATUS:
+    {
+        if (irpSp->Parameters.DeviceIoControl.OutputBufferLength < sizeof(AO_STREAM_STATUS))
+        {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        AO_STREAM_STATUS* pStatus = (AO_STREAM_STATUS*)Irp->AssociatedIrp.SystemBuffer;
+        RtlZeroMemory(pStatus, sizeof(AO_STREAM_STATUS));
+
+#if defined(CABLE_A) || !defined(CABLE_B)
+        pStatus->CableA_Speaker.Active      = g_CableALoopback.SpeakerActive;
+        pStatus->CableA_Speaker.SampleRate   = g_CableALoopback.SpeakerFormat.SampleRate;
+        pStatus->CableA_Speaker.BitsPerSample= g_CableALoopback.SpeakerFormat.BitsPerSample;
+        pStatus->CableA_Speaker.Channels     = g_CableALoopback.SpeakerFormat.nChannels;
+        pStatus->CableA_Mic.Active          = g_CableALoopback.MicActive;
+        pStatus->CableA_Mic.SampleRate       = g_CableALoopback.MicFormat.SampleRate;
+        pStatus->CableA_Mic.BitsPerSample    = g_CableALoopback.MicFormat.BitsPerSample;
+        pStatus->CableA_Mic.Channels         = g_CableALoopback.MicFormat.nChannels;
+#endif
+
+#if defined(CABLE_B) || !defined(CABLE_A)
+        pStatus->CableB_Speaker.Active      = g_CableBLoopback.SpeakerActive;
+        pStatus->CableB_Speaker.SampleRate   = g_CableBLoopback.SpeakerFormat.SampleRate;
+        pStatus->CableB_Speaker.BitsPerSample= g_CableBLoopback.SpeakerFormat.BitsPerSample;
+        pStatus->CableB_Speaker.Channels     = g_CableBLoopback.SpeakerFormat.nChannels;
+        pStatus->CableB_Mic.Active          = g_CableBLoopback.MicActive;
+        pStatus->CableB_Mic.SampleRate       = g_CableBLoopback.MicFormat.SampleRate;
+        pStatus->CableB_Mic.BitsPerSample    = g_CableBLoopback.MicFormat.BitsPerSample;
+        pStatus->CableB_Mic.Channels         = g_CableBLoopback.MicFormat.nChannels;
+#endif
+
+        bytesReturned = sizeof(AO_STREAM_STATUS);
+        status = STATUS_SUCCESS;
+        break;
+    }
+
+    default:
+        // Not our IOCTL - pass to PortCls
+        if (g_OriginalDeviceControl)
+        {
+            return g_OriginalDeviceControl(DeviceObject, Irp);
+        }
+        status = STATUS_NOT_SUPPORTED;
+        break;
+    }
+
+    Irp->IoStatus.Status = status;
+    Irp->IoStatus.Information = bytesReturned;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return status;
+}
+
+//=============================================================================
+#pragma code_seg("PAGE")
+NTSTATUS
 PnpHandler
 (
     _In_ DEVICE_OBJECT *_DeviceObject, 
@@ -915,12 +1212,20 @@ Return Value:
     case IRP_MN_REMOVE_DEVICE:
     case IRP_MN_SURPRISE_REMOVAL:
     case IRP_MN_STOP_DEVICE:
+        // Disable device interface for control panel
+        if (g_DeviceInterfaceName.Buffer != NULL)
+        {
+            IoSetDeviceInterfaceState(&g_DeviceInterfaceName, FALSE);
+            RtlFreeUnicodeString(&g_DeviceInterfaceName);
+            g_DeviceInterfaceName.Buffer = NULL;
+        }
+
         ext = static_cast<PortClassDeviceContext*>(_DeviceObject->DeviceExtension);
 
         if (ext->m_pCommon != NULL)
         {
             ext->m_pCommon->Cleanup();
-            
+
             ext->m_pCommon->Release();
             ext->m_pCommon = NULL;
         }

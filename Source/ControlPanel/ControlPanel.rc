@@ -1,0 +1,28 @@
+#include "resource.h"
+#include <windows.h>
+
+IDD_SETTINGS DIALOGEX 0, 0, 340, 260
+STYLE DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "AO Virtual Cable Settings"
+FONT 9, "Segoe UI"
+BEGIN
+    GROUPBOX "Internal Sample Rate", -1, 10, 10, 150, 50
+    COMBOBOX IDC_COMBO_RATE, 20, 28, 130, 100, CBS_DROPDOWNLIST | WS_TABSTOP
+
+    GROUPBOX "Max Latency", -1, 170, 10, 160, 50
+    CONTROL "", IDC_SLIDER_LATENCY, "msctls_trackbar32", TBS_AUTOTICKS | WS_TABSTOP, 180, 28, 110, 20
+    LTEXT "20 ms", IDC_STATIC_LATENCY, 295, 30, 30, 12
+
+    GROUPBOX "Stream Monitor", -1, 10, 70, 320, 130
+    LTEXT "Cable A Speaker:", -1, 20, 88, 70, 12
+    LTEXT "--", IDC_STATUS_A_SPK, 95, 88, 220, 12
+    LTEXT "Cable A Mic:", -1, 20, 104, 70, 12
+    LTEXT "--", IDC_STATUS_A_MIC, 95, 104, 220, 12
+    LTEXT "Cable B Speaker:", -1, 20, 124, 70, 12
+    LTEXT "--", IDC_STATUS_B_SPK, 95, 124, 220, 12
+    LTEXT "Cable B Mic:", -1, 20, 140, 70, 12
+    LTEXT "--", IDC_STATUS_B_MIC, 95, 140, 220, 12
+
+    DEFPUSHBUTTON "Apply", IDAPPLY, 200, 210, 60, 20
+    PUSHBUTTON "Close", IDCANCEL, 270, 210, 60, 20
+END

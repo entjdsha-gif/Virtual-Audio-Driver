@@ -110,14 +110,14 @@ echo Platform: %PLATFORM%
 echo.
 
 REM -- Build dependencies first (Utilities + Filters)
-echo [1/3] Building dependencies (Utilities + Filters)...
+echo [1/4] Building dependencies (Utilities + Filters)...
 call "%MSBUILD_CMD%" "Source\Utilities\Utilities.vcxproj" /p:Configuration=%CONFIG% /p:Platform=%PLATFORM%
 if %errorlevel% neq 0 ( echo ERROR: Utilities build failed & pause >nul & exit /b %errorlevel% )
 call "%MSBUILD_CMD%" "Source\Filters\Filters.vcxproj" /p:Configuration=%CONFIG% /p:Platform=%PLATFORM%
 if %errorlevel% neq 0 ( echo ERROR: Filters build failed & pause >nul & exit /b %errorlevel% )
 
 REM -- Build Cable A
-echo [2/3] Building Cable A (aocablea.sys)...
+echo [2/4] Building Cable A (aocablea.sys)...
 if /i "%PLATFORM%"=="ARM64" (
     call "%MSBUILD_CMD%" "Source\Main\CableA.vcxproj" ^
         /p:Configuration=%CONFIG% /p:Platform=ARM64 ^
@@ -136,7 +136,7 @@ if %errorlevel% neq 0 (
 )
 
 REM -- Build Cable B
-echo [3/3] Building Cable B (aocableb.sys)...
+echo [3/4] Building Cable B (aocableb.sys)...
 if /i "%PLATFORM%"=="ARM64" (
     call "%MSBUILD_CMD%" "Source\Main\CableB.vcxproj" ^
         /p:Configuration=%CONFIG% /p:Platform=ARM64 ^
@@ -152,6 +152,17 @@ if %errorlevel% neq 0 (
     echo ERROR: Cable B build failed with exit code %errorlevel%
     pause >nul
     exit /b %errorlevel%
+)
+
+REM -- Build Control Panel (user-mode, x64 only)
+echo [4/4] Building Control Panel (AOControlPanel.exe)...
+if /i "%PLATFORM%"=="ARM64" (
+    echo       [skip] Control Panel is x64 only, skipping for ARM64.
+) else (
+    call "%MSBUILD_CMD%" "Source\ControlPanel\ControlPanel.vcxproj" /p:Configuration=%CONFIG% /p:Platform=%PLATFORM%
+    if %errorlevel% neq 0 (
+        echo WARNING: Control Panel build failed, drivers are still OK.
+    )
 )
 
 echo.
@@ -203,6 +214,11 @@ for %%c in (%CONFIGS%) do (
             if !errorlevel! neq 0 ( echo ERROR: CableB %%c %%p failed & pause >nul & exit /b !errorlevel! )
         )
 
+        if /i "%%p"=="x64" (
+            call "%MSBUILD_CMD%" "Source\ControlPanel\ControlPanel.vcxproj" /p:Configuration=%%c /p:Platform=%%p
+            if !errorlevel! neq 0 ( echo WARNING: ControlPanel %%c %%p failed, continuing... )
+        )
+
         echo Build %%c %%p completed successfully!
     )
 )
@@ -225,10 +241,11 @@ if %BUILD_ALL%==1 (
 )
 echo.
 echo Key files:
-echo   - aocablea.sys  (Cable A driver binary)
-echo   - aocableb.sys  (Cable B driver binary)
-echo   - aocablea.inf  (Cable A installation file)
-echo   - aocableb.inf  (Cable B installation file)
+echo   - aocablea.sys       (Cable A driver binary)
+echo   - aocableb.sys       (Cable B driver binary)
+echo   - aocablea.inf       (Cable A installation file)
+echo   - aocableb.inf       (Cable B installation file)
+echo   - AOControlPanel.exe (Control Panel tray app)
 
 echo.
 echo Press any key to close...

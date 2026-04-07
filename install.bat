@@ -254,6 +254,22 @@ pnputil /add-driver "%PKGDIR_B%\aocableb.inf" /install
 echo       Both drivers installed.
 
 REM ============================================================
+REM  Step 6b: Install Control Panel
+REM ============================================================
+set "CPEXE=%~dp0Source\ControlPanel\x64\Release\AOControlPanel.exe"
+if not exist "%CPEXE%" set "CPEXE=%~dp0x64\Release\AOControlPanel.exe"
+if exist "%CPEXE%" (
+    echo.
+    echo [6b] Installing Control Panel...
+    if not exist "%ProgramFiles%\AOAudio" mkdir "%ProgramFiles%\AOAudio"
+    copy /Y "%CPEXE%" "%ProgramFiles%\AOAudio\AOControlPanel.exe" >nul 2>&1
+    reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v "AOControlPanel" /t REG_SZ /d "\"%ProgramFiles%\AOAudio\AOControlPanel.exe\"" /f >nul 2>&1
+    echo       Control Panel installed and set to auto-start.
+) else (
+    echo       [skip] AOControlPanel.exe not found, skipping control panel install.
+)
+
+REM ============================================================
 REM  Step 7: Restore default audio devices
 REM ============================================================
 echo.

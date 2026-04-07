@@ -1186,7 +1186,7 @@ NTSTATUS CMiniportWaveRTStream::SetState
                 // Acquire stream resources
             }
 
-            // Ensure Mic sink is unregistered on stop.
+            // Ensure Mic sink, format, and DMA stash are cleared on stop.
             if (m_bCapture && m_pMiniport)
             {
                 PLOOPBACK_BUFFER pLB = NULL;
@@ -1195,12 +1195,18 @@ NTSTATUS CMiniportWaveRTStream::SetState
                 else if (m_pMiniport->m_DeviceType == eCableBMic)
                     pLB = &g_CableBLoopback;
                 if (pLB)
+                {
                     LoopbackUnregisterMicSink(pLB);
+                    LoopbackUnregisterFormat(pLB, FALSE);
+                    KIRQL irql;
+                    KeAcquireSpinLock(&pLB->SpinLock, &irql);
+                    pLB->MicDmaStash = NULL;
+                    pLB->MicDmaStashSize = 0;
+                    KeReleaseSpinLock(&pLB->SpinLock, irql);
+                }
             }
 
-            // Phase 4: Speaker stop - reset loopback ring buffer.
-            // Only unregister MicSink if Mic is NOT currently active,
-            // so Speaker restart can resume direct-push without Mic re-registering.
+            // Phase 4: Speaker stop - unregister format and reset loopback ring buffer.
             if (!m_bCapture && m_pMiniport)
             {
                 PLOOPBACK_BUFFER pLB = NULL;
@@ -1210,6 +1216,7 @@ NTSTATUS CMiniportWaveRTStream::SetState
                     pLB = &g_CableBLoopback;
                 if (pLB)
                 {
+                    LoopbackUnregisterFormat(pLB, TRUE);
                     LoopbackReset(pLB);
                     // Keep MicSink registered if Mic is still running,
                     // so Speaker restart resumes direct-push immediately.
@@ -1272,7 +1279,7 @@ NTSTATUS CMiniportWaveRTStream::SetState
                 // Run -> Pause
                 //
 
-                // Unregister Mic DMA sink before stopping timer.
+                // Unregister Mic DMA sink, format, and stash before stopping timer.
                 if (m_bCapture && m_pMiniport)
                 {
                     PLOOPBACK_BUFFER pLB = NULL;
@@ -1281,7 +1288,15 @@ NTSTATUS CMiniportWaveRTStream::SetState
                     else if (m_pMiniport->m_DeviceType == eCableBMic)
                         pLB = &g_CableBLoopback;
                     if (pLB)
+                    {
                         LoopbackUnregisterMicSink(pLB);
+                        LoopbackUnregisterFormat(pLB, FALSE);
+                        KIRQL irql;
+                        KeAcquireSpinLock(&pLB->SpinLock, &irql);
+                        pLB->MicDmaStash = NULL;
+                        pLB->MicDmaStashSize = 0;
+                        KeReleaseSpinLock(&pLB->SpinLock, irql);
+                    }
                 }
 
                 // Pause DMA
@@ -1311,7 +1326,40 @@ NTSTATUS CMiniportWaveRTStream::SetState
             break;
 
         case KSSTATE_RUN:
-            // Register Mic DMA as direct-push sink for loopback (eliminates async gap).
+            // Register stream format and Mic DMA sink for loopback.
+            if (m_pMiniport && m_pWfExt)
+            {
+                PLOOPBACK_BUFFER pLB = NULL;
+                BOOLEAN isSpeaker = FALSE;
+                if (m_bCapture)
+                {
+                    if (m_pMiniport->m_DeviceType == eCableAMic)
+                        pLB = &g_CableALoopback;
+                    else if (m_pMiniport->m_DeviceType == eCableBMic)
+                        pLB = &g_CableBLoopback;
+                    isSpeaker = FALSE;
+                }
+                else
+                {
+                    if (m_pMiniport->m_DeviceType == eCableASpeaker)
+                        pLB = &g_CableALoopback;
+                    else if (m_pMiniport->m_DeviceType == eCableBSpeaker)
+                        pLB = &g_CableBLoopback;
+                    isSpeaker = TRUE;
+                }
+                if (pLB)
+                {
+                    LoopbackRegisterFormat(pLB, isSpeaker,
+                        m_pWfExt->Format.nSamplesPerSec,
+                        m_pWfExt->Format.wBitsPerSample,
+                        m_pWfExt->Format.nChannels,
+                        m_pWfExt->Format.nBlockAlign);
+                    // LoopbackRegisterFormat auto-activates MicSink if
+                    // FormatMatch transitions FALSE->TRUE and DMA is stashed.
+                }
+            }
+
+            // Mic RUN: stash DMA info and register MicSink if formats match.
             if (m_bCapture && m_pMiniport && m_pDmaBuffer)
             {
                 PLOOPBACK_BUFFER pLB = NULL;
@@ -1320,7 +1368,19 @@ NTSTATUS CMiniportWaveRTStream::SetState
                 else if (m_pMiniport->m_DeviceType == eCableBMic)
                     pLB = &g_CableBLoopback;
                 if (pLB)
-                    LoopbackRegisterMicSink(pLB, m_pDmaBuffer, m_ulDmaBufferSize);
+                {
+                    // Always stash Mic DMA info for deferred MicSink activation.
+                    KIRQL irql;
+                    KeAcquireSpinLock(&pLB->SpinLock, &irql);
+                    pLB->MicDmaStash = m_pDmaBuffer;
+                    pLB->MicDmaStashSize = m_ulDmaBufferSize;
+                    KeReleaseSpinLock(&pLB->SpinLock, irql);
+
+                    if (pLB->FormatMatch)
+                    {
+                        LoopbackRegisterMicSink(pLB, m_pDmaBuffer, m_ulDmaBufferSize);
+                    }
+                }
             }
 
             // Phase 2: Zero-fill DMA buffer to prevent garbage data at stream start
@@ -1576,23 +1636,30 @@ For other devices: output silence (original behavior).
             pLoopback = &g_CableBLoopback;
     }
 
-    if (pLoopback && pLoopback->MicSink.Active)
+    if (pLoopback && pLoopback->MicSink.Active && pLoopback->FormatMatch)
     {
-        // Speaker DPC already pushed data directly into our DMA buffer.
+        // Speaker DPC already pushed data directly into our DMA buffer (passthrough).
         // Gap regions were zero-filled by UpdatePosition (Phase 8).
         // No copy needed here.
     }
     else
     {
-        // Phase 5: MicSink not active (Speaker stopped or not started).
-        // Pull from loopback ring (returns silence if ring was reset).
+        // Phase 5: MicSink not active, or format mismatch requires conversion.
+        // Pull from loopback ring with format conversion if needed.
         while (ByteDisplacement > 0)
         {
             ULONG runWrite = min(ByteDisplacement, m_ulDmaBufferSize - bufferOffset);
 
             if (pLoopback)
             {
-                LoopbackRead(pLoopback, m_pDmaBuffer + bufferOffset, runWrite);
+                if (pLoopback->FormatMatch)
+                {
+                    LoopbackRead(pLoopback, m_pDmaBuffer + bufferOffset, runWrite);
+                }
+                else
+                {
+                    LoopbackReadConverted(pLoopback, m_pDmaBuffer + bufferOffset, runWrite);
+                }
             }
             else
             {
@@ -1606,21 +1673,43 @@ For other devices: output silence (original behavior).
 
     // Phase 6: Apply fade-in ramp to prevent pop/click at capture stream start.
     // Applies to data from both paths (MicSink direct-push or LoopbackRead).
+    // Supports both 16-bit and 24-bit formats.
     if (m_ulFadeInRemaining > 0 && totalBytes > 0 && m_pWfExt)
     {
         ULONG nBlockAlign = m_pWfExt->Format.nBlockAlign;
         ULONG nChannels = m_pWfExt->Format.nChannels;
+        ULONG bitsPerSample = m_pWfExt->Format.wBitsPerSample;
         ULONG sampleCount = totalBytes / nBlockAlign;
         ULONG fadePos = fadeStartOffset;
 
         for (ULONG i = 0; i < sampleCount && m_ulFadeInRemaining > 0; i++)
         {
             ULONG rampPos = FADE_SAMPLES - m_ulFadeInRemaining;
-            INT16* pSample = (INT16*)(m_pDmaBuffer + fadePos);
-            for (ULONG ch = 0; ch < nChannels; ch++)
+
+            if (bitsPerSample == 16)
             {
-                pSample[ch] = (INT16)(((INT32)pSample[ch] * rampPos) / FADE_SAMPLES);
+                INT16* pSample = (INT16*)(m_pDmaBuffer + fadePos);
+                for (ULONG ch = 0; ch < nChannels; ch++)
+                {
+                    pSample[ch] = (INT16)(((INT32)pSample[ch] * rampPos) / FADE_SAMPLES);
+                }
             }
+            else if (bitsPerSample == 24)
+            {
+                BYTE* pFrame = m_pDmaBuffer + fadePos;
+                for (ULONG ch = 0; ch < nChannels; ch++)
+                {
+                    BYTE* p = pFrame + ch * 3;
+                    // Read 24-bit packed sample (little-endian, sign-extended)
+                    INT32 val = (INT32)(p[0] | (p[1] << 8) | ((INT8)p[2] << 16));
+                    val = (INT32)(((INT64)val * rampPos) / FADE_SAMPLES);
+                    // Write back
+                    p[0] = (BYTE)(val & 0xFF);
+                    p[1] = (BYTE)((val >> 8) & 0xFF);
+                    p[2] = (BYTE)((val >> 16) & 0xFF);
+                }
+            }
+
             fadePos = (fadePos + nBlockAlign) % m_ulDmaBufferSize;
             m_ulFadeInRemaining--;
         }
@@ -1670,7 +1759,14 @@ For other devices: save data to file (original behavior).
         if (pLoopback)
         {
             // Cable speaker: push app audio into loopback ring buffer
-            LoopbackWrite(pLoopback, m_pDmaBuffer + bufferOffset, runWrite);
+            if (pLoopback->FormatMatch)
+            {
+                LoopbackWrite(pLoopback, m_pDmaBuffer + bufferOffset, runWrite);
+            }
+            else
+            {
+                LoopbackWriteConverted(pLoopback, m_pDmaBuffer + bufferOffset, runWrite);
+            }
         }
         else
         {

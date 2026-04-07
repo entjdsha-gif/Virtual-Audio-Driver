@@ -7,27 +7,27 @@ Module Name:
 Abstract:
 
     Declaration of wave miniport tables for Cable A/B endpoints.
-    Multi-format: 44.1/48/96 kHz, 16/24-bit, stereo PCM.
-    Default 48 kHz/16-bit matches Windows audio engine, eliminating resampling.
-    Render and capture share the same format table so loopback is raw byte copy.
-    NOTE: Speaker and Mic must use the same format for correct loopback.
+    Multi-format: 8k~192kHz, 16/24-bit, mono/stereo PCM (48 combinations).
+    Default 48 kHz/16-bit/stereo matches Windows audio engine.
+    Internal loopback uses format conversion engine for mismatched formats.
 
 --*/
 
 #ifndef _VIRTUALAUDIODRIVER_CABLEWAVTABLE_H_
 #define _VIRTUALAUDIODRIVER_CABLEWAVTABLE_H_
 
-// Cable endpoints: stereo, multi-rate, multi-depth
+// Cable endpoints: mono/stereo, multi-rate, multi-depth
 #define CABLE_DEVICE_MAX_CHANNELS           2
+#define CABLE_DEVICE_MIN_CHANNELS           1
 #define CABLE_HOST_MAX_CHANNELS             2
 #define CABLE_HOST_MIN_BITS_PER_SAMPLE      16
 #define CABLE_HOST_MAX_BITS_PER_SAMPLE      24
-#define CABLE_HOST_MIN_SAMPLE_RATE          44100
-#define CABLE_HOST_MAX_SAMPLE_RATE          96000
+#define CABLE_HOST_MIN_SAMPLE_RATE          8000
+#define CABLE_HOST_MAX_SAMPLE_RATE          192000
 #define CABLE_MAX_INPUT_STREAMS             1
 
 //=============================================================================
-// Supported device formats: 44.1/48/96 kHz x 16/24-bit x stereo PCM
+// Supported device formats: 12 rates x 2 depths x 2 channels = 48 combos
 // Index [0] = default (48 kHz / 16-bit / stereo)
 //=============================================================================
 
@@ -41,117 +41,148 @@ Abstract:
         STATICGUIDOF(KSDATAFORMAT_SPECIFIER_WAVEFORMATEX) \
     }
 
+// Helper macro: stereo format entry
+#define CABLE_FMT_STEREO(rate, bits) \
+    { \
+        CABLE_KSDATAFORMAT_AUDIO_HEADER, \
+        { \
+            { \
+                WAVE_FORMAT_EXTENSIBLE, \
+                2, \
+                (rate), \
+                (rate) * 2 * (bits) / 8, \
+                2 * (bits) / 8, \
+                (WORD)(bits), \
+                sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX) \
+            }, \
+            (WORD)(bits), \
+            KSAUDIO_SPEAKER_STEREO, \
+            STATICGUIDOF(KSDATAFORMAT_SUBTYPE_PCM) \
+        } \
+    }
+
+// Helper macro: mono format entry
+#define CABLE_FMT_MONO(rate, bits) \
+    { \
+        CABLE_KSDATAFORMAT_AUDIO_HEADER, \
+        { \
+            { \
+                WAVE_FORMAT_EXTENSIBLE, \
+                1, \
+                (rate), \
+                (rate) * 1 * (bits) / 8, \
+                1 * (bits) / 8, \
+                (WORD)(bits), \
+                sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX) \
+            }, \
+            (WORD)(bits), \
+            KSAUDIO_SPEAKER_MONO, \
+            STATICGUIDOF(KSDATAFORMAT_SUBTYPE_PCM) \
+        } \
+    }
+
 static
 KSDATAFORMAT_WAVEFORMATEXTENSIBLE CableHostPinSupportedDeviceFormats[] =
 {
-    // [0] 48000 Hz / 16-bit / stereo  (DEFAULT)
-    {
-        CABLE_KSDATAFORMAT_AUDIO_HEADER,
-        {
-            {
-                WAVE_FORMAT_EXTENSIBLE,
-                2,                              // nChannels
-                48000,                          // nSamplesPerSec
-                48000 * 2 * 16 / 8,             // nAvgBytesPerSec = 192000
-                2 * 16 / 8,                     // nBlockAlign = 4
-                16,                             // wBitsPerSample
-                sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)
-            },
-            16,                                 // wValidBitsPerSample
-            KSAUDIO_SPEAKER_STEREO,
-            STATICGUIDOF(KSDATAFORMAT_SUBTYPE_PCM)
-        }
-    },
-    // [1] 48000 Hz / 24-bit / stereo
-    {
-        CABLE_KSDATAFORMAT_AUDIO_HEADER,
-        {
-            {
-                WAVE_FORMAT_EXTENSIBLE,
-                2,
-                48000,
-                48000 * 2 * 24 / 8,             // nAvgBytesPerSec = 288000
-                2 * 24 / 8,                     // nBlockAlign = 6
-                24,
-                sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)
-            },
-            24,
-            KSAUDIO_SPEAKER_STEREO,
-            STATICGUIDOF(KSDATAFORMAT_SUBTYPE_PCM)
-        }
-    },
-    // [2] 44100 Hz / 16-bit / stereo
-    {
-        CABLE_KSDATAFORMAT_AUDIO_HEADER,
-        {
-            {
-                WAVE_FORMAT_EXTENSIBLE,
-                2,
-                44100,
-                44100 * 2 * 16 / 8,             // nAvgBytesPerSec = 176400
-                2 * 16 / 8,                     // nBlockAlign = 4
-                16,
-                sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)
-            },
-            16,
-            KSAUDIO_SPEAKER_STEREO,
-            STATICGUIDOF(KSDATAFORMAT_SUBTYPE_PCM)
-        }
-    },
-    // [3] 44100 Hz / 24-bit / stereo
-    {
-        CABLE_KSDATAFORMAT_AUDIO_HEADER,
-        {
-            {
-                WAVE_FORMAT_EXTENSIBLE,
-                2,
-                44100,
-                44100 * 2 * 24 / 8,             // nAvgBytesPerSec = 264600
-                2 * 24 / 8,                     // nBlockAlign = 6
-                24,
-                sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)
-            },
-            24,
-            KSAUDIO_SPEAKER_STEREO,
-            STATICGUIDOF(KSDATAFORMAT_SUBTYPE_PCM)
-        }
-    },
-    // [4] 96000 Hz / 16-bit / stereo
-    {
-        CABLE_KSDATAFORMAT_AUDIO_HEADER,
-        {
-            {
-                WAVE_FORMAT_EXTENSIBLE,
-                2,
-                96000,
-                96000 * 2 * 16 / 8,             // nAvgBytesPerSec = 384000
-                2 * 16 / 8,                     // nBlockAlign = 4
-                16,
-                sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)
-            },
-            16,
-            KSAUDIO_SPEAKER_STEREO,
-            STATICGUIDOF(KSDATAFORMAT_SUBTYPE_PCM)
-        }
-    },
-    // [5] 96000 Hz / 24-bit / stereo
-    {
-        CABLE_KSDATAFORMAT_AUDIO_HEADER,
-        {
-            {
-                WAVE_FORMAT_EXTENSIBLE,
-                2,
-                96000,
-                96000 * 2 * 24 / 8,             // nAvgBytesPerSec = 576000
-                2 * 24 / 8,                     // nBlockAlign = 6
-                24,
-                sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)
-            },
-            24,
-            KSAUDIO_SPEAKER_STEREO,
-            STATICGUIDOF(KSDATAFORMAT_SUBTYPE_PCM)
-        }
-    },
+    // === STEREO FORMATS (24 entries) ===
+    //  [0] 48000/16/stereo (DEFAULT)
+    CABLE_FMT_STEREO(48000, 16),
+    //  [1] 48000/24/stereo
+    CABLE_FMT_STEREO(48000, 24),
+    //  [2] 44100/16/stereo
+    CABLE_FMT_STEREO(44100, 16),
+    //  [3] 44100/24/stereo
+    CABLE_FMT_STEREO(44100, 24),
+    //  [4] 96000/16/stereo
+    CABLE_FMT_STEREO(96000, 16),
+    //  [5] 96000/24/stereo
+    CABLE_FMT_STEREO(96000, 24),
+    //  [6] 88200/16/stereo
+    CABLE_FMT_STEREO(88200, 16),
+    //  [7] 88200/24/stereo
+    CABLE_FMT_STEREO(88200, 24),
+    //  [8] 192000/16/stereo
+    CABLE_FMT_STEREO(192000, 16),
+    //  [9] 192000/24/stereo
+    CABLE_FMT_STEREO(192000, 24),
+    // [10] 176400/16/stereo
+    CABLE_FMT_STEREO(176400, 16),
+    // [11] 176400/24/stereo
+    CABLE_FMT_STEREO(176400, 24),
+    // [12] 32000/16/stereo
+    CABLE_FMT_STEREO(32000, 16),
+    // [13] 32000/24/stereo
+    CABLE_FMT_STEREO(32000, 24),
+    // [14] 24000/16/stereo
+    CABLE_FMT_STEREO(24000, 16),
+    // [15] 24000/24/stereo
+    CABLE_FMT_STEREO(24000, 24),
+    // [16] 22050/16/stereo
+    CABLE_FMT_STEREO(22050, 16),
+    // [17] 22050/24/stereo
+    CABLE_FMT_STEREO(22050, 24),
+    // [18] 16000/16/stereo
+    CABLE_FMT_STEREO(16000, 16),
+    // [19] 16000/24/stereo
+    CABLE_FMT_STEREO(16000, 24),
+    // [20] 11025/16/stereo
+    CABLE_FMT_STEREO(11025, 16),
+    // [21] 11025/24/stereo
+    CABLE_FMT_STEREO(11025, 24),
+    // [22] 8000/16/stereo
+    CABLE_FMT_STEREO(8000, 16),
+    // [23] 8000/24/stereo
+    CABLE_FMT_STEREO(8000, 24),
+
+    // === MONO FORMATS (24 entries) ===
+    // [24] 48000/16/mono
+    CABLE_FMT_MONO(48000, 16),
+    // [25] 48000/24/mono
+    CABLE_FMT_MONO(48000, 24),
+    // [26] 44100/16/mono
+    CABLE_FMT_MONO(44100, 16),
+    // [27] 44100/24/mono
+    CABLE_FMT_MONO(44100, 24),
+    // [28] 96000/16/mono
+    CABLE_FMT_MONO(96000, 16),
+    // [29] 96000/24/mono
+    CABLE_FMT_MONO(96000, 24),
+    // [30] 88200/16/mono
+    CABLE_FMT_MONO(88200, 16),
+    // [31] 88200/24/mono
+    CABLE_FMT_MONO(88200, 24),
+    // [32] 192000/16/mono
+    CABLE_FMT_MONO(192000, 16),
+    // [33] 192000/24/mono
+    CABLE_FMT_MONO(192000, 24),
+    // [34] 176400/16/mono
+    CABLE_FMT_MONO(176400, 16),
+    // [35] 176400/24/mono
+    CABLE_FMT_MONO(176400, 24),
+    // [36] 32000/16/mono
+    CABLE_FMT_MONO(32000, 16),
+    // [37] 32000/24/mono
+    CABLE_FMT_MONO(32000, 24),
+    // [38] 24000/16/mono
+    CABLE_FMT_MONO(24000, 16),
+    // [39] 24000/24/mono
+    CABLE_FMT_MONO(24000, 24),
+    // [40] 22050/16/mono
+    CABLE_FMT_MONO(22050, 16),
+    // [41] 22050/24/mono
+    CABLE_FMT_MONO(22050, 24),
+    // [42] 16000/16/mono
+    CABLE_FMT_MONO(16000, 16),
+    // [43] 16000/24/mono
+    CABLE_FMT_MONO(16000, 24),
+    // [44] 11025/16/mono
+    CABLE_FMT_MONO(11025, 16),
+    // [45] 11025/24/mono
+    CABLE_FMT_MONO(11025, 24),
+    // [46] 8000/16/mono
+    CABLE_FMT_MONO(8000, 16),
+    // [47] 8000/24/mono
+    CABLE_FMT_MONO(8000, 24),
 };
 
 //=============================================================================
@@ -223,7 +254,7 @@ PIN_DEVICE_FORMATS_AND_MODES CableCapturePinDeviceFormatsAndModes[] =
 };
 
 //=============================================================================
-// Data range: 48 kHz / 16-bit / stereo
+// Data range: full range (mono~stereo, 16~24bit, 8k~192kHz)
 //=============================================================================
 static
 KSDATARANGE_AUDIO CablePinDataRangesStream[] =
@@ -239,10 +270,10 @@ KSDATARANGE_AUDIO CablePinDataRangesStream[] =
             STATICGUIDOF(KSDATAFORMAT_SPECIFIER_WAVEFORMATEX)
         },
         CABLE_HOST_MAX_CHANNELS,            // MaximumChannels = 2
-        CABLE_HOST_BITS_PER_SAMPLE,         // MinimumBitsPerSample = 16
-        CABLE_HOST_BITS_PER_SAMPLE,         // MaximumBitsPerSample = 16
-        CABLE_HOST_SAMPLE_RATE,             // MinimumSampleFrequency = 48000
-        CABLE_HOST_SAMPLE_RATE              // MaximumSampleFrequency = 48000
+        CABLE_HOST_MIN_BITS_PER_SAMPLE,     // MinimumBitsPerSample = 16
+        CABLE_HOST_MAX_BITS_PER_SAMPLE,     // MaximumBitsPerSample = 24
+        CABLE_HOST_MIN_SAMPLE_RATE,         // MinimumSampleFrequency = 8000
+        CABLE_HOST_MAX_SAMPLE_RATE          // MaximumSampleFrequency = 192000
     }
 };
 

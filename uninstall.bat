@@ -49,6 +49,12 @@ del /f "%SystemRoot%\System32\drivers\aocablea.sys" >nul 2>&1
 del /f "%SystemRoot%\System32\drivers\aocableb.sys" >nul 2>&1
 del /f "%SystemRoot%\System32\drivers\virtualaudiodriver.sys" >nul 2>&1
 
+REM Remove Control Panel
+taskkill /f /im AOControlPanel.exe >nul 2>&1
+reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v "AOControlPanel" /f >nul 2>&1
+del /f "%ProgramFiles%\AOAudio\AOControlPanel.exe" >nul 2>&1
+rmdir "%ProgramFiles%\AOAudio" >nul 2>&1
+
 echo Done. All AO Virtual Cable devices removed.
 endlocal
 exit /b 0
