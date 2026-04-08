@@ -18,20 +18,20 @@ Abstract:
 //=============================================================================
 #define LB_DEFAULT_INTERNAL_RATE       48000
 #define LB_INTERNAL_BITS               24
-#define LB_INTERNAL_CHANNELS           8
-#define LB_INTERNAL_BLOCKALIGN         24  // 24bit(3bytes) * 8ch = 24 bytes/frame
+#define LB_INTERNAL_CHANNELS           2
+#define LB_INTERNAL_BLOCKALIGN         6   // 24bit(3bytes) * 2ch = 6 bytes/frame
 #define LB_DEFAULT_LATENCY_MS          20
 #define LB_MIN_LATENCY_MS             5
 #define LB_MAX_LATENCY_MS             100
 
-// Convert buffer: 192kHz/8ch/2ms = 192*8*4(INT32)*2 = 12288, round up
-#define LB_CONVERT_BUF_SIZE           16384
+// Convert buffer: 192kHz/2ch/2ms = 192*2*4(INT32)*2 = 3072, round up
+#define LB_CONVERT_BUF_SIZE           4096
 
 // Default buffer size: 4 seconds @ internal format
 #define LOOPBACK_BUFFER_SIZE  (48000 * LB_INTERNAL_BLOCKALIGN * 4)
 
 // Max render streams for multi-client support
-#define LB_MAX_RENDER_STREAMS         4
+#define LB_MAX_RENDER_STREAMS         1
 
 //=============================================================================
 // Stream format descriptor

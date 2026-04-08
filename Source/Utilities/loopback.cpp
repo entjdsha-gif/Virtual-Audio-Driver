@@ -3,8 +3,8 @@ Module Name:
     loopback.cpp
 Abstract:
     Loopback ring buffer with format conversion engine.
-    Internal format: 48kHz/24bit/8ch (configurable rate via IOCTL).
-    Handles bit depth (16/24/32float), channel (mono to 7.1), and
+    Internal format: 48kHz/24bit/stereo (configurable rate via IOCTL).
+    Handles bit depth (16/24/32float), channel (mono/stereo), and
     sample rate conversion using 8-tap windowed sinc interpolation.
     All arithmetic is integer-only, safe at DISPATCH_LEVEL.
 --*/
@@ -196,10 +196,8 @@ static __forceinline void WriteSample(BYTE* p, INT32 val, const LB_FORMAT* fmt)
 // Convert input data to internal N-channel format (INT32 per channel)
 // Output: ch0,ch1,...ch(N-1) per frame, N = LB_INTERNAL_CHANNELS
 // Channel mapping:
-//   1ch -> FL=FR=input, rest 0
-//   2ch -> FL,FR from input, rest 0
-//   6ch -> FL,FR,FC,LFE,BL,BR from input, rest 0
-//   8ch -> all from input
+//   1ch -> FL=FR=input
+//   2ch -> FL,FR from input
 // Returns number of internal frames produced.
 //=============================================================================
 static ULONG ConvertToInternal(
@@ -244,10 +242,8 @@ static ULONG ConvertToInternal(
 //=============================================================================
 // Convert from internal N-channel INT32 samples to output format bytes
 // Channel downmix:
-//   Nch -> 1ch: average FL + FR
-//   Nch -> 2ch: copy FL, FR
-//   Nch -> 6ch: copy channels 0-5
-//   Nch -> 8ch: copy all
+//   2ch -> 1ch: average FL + FR
+//   2ch -> 2ch: copy FL, FR
 // Returns bytes written.
 //=============================================================================
 static ULONG ConvertFromInternal(
