@@ -222,12 +222,10 @@ Arguments:
     }
 
     //
-    // For capture endpoints (MicArray, Cable A/B Mic), return the default format
-    // directly. PortCls default handler does not reliably intersect
-    // KSDATARANGE_ATTRIBUTES + WAVE_FORMAT_EXTENSIBLE data ranges, so capture
-    // endpoints must handle intersection explicitly.
-    //
-    // For render endpoints, let the class handler do the rest.
+    // Handle DataRangeIntersection explicitly for all endpoints.
+    // PortCls default handler does not reliably intersect
+    // KSDATARANGE_ATTRIBUTES + WAVE_FORMAT_EXTENSIBLE data ranges,
+    // and crashes with MaximumChannels > 2.
     //
     if (m_DeviceType == eMicArrayDevice1)
     {
@@ -250,10 +248,9 @@ Arguments:
 
         return STATUS_SUCCESS;
     }
-    else if (m_DeviceType == eCableAMic || m_DeviceType == eCableBMic)
+    else
     {
-        // Cable capture: return default format (index 0 = 48kHz/16bit/stereo).
-        // Match against MyDataRange to ensure the client's range is compatible.
+        // All Cable endpoints (render + capture): match against supported formats.
         PKSDATARANGE_AUDIO myAudioRange = (PKSDATARANGE_AUDIO)MyDataRange;
 
         requiredSize = sizeof(KSDATAFORMAT_WAVEFORMATEXTENSIBLE);
@@ -268,10 +265,19 @@ Arguments:
             return STATUS_BUFFER_TOO_SMALL;
         }
 
-        // Find the best matching format from our supported list.
-        // Walk the PIN_DEVICE_FORMATS_AND_MODES for the streaming pin.
-        KSDATAFORMAT_WAVEFORMATEXTENSIBLE* pFormats = m_DeviceFormatsAndModes[KSPIN_WAVEIN_HOST].WaveFormats;
-        ULONG cFormats = m_DeviceFormatsAndModes[KSPIN_WAVEIN_HOST].WaveFormatsCount;
+        // Determine the streaming pin index for format lookup.
+        ULONG streamingPinIndex;
+        if (IsRenderDevice())
+        {
+            streamingPinIndex = KSPIN_WAVE_RENDER3_SINK_SYSTEM;
+        }
+        else
+        {
+            streamingPinIndex = KSPIN_WAVEIN_HOST;
+        }
+
+        KSDATAFORMAT_WAVEFORMATEXTENSIBLE* pFormats = m_DeviceFormatsAndModes[streamingPinIndex].WaveFormats;
+        ULONG cFormats = m_DeviceFormatsAndModes[streamingPinIndex].WaveFormatsCount;
 
         for (ULONG i = 0; i < cFormats; i++)
         {
@@ -305,32 +311,6 @@ Arguments:
         }
 
         return STATUS_NO_MATCH;
-    }
-    else
-    {
-        // Render endpoints: let the class handler handle intersection.
-        requiredSize = sizeof(KSDATAFORMAT_WAVEFORMATEXTENSIBLE);
-
-        if (!OutputBufferLength)
-        {
-            *ResultantFormatLength = requiredSize;
-            return STATUS_BUFFER_OVERFLOW;
-        }
-        else if (OutputBufferLength < requiredSize)
-        {
-            return STATUS_BUFFER_TOO_SMALL;
-        }
-
-        // Verify channel count is compatible.
-        if (((PKSDATARANGE_AUDIO)MyDataRange)->MaximumChannels < ((PKSDATARANGE_AUDIO)ClientDataRange)->MaximumChannels)
-        {
-            return STATUS_NO_MATCH;
-        }
-
-        //
-        // Ok, let the class handler do the rest.
-        //
-        return STATUS_NOT_IMPLEMENTED;
     }
 
 } // DataRangeIntersection
