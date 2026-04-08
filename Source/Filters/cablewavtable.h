@@ -16,18 +16,18 @@ Abstract:
 #ifndef _VIRTUALAUDIODRIVER_CABLEWAVTABLE_H_
 #define _VIRTUALAUDIODRIVER_CABLEWAVTABLE_H_
 
-// Cable endpoints: mono/stereo, multi-rate, multi-depth, PCM + IEEE_FLOAT
-#define CABLE_DEVICE_MAX_CHANNELS           2
+// Cable endpoints: mono/stereo/5.1/7.1, multi-rate, multi-depth, PCM + IEEE_FLOAT
+#define CABLE_DEVICE_MAX_CHANNELS           8
 #define CABLE_DEVICE_MIN_CHANNELS           1
-#define CABLE_HOST_MAX_CHANNELS             2
+#define CABLE_HOST_MAX_CHANNELS             8
 #define CABLE_HOST_MIN_BITS_PER_SAMPLE_PCM  16
 #define CABLE_HOST_MAX_BITS_PER_SAMPLE_PCM  24
 #define CABLE_HOST_MIN_SAMPLE_RATE          8000
 #define CABLE_HOST_MAX_SAMPLE_RATE          192000
-#define CABLE_MAX_INPUT_STREAMS             1
+#define CABLE_MAX_INPUT_STREAMS             4
 
 //=============================================================================
-// Supported device formats: 12 rates x 3 depths x 2 channels = 72 combos
+// Supported device formats: 12 rates x 3 depths x 4 layouts = 108 combos
 // Index [0] = default (48 kHz / 16-bit / stereo)
 //=============================================================================
 
@@ -107,6 +107,86 @@ Abstract:
             }, \
             32, \
             KSAUDIO_SPEAKER_STEREO, \
+            STATICGUIDOF(KSDATAFORMAT_SUBTYPE_IEEE_FLOAT) \
+        } \
+    }
+
+// Helper macro: 5.1 surround PCM format entry
+#define CABLE_FMT_51(rate, bits) \
+    { \
+        CABLE_KSDATAFORMAT_AUDIO_HEADER, \
+        { \
+            { \
+                WAVE_FORMAT_EXTENSIBLE, \
+                6, \
+                (rate), \
+                (rate) * 6 * (bits) / 8, \
+                6 * (bits) / 8, \
+                (WORD)(bits), \
+                sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX) \
+            }, \
+            (WORD)(bits), \
+            KSAUDIO_SPEAKER_5POINT1_SURROUND, \
+            STATICGUIDOF(KSDATAFORMAT_SUBTYPE_PCM) \
+        } \
+    }
+
+// Helper macro: 7.1 surround PCM format entry
+#define CABLE_FMT_71(rate, bits) \
+    { \
+        CABLE_KSDATAFORMAT_AUDIO_HEADER, \
+        { \
+            { \
+                WAVE_FORMAT_EXTENSIBLE, \
+                8, \
+                (rate), \
+                (rate) * 8 * (bits) / 8, \
+                8 * (bits) / 8, \
+                (WORD)(bits), \
+                sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX) \
+            }, \
+            (WORD)(bits), \
+            KSAUDIO_SPEAKER_7POINT1_SURROUND, \
+            STATICGUIDOF(KSDATAFORMAT_SUBTYPE_PCM) \
+        } \
+    }
+
+// Helper macro: 5.1 surround IEEE_FLOAT format entry (always 32-bit)
+#define CABLE_FMT_51_FLOAT(rate) \
+    { \
+        CABLE_KSDATAFORMAT_AUDIO_HEADER_FLOAT, \
+        { \
+            { \
+                WAVE_FORMAT_EXTENSIBLE, \
+                6, \
+                (rate), \
+                (rate) * 6 * 4, \
+                6 * 4, \
+                32, \
+                sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX) \
+            }, \
+            32, \
+            KSAUDIO_SPEAKER_5POINT1_SURROUND, \
+            STATICGUIDOF(KSDATAFORMAT_SUBTYPE_IEEE_FLOAT) \
+        } \
+    }
+
+// Helper macro: 7.1 surround IEEE_FLOAT format entry (always 32-bit)
+#define CABLE_FMT_71_FLOAT(rate) \
+    { \
+        CABLE_KSDATAFORMAT_AUDIO_HEADER_FLOAT, \
+        { \
+            { \
+                WAVE_FORMAT_EXTENSIBLE, \
+                8, \
+                (rate), \
+                (rate) * 8 * 4, \
+                8 * 4, \
+                32, \
+                sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX) \
+            }, \
+            32, \
+            KSAUDIO_SPEAKER_7POINT1_SURROUND, \
             STATICGUIDOF(KSDATAFORMAT_SUBTYPE_IEEE_FLOAT) \
         } \
     }
@@ -285,6 +365,86 @@ KSDATAFORMAT_WAVEFORMATEXTENSIBLE CableHostPinSupportedDeviceFormats[] =
     CABLE_FMT_MONO_FLOAT(11025),
     // [71] 8000/32float/mono
     CABLE_FMT_MONO_FLOAT(8000),
+
+    // === 5.1 SURROUND PCM FORMATS (12 entries) ===
+    // [72] 48000/16/5.1
+    CABLE_FMT_51(48000, 16),
+    // [73] 48000/24/5.1
+    CABLE_FMT_51(48000, 24),
+    // [74] 44100/16/5.1
+    CABLE_FMT_51(44100, 16),
+    // [75] 44100/24/5.1
+    CABLE_FMT_51(44100, 24),
+    // [76] 96000/16/5.1
+    CABLE_FMT_51(96000, 16),
+    // [77] 96000/24/5.1
+    CABLE_FMT_51(96000, 24),
+    // [78] 88200/16/5.1
+    CABLE_FMT_51(88200, 16),
+    // [79] 88200/24/5.1
+    CABLE_FMT_51(88200, 24),
+    // [80] 192000/16/5.1
+    CABLE_FMT_51(192000, 16),
+    // [81] 192000/24/5.1
+    CABLE_FMT_51(192000, 24),
+    // [82] 176400/16/5.1
+    CABLE_FMT_51(176400, 16),
+    // [83] 176400/24/5.1
+    CABLE_FMT_51(176400, 24),
+
+    // === 5.1 SURROUND FLOAT FORMATS (6 entries) ===
+    // [84] 48000/32float/5.1
+    CABLE_FMT_51_FLOAT(48000),
+    // [85] 44100/32float/5.1
+    CABLE_FMT_51_FLOAT(44100),
+    // [86] 96000/32float/5.1
+    CABLE_FMT_51_FLOAT(96000),
+    // [87] 88200/32float/5.1
+    CABLE_FMT_51_FLOAT(88200),
+    // [88] 192000/32float/5.1
+    CABLE_FMT_51_FLOAT(192000),
+    // [89] 176400/32float/5.1
+    CABLE_FMT_51_FLOAT(176400),
+
+    // === 7.1 SURROUND PCM FORMATS (12 entries) ===
+    // [90] 48000/16/7.1
+    CABLE_FMT_71(48000, 16),
+    // [91] 48000/24/7.1
+    CABLE_FMT_71(48000, 24),
+    // [92] 44100/16/7.1
+    CABLE_FMT_71(44100, 16),
+    // [93] 44100/24/7.1
+    CABLE_FMT_71(44100, 24),
+    // [94] 96000/16/7.1
+    CABLE_FMT_71(96000, 16),
+    // [95] 96000/24/7.1
+    CABLE_FMT_71(96000, 24),
+    // [96] 88200/16/7.1
+    CABLE_FMT_71(88200, 16),
+    // [97] 88200/24/7.1
+    CABLE_FMT_71(88200, 24),
+    // [98] 192000/16/7.1
+    CABLE_FMT_71(192000, 16),
+    // [99] 192000/24/7.1
+    CABLE_FMT_71(192000, 24),
+    // [100] 176400/16/7.1
+    CABLE_FMT_71(176400, 16),
+    // [101] 176400/24/7.1
+    CABLE_FMT_71(176400, 24),
+
+    // === 7.1 SURROUND FLOAT FORMATS (6 entries) ===
+    // [102] 48000/32float/7.1
+    CABLE_FMT_71_FLOAT(48000),
+    // [103] 44100/32float/7.1
+    CABLE_FMT_71_FLOAT(44100),
+    // [104] 96000/32float/7.1
+    CABLE_FMT_71_FLOAT(96000),
+    // [105] 88200/32float/7.1
+    CABLE_FMT_71_FLOAT(88200),
+    // [106] 192000/32float/7.1
+    CABLE_FMT_71_FLOAT(192000),
+    // [107] 176400/32float/7.1
+    CABLE_FMT_71_FLOAT(176400),
 };
 
 //=============================================================================
@@ -356,8 +516,8 @@ PIN_DEVICE_FORMATS_AND_MODES CableCapturePinDeviceFormatsAndModes[] =
 };
 
 //=============================================================================
-// Data range: PCM (mono~stereo, 16~24bit, 8k~192kHz)
-//           + IEEE_FLOAT (mono~stereo, 32bit, 8k~192kHz)
+// Data range: PCM (mono~7.1, 16~24bit, 8k~192kHz)
+//           + IEEE_FLOAT (mono~7.1, 32bit, 8k~192kHz)
 //=============================================================================
 static
 KSDATARANGE_AUDIO CablePinDataRangesStream[] =
@@ -373,7 +533,7 @@ KSDATARANGE_AUDIO CablePinDataRangesStream[] =
             STATICGUIDOF(KSDATAFORMAT_SUBTYPE_PCM),
             STATICGUIDOF(KSDATAFORMAT_SPECIFIER_WAVEFORMATEX)
         },
-        CABLE_HOST_MAX_CHANNELS,                // MaximumChannels = 2
+        CABLE_HOST_MAX_CHANNELS,                // MaximumChannels = 8
         CABLE_HOST_MIN_BITS_PER_SAMPLE_PCM,     // MinimumBitsPerSample = 16
         CABLE_HOST_MAX_BITS_PER_SAMPLE_PCM,     // MaximumBitsPerSample = 24
         CABLE_HOST_MIN_SAMPLE_RATE,             // MinimumSampleFrequency = 8000
@@ -390,7 +550,7 @@ KSDATARANGE_AUDIO CablePinDataRangesStream[] =
             STATICGUIDOF(KSDATAFORMAT_SUBTYPE_IEEE_FLOAT),
             STATICGUIDOF(KSDATAFORMAT_SPECIFIER_WAVEFORMATEX)
         },
-        CABLE_HOST_MAX_CHANNELS,                // MaximumChannels = 2
+        CABLE_HOST_MAX_CHANNELS,                // MaximumChannels = 8
         32,                                     // MinimumBitsPerSample = 32
         32,                                     // MaximumBitsPerSample = 32
         CABLE_HOST_MIN_SAMPLE_RATE,             // MinimumSampleFrequency = 8000

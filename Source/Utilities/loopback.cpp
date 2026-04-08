@@ -194,10 +194,12 @@ static __forceinline void WriteSample(BYTE* p, INT32 val, const LB_FORMAT* fmt)
 
 //=============================================================================
 // Convert input data to internal N-channel format (INT32 per channel)
-// Output: ch0,ch1,...ch(N-1) per frame, N = LB_INTERNAL_CHANNELS
+// Output: ch0,ch1,...ch(N-1) per frame, N = LB_INTERNAL_CHANNELS (8)
 // Channel mapping:
-//   1ch -> FL=FR=input
-//   2ch -> FL,FR from input
+//   1ch -> FL=FR=input, rest silence
+//   2ch -> FL,FR from input, rest silence
+//   6ch (5.1) -> FL,FR,FC,LFE,BL,BR from input, SL,SR silence
+//   8ch (7.1) -> all channels from input
 // Returns number of internal frames produced.
 //=============================================================================
 static ULONG ConvertToInternal(
@@ -241,9 +243,11 @@ static ULONG ConvertToInternal(
 
 //=============================================================================
 // Convert from internal N-channel INT32 samples to output format bytes
-// Channel downmix:
-//   2ch -> 1ch: average FL + FR
-//   2ch -> 2ch: copy FL, FR
+// Channel downmix/copy from 8ch internal:
+//   8ch -> 1ch: average FL + FR
+//   8ch -> 2ch: copy FL, FR
+//   8ch -> 6ch (5.1): copy FL,FR,FC,LFE,BL,BR
+//   8ch -> 8ch (7.1): copy all channels
 // Returns bytes written.
 //=============================================================================
 static ULONG ConvertFromInternal(
