@@ -221,17 +221,18 @@ Arguments:
         return STATUS_NOT_IMPLEMENTED;
     }
 
-    //If called for the mic array pin, set ResultantFormat to be the endpoint's only supported format.
-    //Otherwise, allow the class handler to set ResultantFormat.  
-    if ((this->m_DeviceType) == eMicArrayDevice1)
+    //
+    // For capture endpoints (MicArray, Cable A/B Mic), return the default format
+    // directly. PortCls default handler does not reliably intersect
+    // KSDATARANGE_ATTRIBUTES + WAVE_FORMAT_EXTENSIBLE data ranges, so capture
+    // endpoints must handle intersection explicitly.
+    //
+    // For render endpoints, let the class handler do the rest.
+    //
+    if (m_DeviceType == eMicArrayDevice1)
     {
         requiredSize = sizeof(KSDATAFORMAT_WAVEFORMATEXTENSIBLE);
 
-        //
-        // Validate return buffer size, if the request is only for the
-        // size of the resultant structure, return it now before
-        // returning other types of errors.
-        //
         if (!OutputBufferLength)
         {
             *ResultantFormatLength = requiredSize;
@@ -242,7 +243,6 @@ Arguments:
             return STATUS_BUFFER_TOO_SMALL;
         }
 
-        //Set ResultantFormat to be the only supported format for the MicArray endpoint. 
         PKSDATAFORMAT_WAVEFORMATEXTENSIBLE resultantFormat;
         resultantFormat = (PKSDATAFORMAT_WAVEFORMATEXTENSIBLE)ResultantFormat;
         *resultantFormat = *MicArrayPinSupportedDeviceFormats;
@@ -250,15 +250,14 @@ Arguments:
 
         return STATUS_SUCCESS;
     }
-    else
+    else if (m_DeviceType == eCableAMic || m_DeviceType == eCableBMic)
     {
-        requiredSize = sizeof(KSDATAFORMAT_WAVEFORMATEX);
+        // Cable capture: return default format (index 0 = 48kHz/16bit/stereo).
+        // Match against MyDataRange to ensure the client's range is compatible.
+        PKSDATARANGE_AUDIO myAudioRange = (PKSDATARANGE_AUDIO)MyDataRange;
 
-        //
-        // Validate return buffer size, if the request is only for the
-        // size of the resultant structure, return it now before
-        // returning other types of errors.
-        //
+        requiredSize = sizeof(KSDATAFORMAT_WAVEFORMATEXTENSIBLE);
+
         if (!OutputBufferLength)
         {
             *ResultantFormatLength = requiredSize;
@@ -269,9 +268,61 @@ Arguments:
             return STATUS_BUFFER_TOO_SMALL;
         }
 
-        // Verify channel count is supported. This routine assumes a separate data
-        // range for each supported channel count.
-        if (((PKSDATARANGE_AUDIO)MyDataRange)->MaximumChannels != ((PKSDATARANGE_AUDIO)ClientDataRange)->MaximumChannels)
+        // Find the best matching format from our supported list.
+        // Walk the PIN_DEVICE_FORMATS_AND_MODES for the streaming pin.
+        KSDATAFORMAT_WAVEFORMATEXTENSIBLE* pFormats = m_DeviceFormatsAndModes[KSPIN_WAVEIN_HOST].WaveFormats;
+        ULONG cFormats = m_DeviceFormatsAndModes[KSPIN_WAVEIN_HOST].WaveFormatsCount;
+
+        for (ULONG i = 0; i < cFormats; i++)
+        {
+            PWAVEFORMATEX pWfx = &pFormats[i].WaveFormatExt.Format;
+
+            // Check SubFormat match (PCM vs FLOAT)
+            if (!IsEqualGUIDAligned(pFormats[i].DataFormat.SubFormat, ClientDataRange->SubFormat))
+                continue;
+
+            // Check sample rate within client's range
+            if (pWfx->nSamplesPerSec < myAudioRange->MinimumSampleFrequency ||
+                pWfx->nSamplesPerSec > myAudioRange->MaximumSampleFrequency)
+                continue;
+
+            // Check channels within client's range
+            if (pWfx->nChannels > myAudioRange->MaximumChannels)
+                continue;
+
+            // Check bit depth within range
+            if (pWfx->wBitsPerSample < myAudioRange->MinimumBitsPerSample ||
+                pWfx->wBitsPerSample > myAudioRange->MaximumBitsPerSample)
+                continue;
+
+            // Found a match - return it
+            PKSDATAFORMAT_WAVEFORMATEXTENSIBLE resultantFormat;
+            resultantFormat = (PKSDATAFORMAT_WAVEFORMATEXTENSIBLE)ResultantFormat;
+            *resultantFormat = pFormats[i];
+            *ResultantFormatLength = requiredSize;
+
+            return STATUS_SUCCESS;
+        }
+
+        return STATUS_NO_MATCH;
+    }
+    else
+    {
+        // Render endpoints: let the class handler handle intersection.
+        requiredSize = sizeof(KSDATAFORMAT_WAVEFORMATEXTENSIBLE);
+
+        if (!OutputBufferLength)
+        {
+            *ResultantFormatLength = requiredSize;
+            return STATUS_BUFFER_OVERFLOW;
+        }
+        else if (OutputBufferLength < requiredSize)
+        {
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+
+        // Verify channel count is compatible.
+        if (((PKSDATARANGE_AUDIO)MyDataRange)->MaximumChannels < ((PKSDATARANGE_AUDIO)ClientDataRange)->MaximumChannels)
         {
             return STATUS_NO_MATCH;
         }
