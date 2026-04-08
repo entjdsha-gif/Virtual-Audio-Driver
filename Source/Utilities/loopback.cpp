@@ -3,9 +3,9 @@ Module Name:
     loopback.cpp
 Abstract:
     Loopback ring buffer with format conversion engine.
-    Internal format: 48kHz/24bit/stereo (configurable rate via IOCTL).
-    Handles bit depth (16 to 24), channel (mono to stereo), and
-    sample rate conversion using fixed-point linear interpolation.
+    Internal format: 48kHz/24bit/8ch (configurable rate via IOCTL).
+    Handles bit depth (16/24/32float), channel (mono to 7.1), and
+    sample rate conversion using 8-tap windowed sinc interpolation.
     All arithmetic is integer-only, safe at DISPATCH_LEVEL.
 --*/
 
@@ -39,10 +39,13 @@ static __forceinline INT32 Convert16to24(INT16 s16)
     return (INT32)s16 << 8;
 }
 
-// 24-bit -> 16-bit (rounded)
+// 24-bit -> 16-bit (rounded, clamped)
 static __forceinline INT16 Convert24to16(INT32 s24)
 {
-    return (INT16)((s24 + 128) >> 8);
+    INT32 tmp = (s24 + 128) >> 8;
+    if (tmp > 32767) tmp = 32767;
+    if (tmp < -32768) tmp = -32768;
+    return (INT16)tmp;
 }
 
 // Clamp INT32 to 24-bit range
@@ -54,101 +57,225 @@ static __forceinline INT32 Clamp24(INT32 val)
 }
 
 //=============================================================================
-// Convert input data to internal format (24-bit stereo samples in INT32 pairs)
-// Returns number of stereo frames produced.
-// outBuf must hold at least (inputFrames) stereo frame pairs.
+// IEEE 754 float <-> INT24 conversion (integer-only, safe at DISPATCH_LEVEL)
+// Float range [-1.0, +1.0] maps to INT24 range [-0x800000, +0x7FFFFF]
+//=============================================================================
+
+// Convert IEEE 754 float bits (reinterpreted as UINT32) to INT24
+static __forceinline INT32 FloatBitsToInt24(UINT32 bits)
+{
+    // Extract IEEE 754 fields
+    UINT32 sign = bits >> 31;
+    INT32  exp  = (INT32)((bits >> 23) & 0xFF) - 127;  // unbiased exponent
+    UINT32 mant = (bits & 0x7FFFFF) | 0x800000;        // implicit leading 1
+
+    // Denormalized or zero
+    if (exp < -23)
+        return 0;
+
+    // Float 1.0 has exp=0, mant=0x800000.  We want 1.0 -> 0x7FFFFF (23-bit max).
+    // So we shift mantissa by (23 - exp) to scale: result = mant >> (23 - exp)
+    // At exp=0: result = 0x800000 >> 23 ... no, let's think differently.
+    //
+    // The float value is: (-1)^sign * mant/2^23 * 2^exp = (-1)^sign * mant * 2^(exp-23)
+    // We want to multiply by 2^23 (to scale [-1,+1] to [-0x800000, +0x7FFFFF]):
+    //   result = mant * 2^(exp-23) * 2^23 = mant * 2^exp
+    // So shift = exp.  If exp >= 0, left-shift; if exp < 0, right-shift.
+
+    INT32 result;
+    if (exp >= 0)
+    {
+        // Clamp to prevent overflow (exp > 0 means |value| > 1.0)
+        if (exp > 0)
+            result = 0x7FFFFF;  // saturate
+        else
+            result = (INT32)(mant);  // exp==0: mant is exactly 0x800000 for 1.0
+    }
+    else
+    {
+        // exp < 0: right-shift
+        if (-exp >= 24)
+            return 0;
+        result = (INT32)(mant >> (-exp));
+    }
+
+    // Clamp: positive to +0x7FFFFF, negative can reach -0x800000
+    if (sign)
+    {
+        if (result > 0x800000) result = 0x800000;
+        return -(INT32)result;
+    }
+    else
+    {
+        if (result > 0x7FFFFF) result = 0x7FFFFF;
+        return result;
+    }
+}
+
+// Convert INT24 to IEEE 754 float bits (returned as UINT32)
+static __forceinline UINT32 Int24ToFloatBits(INT32 s24)
+{
+    if (s24 == 0)
+        return 0x00000000;  // +0.0f
+
+    UINT32 sign = 0;
+    UINT32 abs_val;
+    if (s24 < 0)
+    {
+        sign = 1;
+        abs_val = (UINT32)(-s24);
+    }
+    else
+    {
+        abs_val = (UINT32)s24;
+    }
+
+    // We want to produce float = s24 / 2^23, i.e., value = abs_val * 2^(-23)
+    // Find highest set bit position (0-based from LSB)
+    ULONG bitpos = 0;
+    UINT32 tmp = abs_val;
+    // Manual bit scan (safe at DISPATCH_LEVEL, no intrinsic dependency)
+    if (tmp & 0xFF0000) { bitpos += 16; tmp >>= 16; }
+    if (tmp & 0xFF00)   { bitpos += 8;  tmp >>= 8;  }
+    if (tmp & 0xF0)     { bitpos += 4;  tmp >>= 4;  }
+    if (tmp & 0xC)      { bitpos += 2;  tmp >>= 2;  }
+    if (tmp & 0x2)      { bitpos += 1; }
+
+    // IEEE exponent: biased = 127 + bitpos - 23 (because value = abs_val * 2^(-23))
+    INT32 biased_exp = 127 + (INT32)bitpos - 23;
+    if (biased_exp <= 0)
+        return 0;  // too small, flush to zero
+    if (biased_exp >= 255)
+        biased_exp = 254;  // clamp (shouldn't happen for 24-bit input)
+
+    // Mantissa: shift to align leading bit at position 23, then mask out implicit 1
+    UINT32 mantissa;
+    if (bitpos >= 23)
+        mantissa = (abs_val >> (bitpos - 23)) & 0x7FFFFF;
+    else
+        mantissa = (abs_val << (23 - bitpos)) & 0x7FFFFF;
+
+    return (sign << 31) | ((UINT32)biased_exp << 23) | mantissa;
+}
+
+//=============================================================================
+// Read one sample from input buffer based on format (16/24/32float)
+//=============================================================================
+static __forceinline INT32 ReadSample(const BYTE* p, const LB_FORMAT* fmt)
+{
+    if (fmt->BitsPerSample == 32 && fmt->IsFloat)
+        return FloatBitsToInt24(*(UINT32*)p);
+    else if (fmt->BitsPerSample == 16)
+        return Convert16to24(*(INT16*)p);
+    else
+        return Read24(p);
+}
+
+// Bytes per sample for a given format
+static __forceinline ULONG BytesPerSample(const LB_FORMAT* fmt)
+{
+    if (fmt->BitsPerSample == 32) return 4;
+    if (fmt->BitsPerSample == 24) return 3;
+    return 2; // 16-bit
+}
+
+//=============================================================================
+// Write one sample to output buffer based on format
+//=============================================================================
+static __forceinline void WriteSample(BYTE* p, INT32 val, const LB_FORMAT* fmt)
+{
+    if (fmt->BitsPerSample == 32 && fmt->IsFloat)
+        *(UINT32*)p = Int24ToFloatBits(val);
+    else if (fmt->BitsPerSample == 16)
+        *(INT16*)p = Convert24to16(val);
+    else
+        Write24(p, Clamp24(val));
+}
+
+//=============================================================================
+// Convert input data to internal N-channel format (INT32 per channel)
+// Output: ch0,ch1,...ch(N-1) per frame, N = LB_INTERNAL_CHANNELS
+// Channel mapping:
+//   1ch -> FL=FR=input, rest 0
+//   2ch -> FL,FR from input, rest 0
+//   6ch -> FL,FR,FC,LFE,BL,BR from input, rest 0
+//   8ch -> all from input
+// Returns number of internal frames produced.
 //=============================================================================
 static ULONG ConvertToInternal(
     const BYTE*     inData,
     ULONG           inFrames,
     const LB_FORMAT* inFmt,
-    INT32*          outSamples     // output: L,R,L,R... as INT32 (24-bit range)
+    INT32*          outSamples
 )
 {
-    ULONG produced = 0;
+    const ULONG nCh = LB_INTERNAL_CHANNELS;
+    const ULONG bps = BytesPerSample(inFmt);
     const BYTE* p = inData;
 
     for (ULONG i = 0; i < inFrames; i++)
     {
-        INT32 left = 0, right = 0;
+        INT32* out = outSamples + i * nCh;
+        // Zero all channels first
+        RtlZeroMemory(out, nCh * sizeof(INT32));
 
-        if (inFmt->BitsPerSample == 16)
+        if (inFmt->nChannels == 1)
         {
-            left = Convert16to24(*(INT16*)p);
-            if (inFmt->nChannels >= 2)
-            {
-                right = Convert16to24(*(INT16*)(p + 2));
-            }
-            else
-            {
-                right = left; // mono -> stereo duplication
-            }
+            INT32 val = ReadSample(p, inFmt);
+            out[0] = val;  // FL
+            out[1] = val;  // FR (duplicate mono)
         }
-        else // 24-bit
+        else
         {
-            left = Read24(p);
-            if (inFmt->nChannels >= 2)
+            // Read min(input channels, internal channels)
+            ULONG chToCopy = min(inFmt->nChannels, nCh);
+            for (ULONG ch = 0; ch < chToCopy; ch++)
             {
-                right = Read24(p + 3);
-            }
-            else
-            {
-                right = left; // mono -> stereo duplication
+                out[ch] = ReadSample(p + ch * bps, inFmt);
             }
         }
 
-        outSamples[produced * 2]     = left;
-        outSamples[produced * 2 + 1] = right;
-        produced++;
         p += inFmt->nBlockAlign;
     }
 
-    return produced;
+    return inFrames;
 }
 
 //=============================================================================
-// Convert from internal stereo INT32 samples to output format bytes
+// Convert from internal N-channel INT32 samples to output format bytes
+// Channel downmix:
+//   Nch -> 1ch: average FL + FR
+//   Nch -> 2ch: copy FL, FR
+//   Nch -> 6ch: copy channels 0-5
+//   Nch -> 8ch: copy all
 // Returns bytes written.
 //=============================================================================
 static ULONG ConvertFromInternal(
-    const INT32*    inSamples,     // L,R,L,R... in 24-bit range
+    const INT32*    inSamples,
     ULONG           inFrames,
     const LB_FORMAT* outFmt,
     BYTE*           outData
 )
 {
+    const ULONG nCh = LB_INTERNAL_CHANNELS;
+    const ULONG bps = BytesPerSample(outFmt);
     BYTE* p = outData;
 
     for (ULONG i = 0; i < inFrames; i++)
     {
-        INT32 left  = inSamples[i * 2];
-        INT32 right = inSamples[i * 2 + 1];
+        const INT32* in = inSamples + i * nCh;
 
         if (outFmt->nChannels == 1)
         {
-            // stereo -> mono: average
-            INT32 mono = (left + right) / 2;
-            if (outFmt->BitsPerSample == 16)
-            {
-                *(INT16*)p = Convert24to16(mono);
-            }
-            else
-            {
-                Write24(p, Clamp24(mono));
-            }
+            INT32 mono = (in[0] + in[1]) / 2;  // FL + FR average
+            WriteSample(p, mono, outFmt);
         }
         else
         {
-            // stereo output
-            if (outFmt->BitsPerSample == 16)
+            ULONG chToCopy = min(outFmt->nChannels, nCh);
+            for (ULONG ch = 0; ch < chToCopy; ch++)
             {
-                *(INT16*)p       = Convert24to16(left);
-                *(INT16*)(p + 2) = Convert24to16(right);
-            }
-            else
-            {
-                Write24(p, Clamp24(left));
-                Write24(p + 3, Clamp24(right));
+                WriteSample(p + ch * bps, in[ch], outFmt);
             }
         }
 
@@ -159,101 +286,111 @@ static ULONG ConvertFromInternal(
 }
 
 //=============================================================================
-// Sample Rate Conversion (SRC) using fixed-point linear interpolation
-// Converts stereo INT32 sample pairs from srcRate to dstRate.
-// Returns number of output stereo frames.
+// 8-tap Kaiser-windowed sinc coefficient table (Q23 fixed-point)
+// 256 sub-phases x 8 taps = 2048 coefficients
+// Generated: Kaiser beta=6.0, normalized sinc
+//=============================================================================
+#include "sinc_table.h"
+
+//=============================================================================
+// Sample Rate Conversion using 8-tap windowed sinc interpolation
+// Processes LB_INTERNAL_CHANNELS per frame.
+// Returns number of output frames.
 //=============================================================================
 static ULONG SrcConvert(
-    const INT32*    inSamples,     // L,R pairs, inFrames count
+    const INT32*    inSamples,
     ULONG           inFrames,
     ULONG           srcRate,
     ULONG           dstRate,
-    INT32*          outSamples,    // output L,R pairs
+    INT32*          outSamples,
     ULONG           maxOutFrames,
-    LB_SRC_STATE*   state          // persistent state across DPC ticks
+    LB_SRC_STATE*   state
 )
 {
+    const ULONG nCh = LB_INTERNAL_CHANNELS;
+    const ULONG halfTaps = LB_SINC_TAPS / 2;
+
     if (srcRate == dstRate)
     {
-        // Passthrough - just copy
         ULONG frames = min(inFrames, maxOutFrames);
-        RtlCopyMemory(outSamples, inSamples, frames * 2 * sizeof(INT32));
-        // Update state for continuity
+        RtlCopyMemory(outSamples, inSamples, frames * nCh * sizeof(INT32));
+        // Save last frames as history
         if (inFrames > 0)
         {
-            state->PrevSamples[0] = inSamples[(inFrames - 1) * 2];
-            state->PrevSamples[1] = inSamples[(inFrames - 1) * 2 + 1];
+            ULONG histStart = (inFrames > LB_SINC_TAPS) ? inFrames - LB_SINC_TAPS : 0;
+            ULONG histCount = inFrames - histStart;
+            RtlCopyMemory(state->PrevSamples,
+                          inSamples + histStart * nCh,
+                          histCount * nCh * sizeof(INT32));
+            state->HistoryCount = histCount;
             state->Valid = TRUE;
         }
         return frames;
     }
 
-    // phase = (srcRate << 32) / dstRate -- 32.32 fixed-point step
     ULONGLONG phase = ((ULONGLONG)srcRate << 32) / dstRate;
     ULONGLONG acc = state->Accumulator;
     ULONG outCount = 0;
 
-    // Previous samples for interpolation across DPC boundaries
-    INT32 prevL = state->Valid ? state->PrevSamples[0] : (inFrames > 0 ? inSamples[0] : 0);
-    INT32 prevR = state->Valid ? state->PrevSamples[1] : (inFrames > 0 ? inSamples[1] : 0);
-
     while (outCount < maxOutFrames)
     {
         ULONG idx = (ULONG)(acc >> 32);
-        ULONG frac = (ULONG)(acc & 0xFFFFFFFF);
-
         if (idx >= inFrames)
             break;
 
-        // Get current and next samples
-        INT32 curL, curR, nextL, nextR;
+        // Sub-phase: top 8 bits of fractional part -> 0..255
+        ULONG fracPhase = (ULONG)((acc >> 24) & 0xFF);
+        const INT32* coeff = &g_SincTable[fracPhase * LB_SINC_TAPS];
 
-        if (idx == 0 && state->Valid)
+        for (ULONG ch = 0; ch < nCh; ch++)
         {
-            // First sample can interpolate with previous DPC's last sample
-            curL = prevL;
-            curR = prevR;
-            nextL = inSamples[0];
-            nextR = inSamples[1];
-        }
-        else if (idx > 0)
-        {
-            curL = inSamples[(idx - 1) * 2];
-            curR = inSamples[(idx - 1) * 2 + 1];
-            nextL = inSamples[idx * 2];
-            nextR = inSamples[idx * 2 + 1];
-        }
-        else
-        {
-            // No previous data, use current sample (no interpolation for first)
-            curL = inSamples[idx * 2];
-            curR = inSamples[idx * 2 + 1];
-            nextL = (idx + 1 < inFrames) ? inSamples[(idx + 1) * 2] : curL;
-            nextR = (idx + 1 < inFrames) ? inSamples[(idx + 1) * 2 + 1] : curR;
+            INT64 sum = 0;
+            for (ULONG tap = 0; tap < LB_SINC_TAPS; tap++)
+            {
+                // tapIdx centers the filter: idx - halfTaps + 1 + tap
+                INT32 tapIdx = (INT32)idx - (INT32)halfTaps + 1 + (INT32)tap;
+                INT32 sample;
+
+                if (tapIdx < 0)
+                {
+                    // Fetch from history buffer
+                    INT32 histIdx = (INT32)state->HistoryCount + tapIdx;
+                    if (histIdx >= 0 && state->Valid)
+                        sample = state->PrevSamples[histIdx * nCh + ch];
+                    else
+                        sample = 0;
+                }
+                else if ((ULONG)tapIdx < inFrames)
+                {
+                    sample = inSamples[tapIdx * nCh + ch];
+                }
+                else
+                {
+                    sample = 0;  // beyond input, zero-pad
+                }
+
+                sum += (INT64)sample * coeff[tap];
+            }
+            outSamples[outCount * nCh + ch] = Clamp24((INT32)(sum >> 23));
         }
 
-        // Linear interpolation: out = cur + (next - cur) * frac / 2^32
-        INT64 diffL = (INT64)nextL - (INT64)curL;
-        INT64 diffR = (INT64)nextR - (INT64)curR;
-        outSamples[outCount * 2]     = (INT32)(curL + (INT32)((diffL * frac) >> 32));
-        outSamples[outCount * 2 + 1] = (INT32)(curR + (INT32)((diffR * frac) >> 32));
         outCount++;
-
         acc += phase;
     }
 
-    // Save state for next DPC tick
-    // Subtract consumed input frames from accumulator
+    // Save state
     ULONGLONG consumed = (ULONGLONG)inFrames << 32;
-    if (acc >= consumed)
-        state->Accumulator = acc - consumed;
-    else
-        state->Accumulator = 0;
+    state->Accumulator = (acc >= consumed) ? (acc - consumed) : 0;
 
+    // Store last LB_SINC_TAPS frames as history
     if (inFrames > 0)
     {
-        state->PrevSamples[0] = inSamples[(inFrames - 1) * 2];
-        state->PrevSamples[1] = inSamples[(inFrames - 1) * 2 + 1];
+        ULONG histStart = (inFrames > LB_SINC_TAPS) ? inFrames - LB_SINC_TAPS : 0;
+        ULONG histCount = inFrames - histStart;
+        RtlCopyMemory(state->PrevSamples,
+                      inSamples + histStart * nCh,
+                      histCount * nCh * sizeof(INT32));
+        state->HistoryCount = histCount;
         state->Valid = TRUE;
     }
 
@@ -267,7 +404,8 @@ static BOOLEAN FormatMatchesInternal(const LB_FORMAT* fmt, ULONG internalRate)
 {
     return (fmt->SampleRate == internalRate &&
             fmt->BitsPerSample == LB_INTERNAL_BITS &&
-            fmt->nChannels == LB_INTERNAL_CHANNELS);
+            fmt->nChannels == LB_INTERNAL_CHANNELS &&
+            !fmt->IsFloat);  // internal format is always PCM
 }
 
 //=============================================================================
@@ -364,21 +502,24 @@ NTSTATUS LoopbackInit(PLOOPBACK_BUFFER pLoopback)
     RtlZeroMemory(&pLoopback->SpeakerSrcState, sizeof(LB_SRC_STATE));
     RtlZeroMemory(&pLoopback->MicSrcState, sizeof(LB_SRC_STATE));
 
-    // Allocate conversion scratch buffers
+    // Allocate conversion scratch buffers (separate for Speaker/Mic DPCs to avoid race)
     pLoopback->ConvertBufSize = LB_CONVERT_BUF_SIZE;
-    pLoopback->ConvertBufA = (BYTE*)ExAllocatePool2(
-        POOL_FLAG_NON_PAGED, LB_CONVERT_BUF_SIZE, 'cvtA');
-    pLoopback->ConvertBufB = (BYTE*)ExAllocatePool2(
-        POOL_FLAG_NON_PAGED, LB_CONVERT_BUF_SIZE, 'cvtB');
+    pLoopback->SpkConvertBufA = (BYTE*)ExAllocatePool2(POOL_FLAG_NON_PAGED, LB_CONVERT_BUF_SIZE, 'scvA');
+    pLoopback->SpkConvertBufB = (BYTE*)ExAllocatePool2(POOL_FLAG_NON_PAGED, LB_CONVERT_BUF_SIZE, 'scvB');
+    pLoopback->MicConvertBufA = (BYTE*)ExAllocatePool2(POOL_FLAG_NON_PAGED, LB_CONVERT_BUF_SIZE, 'mcvA');
+    pLoopback->MicConvertBufB = (BYTE*)ExAllocatePool2(POOL_FLAG_NON_PAGED, LB_CONVERT_BUF_SIZE, 'mcvB');
 
-    if (!pLoopback->ConvertBufA || !pLoopback->ConvertBufB)
+    if (!pLoopback->SpkConvertBufA || !pLoopback->SpkConvertBufB ||
+        !pLoopback->MicConvertBufA || !pLoopback->MicConvertBufB)
     {
-        if (pLoopback->ConvertBufA) ExFreePoolWithTag(pLoopback->ConvertBufA, 'cvtA');
-        if (pLoopback->ConvertBufB) ExFreePoolWithTag(pLoopback->ConvertBufB, 'cvtB');
+        if (pLoopback->SpkConvertBufA) ExFreePoolWithTag(pLoopback->SpkConvertBufA, 'scvA');
+        if (pLoopback->SpkConvertBufB) ExFreePoolWithTag(pLoopback->SpkConvertBufB, 'scvB');
+        if (pLoopback->MicConvertBufA) ExFreePoolWithTag(pLoopback->MicConvertBufA, 'mcvA');
+        if (pLoopback->MicConvertBufB) ExFreePoolWithTag(pLoopback->MicConvertBufB, 'mcvB');
         ExFreePoolWithTag(pLoopback->Buffer, 'pooL');
         pLoopback->Buffer = NULL;
-        pLoopback->ConvertBufA = NULL;
-        pLoopback->ConvertBufB = NULL;
+        pLoopback->SpkConvertBufA = pLoopback->SpkConvertBufB = NULL;
+        pLoopback->MicConvertBufA = pLoopback->MicConvertBufB = NULL;
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -400,16 +541,10 @@ VOID LoopbackCleanup(PLOOPBACK_BUFFER pLoopback)
         ExFreePoolWithTag(pLoopback->Buffer, 'pooL');
         pLoopback->Buffer = NULL;
     }
-    if (pLoopback->ConvertBufA)
-    {
-        ExFreePoolWithTag(pLoopback->ConvertBufA, 'cvtA');
-        pLoopback->ConvertBufA = NULL;
-    }
-    if (pLoopback->ConvertBufB)
-    {
-        ExFreePoolWithTag(pLoopback->ConvertBufB, 'cvtB');
-        pLoopback->ConvertBufB = NULL;
-    }
+    if (pLoopback->SpkConvertBufA) { ExFreePoolWithTag(pLoopback->SpkConvertBufA, 'scvA'); pLoopback->SpkConvertBufA = NULL; }
+    if (pLoopback->SpkConvertBufB) { ExFreePoolWithTag(pLoopback->SpkConvertBufB, 'scvB'); pLoopback->SpkConvertBufB = NULL; }
+    if (pLoopback->MicConvertBufA) { ExFreePoolWithTag(pLoopback->MicConvertBufA, 'mcvA'); pLoopback->MicConvertBufA = NULL; }
+    if (pLoopback->MicConvertBufB) { ExFreePoolWithTag(pLoopback->MicConvertBufB, 'mcvB'); pLoopback->MicConvertBufB = NULL; }
     pLoopback->Initialized = FALSE;
 }
 
@@ -611,7 +746,8 @@ VOID LoopbackRegisterFormat(
     ULONG            sampleRate,
     ULONG            bitsPerSample,
     ULONG            nChannels,
-    ULONG            nBlockAlign
+    ULONG            nBlockAlign,
+    BOOLEAN          isFloat
 )
 {
     if (!pLoopback || !pLoopback->Initialized)
@@ -625,6 +761,7 @@ VOID LoopbackRegisterFormat(
     fmt->BitsPerSample = bitsPerSample;
     fmt->nChannels = nChannels;
     fmt->nBlockAlign = nBlockAlign;
+    fmt->IsFloat = isFloat;
 
     if (isSpeaker)
     {
@@ -723,23 +860,21 @@ VOID LoopbackWriteConverted(
     if (inFrames == 0)
         return;
 
-    // Step 1: Convert input to stereo INT32 samples (24-bit range)
-    // Max frames we can handle in scratch buffer:
-    // ConvertBufA used as INT32 array: bufSize / (2 * sizeof(INT32)) stereo frames
-    ULONG maxStereoFrames = pLoopback->ConvertBufSize / (2 * sizeof(INT32));
-    if (inFrames > maxStereoFrames)
-        inFrames = maxStereoFrames;
+    // Step 1: Convert input to internal N-channel INT32 samples (24-bit range)
+    const ULONG nCh = LB_INTERNAL_CHANNELS;
+    ULONG maxIntFrames = pLoopback->ConvertBufSize / (nCh * sizeof(INT32));
+    if (inFrames > maxIntFrames)
+        inFrames = maxIntFrames;
 
-    INT32* stereoSamples = (INT32*)pLoopback->ConvertBufA;
-    ULONG stereoFrames = ConvertToInternal(Data, inFrames, &spkFmt, stereoSamples);
+    INT32* intSamples = (INT32*)pLoopback->SpkConvertBufA;
+    ULONG intFrames = ConvertToInternal(Data, inFrames, &spkFmt, intSamples);
 
     // Step 2: SRC from speaker rate to internal rate
-    // Use ConvertBufB for SRC output
-    ULONG maxOutFrames = pLoopback->ConvertBufSize / (2 * sizeof(INT32));
-    INT32* srcOutput = (INT32*)pLoopback->ConvertBufB;
+    ULONG maxOutFrames = pLoopback->ConvertBufSize / (nCh * sizeof(INT32));
+    INT32* srcOutput = (INT32*)pLoopback->SpkConvertBufB;
 
     ULONG srcFrames = SrcConvert(
-        stereoSamples, stereoFrames,
+        intSamples, intFrames,
         spkFmt.SampleRate, internalRate,
         srcOutput, maxOutFrames,
         &pLoopback->SpeakerSrcState
@@ -748,10 +883,9 @@ VOID LoopbackWriteConverted(
     if (srcFrames == 0)
         return;
 
-    // Step 3: Convert stereo INT32 -> internal packed format (24-bit stereo)
-    // Reuse ConvertBufA for packed output
-    LB_FORMAT internalFmt = { internalRate, LB_INTERNAL_BITS, LB_INTERNAL_CHANNELS, LB_INTERNAL_BLOCKALIGN };
-    ULONG packedBytes = ConvertFromInternal(srcOutput, srcFrames, &internalFmt, pLoopback->ConvertBufA);
+    // Step 3: Convert N-channel INT32 -> internal packed format
+    LB_FORMAT internalFmt = { internalRate, LB_INTERNAL_BITS, LB_INTERNAL_CHANNELS, LB_INTERNAL_BLOCKALIGN, FALSE };
+    ULONG packedBytes = ConvertFromInternal(srcOutput, srcFrames, &internalFmt, pLoopback->SpkConvertBufA);
 
     // Step 4: Write packed data to ring buffer
     // Need to acquire spinlock for ring buffer write AND mic sink push
@@ -765,7 +899,7 @@ VOID LoopbackWriteConverted(
     while (remaining > 0)
     {
         ULONG chunk = min(remaining, bufSize - writePos);
-        RtlCopyMemory(pLoopback->Buffer + writePos, pLoopback->ConvertBufA + srcOffset, chunk);
+        RtlCopyMemory(pLoopback->Buffer + writePos, pLoopback->SpkConvertBufA + srcOffset, chunk);
         writePos = (writePos + chunk) % bufSize;
         srcOffset += chunk;
         remaining -= chunk;
@@ -796,7 +930,7 @@ VOID LoopbackWriteConverted(
             while (rem > 0)
             {
                 ULONG chunk = min(rem, micSize - micPos);
-                RtlCopyMemory(micBuf + micPos, pLoopback->ConvertBufA + src, chunk);
+                RtlCopyMemory(micBuf + micPos, pLoopback->SpkConvertBufA + src, chunk);
                 micPos = (micPos + chunk) % micSize;
                 src   += chunk;
                 rem   -= chunk;
@@ -869,13 +1003,13 @@ VOID LoopbackReadConverted(
     internalFrames += 1;
 
     // Limit to scratch buffer capacity
-    ULONG maxFrames = pLoopback->ConvertBufSize / (2 * sizeof(INT32));
+    const ULONG nCh = LB_INTERNAL_CHANNELS;
+    ULONG maxFrames = pLoopback->ConvertBufSize / (nCh * sizeof(INT32));
     if (internalFrames > maxFrames)
         internalFrames = maxFrames;
 
     // Step 1: Read internal format bytes from ring buffer
     ULONG internalBytes = internalFrames * LB_INTERNAL_BLOCKALIGN;
-    // Use ConvertBufA for raw ring data
     if (internalBytes > pLoopback->ConvertBufSize)
         internalBytes = pLoopback->ConvertBufSize;
 
@@ -893,7 +1027,7 @@ VOID LoopbackReadConverted(
     while (rem > 0)
     {
         ULONG chunk = min(rem, bufSize - readPos);
-        RtlCopyMemory(pLoopback->ConvertBufA + dstOff, pLoopback->Buffer + readPos, chunk);
+        RtlCopyMemory(pLoopback->MicConvertBufA + dstOff, pLoopback->Buffer + readPos, chunk);
         readPos = (readPos + chunk) % bufSize;
         dstOff += chunk;
         rem -= chunk;
@@ -909,25 +1043,23 @@ VOID LoopbackReadConverted(
         return;
     }
 
-    // Step 2: Convert internal packed bytes -> stereo INT32
-    LB_FORMAT internalFmt = { internalRate, LB_INTERNAL_BITS, LB_INTERNAL_CHANNELS, LB_INTERNAL_BLOCKALIGN };
+    // Step 2: Convert internal packed bytes -> N-channel INT32
+    LB_FORMAT internalFmt = { internalRate, LB_INTERNAL_BITS, LB_INTERNAL_CHANNELS, LB_INTERNAL_BLOCKALIGN, FALSE };
     ULONG readFrames = toRead / LB_INTERNAL_BLOCKALIGN;
 
-    // Use ConvertBufB for stereo INT32
-    INT32* stereoSamples = (INT32*)pLoopback->ConvertBufB;
-    ULONG stereoFrames = ConvertToInternal(pLoopback->ConvertBufA, readFrames, &internalFmt, stereoSamples);
+    INT32* intSamples = (INT32*)pLoopback->MicConvertBufB;
+    ULONG intFrames = ConvertToInternal(pLoopback->MicConvertBufA, readFrames, &internalFmt, intSamples);
 
     // Step 3: SRC from internal rate to mic rate
-    // Reuse ConvertBufA for SRC output
-    INT32* srcOutput = (INT32*)pLoopback->ConvertBufA;
+    INT32* srcOutput = (INT32*)pLoopback->MicConvertBufA;
     ULONG srcFrames = SrcConvert(
-        stereoSamples, stereoFrames,
+        intSamples, intFrames,
         internalRate, micFmt.SampleRate,
-        srcOutput, outFrames,   // limit to what mic needs
+        srcOutput, outFrames,
         &pLoopback->MicSrcState
     );
 
-    // Step 4: Convert stereo INT32 -> Mic output format
+    // Step 4: Convert N-channel INT32 -> Mic output format
     if (srcFrames > 0)
     {
         ULONG written = ConvertFromInternal(srcOutput, srcFrames, &micFmt, Data);

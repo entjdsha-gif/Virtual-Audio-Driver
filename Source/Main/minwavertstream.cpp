@@ -105,6 +105,7 @@ Return Value:
 //=============================================================================
 #pragma code_seg("PAGE")
 
+#if !defined(CABLE_A) && !defined(CABLE_B)
 NTSTATUS CMiniportWaveRTStream::ReadRegistrySettings()
 {
     PAGED_CODE();
@@ -123,7 +124,7 @@ NTSTATUS CMiniportWaveRTStream::ReadRegistrySettings()
 
     DriverObject = WdfDriverWdmGetDriverObject(WdfGetDriver());
     DriverKey = NULL;
-    ntStatus = IoOpenDriverRegistryKey(DriverObject, 
+    ntStatus = IoOpenDriverRegistryKey(DriverObject,
                                  DriverRegKeyParameters,
                                  KEY_READ,
                                  0,
@@ -140,7 +141,7 @@ NTSTATUS CMiniportWaveRTStream::ReadRegistrySettings()
                                   NULL,
                                   NULL);
 
-    if (!NT_SUCCESS(ntStatus)) 
+    if (!NT_SUCCESS(ntStatus))
     {
         DPF(D_VERBOSE, ("RtlQueryRegistryValues failed, using default values, 0x%x", ntStatus));
         //
@@ -155,6 +156,7 @@ NTSTATUS CMiniportWaveRTStream::ReadRegistrySettings()
 
     return ntStatus;
 }
+#endif // !CABLE_A && !CABLE_B
 
 NTSTATUS
 CMiniportWaveRTStream::Init
@@ -232,10 +234,12 @@ Return Value:
     m_bLastBufferRendered = FALSE;
     m_ulFadeInRemaining = 0;
 
+#if !defined(CABLE_A) && !defined(CABLE_B)
     m_ulHostCaptureToneFrequency = IsEqualGUID(SignalProcessingMode, AUDIO_SIGNALPROCESSINGMODE_RAW) ? 1000 : 2000;
     m_dwHostCaptureToneAmplitude = 50;
     m_dwHostCaptureToneDCOffset = 0;
     m_dwHostCaptureToneInitialPhase = 0;
+#endif
 
     m_pPortStream = PortStream_;
     InitializeListHead(&m_NotificationList);
@@ -305,6 +309,7 @@ Return Value:
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
+#if !defined(CABLE_A) && !defined(CABLE_B)
     if (m_bCapture)
     {
         ReadRegistrySettings();
@@ -370,12 +375,13 @@ Return Value:
         {
             ntStatus = m_SaveData.Initialize();
         }
-    
+
         if (!NT_SUCCESS(ntStatus))
         {
             return ntStatus;
         }
     }
+#endif // !CABLE_A && !CABLE_B
 
     //
     // Register this stream.
@@ -487,10 +493,11 @@ NTSTATUS CMiniportWaveRTStream::AllocateBufferWithNotification
 
     RequestedSize_ -= RequestedSize_ % (m_pWfExt->Format.nBlockAlign);
     
+#if !defined(CABLE_A) && !defined(CABLE_B)
     if (!m_bCapture && (!g_DoNotCreateDataFiles))
     {
         NTSTATUS ntStatus;
-        
+
         // Simple Audio Sample uses following buffer to hold data before writing to a file.
         // Allocating larger buffer will reduce File I/O operations.
         ntStatus = m_SaveData.SetMaxWriteSize(RequestedSize_ * 4);
@@ -499,6 +506,7 @@ NTSTATUS CMiniportWaveRTStream::AllocateBufferWithNotification
             return ntStatus;
         }
     }
+#endif
 
     PHYSICAL_ADDRESS highAddress;
     highAddress.HighPart = 0;
@@ -1258,10 +1266,12 @@ NTSTATUS CMiniportWaveRTStream::SetState
             KeReleaseSpinLock(&m_PositionSpinLock, oldIrql);
 
             // Wait until all work items are completed.
+#if !defined(CABLE_A) && !defined(CABLE_B)
             if (!m_bCapture && !g_DoNotCreateDataFiles)
             {
                 m_SaveData.WaitAllWorkItems();
             }
+#endif
             break;
 
         case KSSTATE_ACQUIRE:
@@ -1349,11 +1359,14 @@ NTSTATUS CMiniportWaveRTStream::SetState
                 }
                 if (pLB)
                 {
+                    BOOLEAN isFloat = (BOOLEAN)IsEqualGUIDAligned(
+                        m_pWfExt->SubFormat, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT);
                     LoopbackRegisterFormat(pLB, isSpeaker,
                         m_pWfExt->Format.nSamplesPerSec,
                         m_pWfExt->Format.wBitsPerSample,
                         m_pWfExt->Format.nChannels,
-                        m_pWfExt->Format.nBlockAlign);
+                        m_pWfExt->Format.nBlockAlign,
+                        isFloat);
                     // LoopbackRegisterFormat auto-activates MicSink if
                     // FormatMatch transitions FALSE->TRUE and DMA is stashed.
                 }
@@ -1768,11 +1781,13 @@ For other devices: save data to file (original behavior).
                 LoopbackWriteConverted(pLoopback, m_pDmaBuffer + bufferOffset, runWrite);
             }
         }
+#if !defined(CABLE_A) && !defined(CABLE_B)
         else
         {
             // Default: save to file
             m_SaveData.WriteData(m_pDmaBuffer + bufferOffset, runWrite);
         }
+#endif
 
         bufferOffset = (bufferOffset + runWrite) % m_ulDmaBufferSize;
         ByteDisplacement -= runWrite;
@@ -1831,7 +1846,11 @@ Return Value:
     // Simple Audio Sample writes each stream seperately to disk. If the rights for this
     // stream indicates that the stream is CopyProtected, stop writing to disk.
     //
+#if !defined(CABLE_A) && !defined(CABLE_B)
     m_SaveData.Disable(drmRights->CopyProtect);
+#else
+    UNREFERENCED_PARAMETER(drmRights);
+#endif
 
     //
     // From MSDN:

@@ -18,35 +18,45 @@ Abstract:
 //=============================================================================
 #define LB_DEFAULT_INTERNAL_RATE       48000
 #define LB_INTERNAL_BITS               24
-#define LB_INTERNAL_CHANNELS           2
-#define LB_INTERNAL_BLOCKALIGN         6   // 24bit * 2ch = 6 bytes/frame
+#define LB_INTERNAL_CHANNELS           8
+#define LB_INTERNAL_BLOCKALIGN         24  // 24bit(3bytes) * 8ch = 24 bytes/frame
 #define LB_DEFAULT_LATENCY_MS          20
 #define LB_MIN_LATENCY_MS             5
 #define LB_MAX_LATENCY_MS             100
 
-// Convert buffer size: enough for 192kHz/24bit/stereo 2ms = 2304 bytes
-#define LB_CONVERT_BUF_SIZE           4096
+// Convert buffer: 192kHz/8ch/2ms = 192*8*4(INT32)*2 = 12288, round up
+#define LB_CONVERT_BUF_SIZE           16384
 
-// Legacy: fixed buffer size for backward compat calculation
-#define LOOPBACK_BUFFER_SIZE  (48000 * 6 * 4)  // 4 seconds @ internal format
+// Default buffer size: 4 seconds @ internal format
+#define LOOPBACK_BUFFER_SIZE  (48000 * LB_INTERNAL_BLOCKALIGN * 4)
+
+// Max render streams for multi-client support
+#define LB_MAX_RENDER_STREAMS         4
 
 //=============================================================================
 // Stream format descriptor
 //=============================================================================
 typedef struct _LB_FORMAT {
-    ULONG  SampleRate;
-    ULONG  BitsPerSample;
-    ULONG  nChannels;
-    ULONG  nBlockAlign;
+    ULONG   SampleRate;
+    ULONG   BitsPerSample;
+    ULONG   nChannels;
+    ULONG   nBlockAlign;
+    BOOLEAN IsFloat;        // TRUE for IEEE_FLOAT, FALSE for PCM
 } LB_FORMAT;
 
 //=============================================================================
 // SRC (sample rate converter) state - persists across DPC ticks
 //=============================================================================
+// Sinc interpolation constants
+#define LB_SINC_TAPS       8
+#define LB_SINC_PHASES     256
+#define LB_SINC_TABLE_SIZE (LB_SINC_TAPS * LB_SINC_PHASES)
+
 typedef struct _LB_SRC_STATE {
-    ULONGLONG  Accumulator;     // 32.32 fixed-point position
-    INT32      PrevSamples[2];  // previous samples (L, R) for interpolation
-    BOOLEAN    Valid;            // PrevSamples initialized?
+    ULONGLONG  Accumulator;                                     // 32.32 fixed-point position
+    INT32      PrevSamples[LB_SINC_TAPS * LB_INTERNAL_CHANNELS]; // history for sinc interp
+    ULONG      HistoryCount;                                    // valid history frames
+    BOOLEAN    Valid;
 } LB_SRC_STATE;
 
 //=============================================================================
@@ -94,13 +104,19 @@ typedef struct _LOOPBACK_BUFFER {
     LB_SRC_STATE   MicSrcState;        // Internal->Mic SRC
 
     // Scratch buffers for format conversion (NonPaged, pre-allocated)
-    BYTE*          ConvertBufA;        // Speaker side conversion scratch
-    BYTE*          ConvertBufB;        // Mic side conversion scratch
+    // Speaker and Mic DPCs run on separate cores, so each needs its own pair.
+    BYTE*          SpkConvertBufA;     // Speaker DPC scratch 1
+    BYTE*          SpkConvertBufB;     // Speaker DPC scratch 2
+    BYTE*          MicConvertBufA;     // Mic DPC scratch 1
+    BYTE*          MicConvertBufB;     // Mic DPC scratch 2
     ULONG          ConvertBufSize;
 
     // Dynamic configuration (IOCTL-settable)
     ULONG          InternalRate;       // Default 48000
     ULONG          MaxLatencyMs;       // Default 20
+
+    // Multi-client render stream tracking
+    ULONG          ActiveRenderCount;  // Number of active render streams
 } LOOPBACK_BUFFER, *PLOOPBACK_BUFFER;
 
 //=============================================================================
@@ -127,7 +143,8 @@ VOID LoopbackRegisterFormat(
     ULONG            sampleRate,
     ULONG            bitsPerSample,
     ULONG            nChannels,
-    ULONG            nBlockAlign
+    ULONG            nBlockAlign,
+    BOOLEAN          isFloat = FALSE  // TRUE for IEEE_FLOAT
 );
 VOID LoopbackUnregisterFormat(
     PLOOPBACK_BUFFER pLoopback,
