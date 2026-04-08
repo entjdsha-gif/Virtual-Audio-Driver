@@ -401,9 +401,10 @@ KSDATARANGE_AUDIO CablePinDataRangesStream[] =
 static
 PKSDATARANGE CablePinDataRangePointersStream[] =
 {
-    PKSDATARANGE(&CablePinDataRangesStream[0]),
-    PKSDATARANGE(&CablePinDataRangesStream[1]),
-    PKSDATARANGE(&PinDataRangeAttributeList),
+    PKSDATARANGE(&CablePinDataRangesStream[0]),  // PCM range
+    PKSDATARANGE(&PinDataRangeAttributeList),     // PCM attributes
+    PKSDATARANGE(&CablePinDataRangesStream[1]),  // FLOAT range
+    PKSDATARANGE(&PinDataRangeAttributeList),     // FLOAT attributes
 };
 
 //=============================================================================
