@@ -102,6 +102,8 @@ typedef struct _LOOPBACK_BUFFER {
     // SRC states (persist across DPC ticks for continuity)
     LB_SRC_STATE   SpeakerSrcState;    // Speaker->Internal SRC
     LB_SRC_STATE   MicSrcState;        // Internal->Mic SRC
+    volatile BOOLEAN SpeakerSrcResetPending; // Set by IOCTL, consumed by Speaker DPC
+    volatile BOOLEAN MicSrcResetPending;     // Set by IOCTL, consumed by Mic DPC
 
     // Scratch buffers for format conversion (NonPaged, pre-allocated)
     // Speaker and Mic DPCs run on separate cores, so each needs its own pair.

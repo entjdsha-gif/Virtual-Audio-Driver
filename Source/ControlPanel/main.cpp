@@ -232,27 +232,41 @@ FormatEndpointStatus(const AO_ENDPOINT_STATUS* ep, WCHAR* buf, int cch)
 }
 
 static void
+MergeStreamStatus(AO_STREAM_STATUS* dest, const AO_STREAM_STATUS* src)
+{
+    if (src->CableA_Speaker.Active) dest->CableA_Speaker = src->CableA_Speaker;
+    if (src->CableA_Mic.Active)     dest->CableA_Mic = src->CableA_Mic;
+    if (src->CableB_Speaker.Active) dest->CableB_Speaker = src->CableB_Speaker;
+    if (src->CableB_Mic.Active)     dest->CableB_Mic = src->CableB_Mic;
+}
+
+static void
 UpdateStreamStatus(HWND hDlg, DLG_STATE* state)
 {
     AO_STREAM_STATUS status = {};
+    AO_STREAM_STATUS partial = {};
     WCHAR buf[128];
 
-    // Try device A first, then overlay with device B if available.
-    HANDLE hDev = (state->hDevA != INVALID_HANDLE_VALUE) ? state->hDevA : state->hDevB;
-
-    if (hDev != INVALID_HANDLE_VALUE && AoGetStreamStatus(hDev, &status)) {
-        FormatEndpointStatus(&status.CableA_Speaker, buf, _countof(buf));
-        SetDlgItemTextW(hDlg, IDC_STATUS_A_SPK, buf);
-
-        FormatEndpointStatus(&status.CableA_Mic, buf, _countof(buf));
-        SetDlgItemTextW(hDlg, IDC_STATUS_A_MIC, buf);
-
-        FormatEndpointStatus(&status.CableB_Speaker, buf, _countof(buf));
-        SetDlgItemTextW(hDlg, IDC_STATUS_B_SPK, buf);
-
-        FormatEndpointStatus(&status.CableB_Mic, buf, _countof(buf));
-        SetDlgItemTextW(hDlg, IDC_STATUS_B_MIC, buf);
+    if (state->hDevA != INVALID_HANDLE_VALUE && AoGetStreamStatus(state->hDevA, &partial)) {
+        MergeStreamStatus(&status, &partial);
     }
+
+    ZeroMemory(&partial, sizeof(partial));
+    if (state->hDevB != INVALID_HANDLE_VALUE && AoGetStreamStatus(state->hDevB, &partial)) {
+        MergeStreamStatus(&status, &partial);
+    }
+
+    FormatEndpointStatus(&status.CableA_Speaker, buf, _countof(buf));
+    SetDlgItemTextW(hDlg, IDC_STATUS_A_SPK, buf);
+
+    FormatEndpointStatus(&status.CableA_Mic, buf, _countof(buf));
+    SetDlgItemTextW(hDlg, IDC_STATUS_A_MIC, buf);
+
+    FormatEndpointStatus(&status.CableB_Speaker, buf, _countof(buf));
+    SetDlgItemTextW(hDlg, IDC_STATUS_B_SPK, buf);
+
+    FormatEndpointStatus(&status.CableB_Mic, buf, _countof(buf));
+    SetDlgItemTextW(hDlg, IDC_STATUS_B_MIC, buf);
 }
 
 static INT_PTR CALLBACK

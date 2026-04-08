@@ -29,11 +29,30 @@ typedef void (*fnPcDriverUnload) (PDRIVER_OBJECT);
 fnPcDriverUnload gPCDriverUnloadRoutine = NULL;
 extern "C" DRIVER_UNLOAD DriverUnload;
 
-// Saved original IRP_MJ_DEVICE_CONTROL handler from PortCls
+// Saved original IRP_MJ_CREATE/CLOSE/DEVICE_CONTROL handlers from PortCls
+static PDRIVER_DISPATCH g_OriginalCreate = NULL;
+static PDRIVER_DISPATCH g_OriginalClose = NULL;
 static PDRIVER_DISPATCH g_OriginalDeviceControl = NULL;
 
-// Device interface symbolic link name (for control panel access)
-static UNICODE_STRING g_DeviceInterfaceName = { 0, 0, NULL };
+// Pre-opened registry key handle for persistent settings.
+// Opened in DriverEntry (system thread, PreviousMode=KernelMode) to bypass
+// access checks when IOCTL handler writes from user-mode thread context.
+static HANDLE g_hParametersKey = NULL;
+
+// Standalone control device (separate from PortCls device stack)
+static PDEVICE_OBJECT g_ControlDevice = NULL;
+
+// Control device names
+#if defined(CABLE_A)
+#define AO_CONTROL_DEVICE_NAME   L"\\Device\\AOCableAControl"
+#define AO_CONTROL_SYMLINK_NAME  L"\\DosDevices\\AOCableA"
+#elif defined(CABLE_B)
+#define AO_CONTROL_DEVICE_NAME   L"\\Device\\AOCableBControl"
+#define AO_CONTROL_SYMLINK_NAME  L"\\DosDevices\\AOCableB"
+#else
+#define AO_CONTROL_DEVICE_NAME   L"\\Device\\AOVirtualCableControl"
+#define AO_CONTROL_SYMLINK_NAME  L"\\DosDevices\\AOVirtualCable"
+#endif
 
 //-----------------------------------------------------------------------------
 // Referenced forward.
@@ -44,7 +63,15 @@ DRIVER_ADD_DEVICE AddDevice;
 _Dispatch_type_(IRP_MJ_DEVICE_CONTROL)
 DRIVER_DISPATCH AoDeviceControlHandler;
 
+// Control device handlers
+static NTSTATUS AoControlCreate(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp);
+static NTSTATUS AoControlClose(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp);
+static NTSTATUS AoControlDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp);
+static NTSTATUS AoCreateControlDevice(_In_ PDRIVER_OBJECT DriverObject);
+static VOID     AoDeleteControlDevice(VOID);
+
 // Forward declarations for registry persistence
+static NTSTATUS AoOpenParametersKey(_In_ ACCESS_MASK DesiredAccess, _Out_ PHANDLE phKey);
 static VOID AoReadRegistryConfig(_Out_ PULONG pInternalRate, _Out_ PULONG pMaxLatencyMs);
 static VOID AoWriteRegistryValue(_In_ PCWSTR ValueName, _In_ ULONG Value);
 
@@ -112,13 +139,23 @@ Environment:
 
     DPF(D_TERSE, ("[DriverUnload]"));
 
-    ReleaseRegistryStringBuffer();
-
     if (DriverObject == NULL)
     {
         goto Done;
     }
-    
+
+    // Close registry key
+    if (g_hParametersKey)
+    {
+        ZwClose(g_hParametersKey);
+        g_hParametersKey = NULL;
+    }
+
+    // Delete control device before PortCls unload
+    AoDeleteControlDevice();
+
+    ReleaseRegistryStringBuffer();
+
     //
     // Invoke first the port unload.
     //
@@ -375,10 +412,26 @@ Return Value:
     DriverObject->MajorFunction[IRP_MJ_PNP] = PnpHandler;
 
     //
-    // Hook IRP_MJ_DEVICE_CONTROL for IOCTL support (control panel).
+    // Create standalone control device for control panel IOCTL access.
+    // This is separate from the PortCls device stack so device interface
+    // enumeration works reliably.
     //
+    ntStatus = AoCreateControlDevice(DriverObject);
+    if (!NT_SUCCESS(ntStatus))
+    {
+        DPF(D_TERSE, ("[DriverEntry] Control device creation failed 0x%x (non-fatal)", ntStatus));
+        ntStatus = STATUS_SUCCESS;  // Non-fatal
+    }
+
+    //
+    // Hook IRP_MJ_CREATE/CLOSE/DEVICE_CONTROL to route control device IRPs.
+    //
+    g_OriginalCreate = DriverObject->MajorFunction[IRP_MJ_CREATE];
+    g_OriginalClose = DriverObject->MajorFunction[IRP_MJ_CLOSE];
     g_OriginalDeviceControl = DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL];
-    DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = AoDeviceControlHandler;
+    DriverObject->MajorFunction[IRP_MJ_CREATE] = AoControlCreate;
+    DriverObject->MajorFunction[IRP_MJ_CLOSE] = AoControlClose;
+    DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = AoControlDeviceControl;
 
     //
     // Hook the port class unload function
@@ -416,6 +469,19 @@ Return Value:
 #endif
 
     //
+    // Open registry Parameters key for persistent settings.
+    // Must be done here (system thread context) so Zw* calls bypass access checks.
+    //
+    {
+        NTSTATUS regStatus = AoOpenParametersKey(KEY_READ | KEY_WRITE, &g_hParametersKey);
+        if (!NT_SUCCESS(regStatus))
+        {
+            DPF(D_TERSE, ("[DriverEntry] AoOpenParametersKey failed 0x%x (non-fatal)", regStatus));
+            g_hParametersKey = NULL;
+        }
+    }
+
+    //
     // Apply saved registry settings to loopback buffers.
     //
     {
@@ -447,6 +513,13 @@ Done:
 
     if (!NT_SUCCESS(ntStatus))
     {
+        if (g_hParametersKey)
+        {
+            ZwClose(g_hParametersKey);
+            g_hParametersKey = NULL;
+        }
+        AoDeleteControlDevice();
+
 #if defined(CABLE_A)
         LoopbackCleanup(&g_CableALoopback);
 #elif defined(CABLE_B)
@@ -851,24 +924,6 @@ Return Value:
         ntStatus = PcGetPhysicalDeviceObject(DeviceObject, &pdo);
         IF_FAILED_JUMP(ntStatus, Exit);
 
-        // Register device interface for control panel IOCTL access
-        ntStatus = IoRegisterDeviceInterface(
-            pdo,
-            &GUID_DEVINTERFACE_AO_VIRTUAL_CABLE,
-            NULL,
-            &g_DeviceInterfaceName);
-        if (NT_SUCCESS(ntStatus))
-        {
-            IoSetDeviceInterfaceState(&g_DeviceInterfaceName, TRUE);
-            DPF(D_TERSE, ("[StartDevice] Device interface registered"));
-        }
-        else
-        {
-            DPF(D_TERSE, ("[StartDevice] IoRegisterDeviceInterface failed 0x%x", ntStatus));
-            // Non-fatal: driver works without control panel
-            ntStatus = STATUS_SUCCESS;
-        }
-
         WCHAR hardwareId[256] = {0};
         ULONG resultLen = 0;
         ntStatus = IoGetDeviceProperty(
@@ -930,6 +985,41 @@ Exit:
 // Registry persistence for driver settings
 //=============================================================================
 #pragma code_seg("PAGE")
+static NTSTATUS AoOpenParametersKey(
+    _In_  ACCESS_MASK DesiredAccess,
+    _Out_ PHANDLE     phKey
+)
+{
+    PAGED_CODE();
+
+    // Open (or create) the "Parameters" subkey under the driver's service key.
+    // g_RegistryPath = "\Registry\Machine\SYSTEM\CurrentControlSet\Services\AOCableX"
+    // This key is always accessible from kernel mode regardless of calling thread context.
+    *phKey = NULL;
+
+    if (g_RegistryPath.Buffer == NULL)
+        return STATUS_UNSUCCESSFUL;
+
+    // Open the service key first
+    OBJECT_ATTRIBUTES oa;
+    InitializeObjectAttributes(&oa, &g_RegistryPath, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+
+    HANDLE hServiceKey = NULL;
+    NTSTATUS st = ZwOpenKey(&hServiceKey, KEY_CREATE_SUB_KEY | DesiredAccess, &oa);
+    if (!NT_SUCCESS(st))
+        return st;
+
+    // Open or create "Parameters" subkey
+    UNICODE_STRING subKey;
+    RtlInitUnicodeString(&subKey, L"Parameters");
+    InitializeObjectAttributes(&oa, &subKey, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, hServiceKey, NULL);
+
+    ULONG disposition = 0;
+    st = ZwCreateKey(phKey, DesiredAccess, &oa, 0, NULL, REG_OPTION_NON_VOLATILE, &disposition);
+    ZwClose(hServiceKey);
+    return st;
+}
+
 static VOID AoWriteRegistryValue(
     _In_ PCWSTR ValueName,
     _In_ ULONG  Value
@@ -937,22 +1027,14 @@ static VOID AoWriteRegistryValue(
 {
     PAGED_CODE();
 
-    UNICODE_STRING keyPath;
-    RtlInitUnicodeString(&keyPath, L"\\Registry\\Machine\\" AO_REGISTRY_PATH);
-
-    OBJECT_ATTRIBUTES oa;
-    InitializeObjectAttributes(&oa, &keyPath, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
-
-    HANDLE hKey = NULL;
-    ULONG disposition = 0;
-    NTSTATUS st = ZwCreateKey(&hKey, KEY_WRITE, &oa, 0, NULL, REG_OPTION_NON_VOLATILE, &disposition);
-    if (!NT_SUCCESS(st))
+    // Use the pre-opened handle from DriverEntry (system thread context).
+    // This bypasses access checks when called from user-mode IOCTL context.
+    if (!g_hParametersKey)
         return;
 
     UNICODE_STRING valueName;
     RtlInitUnicodeString(&valueName, ValueName);
-    ZwSetValueKey(hKey, &valueName, 0, REG_DWORD, &Value, sizeof(ULONG));
-    ZwClose(hKey);
+    ZwSetValueKey(g_hParametersKey, &valueName, 0, REG_DWORD, &Value, sizeof(ULONG));
 }
 
 #pragma code_seg("PAGE")
@@ -966,16 +1048,10 @@ static VOID AoReadRegistryConfig(
     *pInternalRate = LB_DEFAULT_INTERNAL_RATE;
     *pMaxLatencyMs = LB_DEFAULT_LATENCY_MS;
 
-    UNICODE_STRING keyPath;
-    RtlInitUnicodeString(&keyPath, L"\\Registry\\Machine\\" AO_REGISTRY_PATH);
-
-    OBJECT_ATTRIBUTES oa;
-    InitializeObjectAttributes(&oa, &keyPath, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
-
-    HANDLE hKey = NULL;
-    NTSTATUS st = ZwOpenKey(&hKey, KEY_READ, &oa);
-    if (!NT_SUCCESS(st))
+    // Use the pre-opened handle from DriverEntry.
+    if (!g_hParametersKey)
         return;
+    HANDLE hKey = g_hParametersKey;
 
     // Read InternalRate
     {
@@ -984,7 +1060,7 @@ static VOID AoReadRegistryConfig(
 
         UCHAR buf[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + sizeof(ULONG)];
         ULONG resultLen = 0;
-        st = ZwQueryValueKey(hKey, &valName, KeyValuePartialInformation, buf, sizeof(buf), &resultLen);
+        NTSTATUS st = ZwQueryValueKey(hKey, &valName, KeyValuePartialInformation, buf, sizeof(buf), &resultLen);
         if (NT_SUCCESS(st))
         {
             PKEY_VALUE_PARTIAL_INFORMATION info = (PKEY_VALUE_PARTIAL_INFORMATION)buf;
@@ -1004,7 +1080,7 @@ static VOID AoReadRegistryConfig(
 
         UCHAR buf[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + sizeof(ULONG)];
         ULONG resultLen = 0;
-        st = ZwQueryValueKey(hKey, &valName, KeyValuePartialInformation, buf, sizeof(buf), &resultLen);
+        NTSTATUS st = ZwQueryValueKey(hKey, &valName, KeyValuePartialInformation, buf, sizeof(buf), &resultLen);
         if (NT_SUCCESS(st))
         {
             PKEY_VALUE_PARTIAL_INFORMATION info = (PKEY_VALUE_PARTIAL_INFORMATION)buf;
@@ -1017,7 +1093,7 @@ static VOID AoReadRegistryConfig(
         }
     }
 
-    ZwClose(hKey);
+    // Do NOT close hKey -- it is the shared g_hParametersKey handle.
 }
 
 //=============================================================================
@@ -1147,8 +1223,8 @@ AoDeviceControlHandler(
     }
 
     default:
-        // Not our IOCTL - pass to PortCls
-        if (g_OriginalDeviceControl)
+        // Not our IOCTL - pass to PortCls (only for PortCls devices, not control device)
+        if (DeviceObject != g_ControlDevice && g_OriginalDeviceControl)
         {
             return g_OriginalDeviceControl(DeviceObject, Irp);
         }
@@ -1160,6 +1236,132 @@ AoDeviceControlHandler(
     Irp->IoStatus.Information = bytesReturned;
     IoCompleteRequest(Irp, IO_NO_INCREMENT);
     return status;
+}
+
+//=============================================================================
+// Standalone control device - separate from PortCls device stack
+//=============================================================================
+
+#pragma code_seg("PAGE")
+static NTSTATUS
+AoControlCreate(
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _Inout_ PIRP Irp
+)
+{
+    PAGED_CODE();
+    if (DeviceObject == g_ControlDevice)
+    {
+        Irp->IoStatus.Status = STATUS_SUCCESS;
+        Irp->IoStatus.Information = 0;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return STATUS_SUCCESS;
+    }
+    // Not our control device - pass to PortCls
+    if (g_OriginalCreate)
+        return g_OriginalCreate(DeviceObject, Irp);
+    Irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return STATUS_INVALID_DEVICE_REQUEST;
+}
+
+#pragma code_seg("PAGE")
+static NTSTATUS
+AoControlClose(
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _Inout_ PIRP Irp
+)
+{
+    PAGED_CODE();
+    if (DeviceObject == g_ControlDevice)
+    {
+        Irp->IoStatus.Status = STATUS_SUCCESS;
+        Irp->IoStatus.Information = 0;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return STATUS_SUCCESS;
+    }
+    if (g_OriginalClose)
+        return g_OriginalClose(DeviceObject, Irp);
+    Irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return STATUS_INVALID_DEVICE_REQUEST;
+}
+
+#pragma code_seg("PAGE")
+static NTSTATUS
+AoControlDeviceControl(
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _Inout_ PIRP Irp
+)
+{
+    PAGED_CODE();
+    // Route our control device IOCTLs to the existing handler
+    if (DeviceObject == g_ControlDevice)
+        return AoDeviceControlHandler(DeviceObject, Irp);
+    // Not our device - pass to PortCls
+    if (g_OriginalDeviceControl)
+        return g_OriginalDeviceControl(DeviceObject, Irp);
+    Irp->IoStatus.Status = STATUS_NOT_SUPPORTED;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return STATUS_NOT_SUPPORTED;
+}
+
+#pragma code_seg("PAGE")
+static NTSTATUS
+AoCreateControlDevice(
+    _In_ PDRIVER_OBJECT DriverObject
+)
+{
+    PAGED_CODE();
+
+    UNICODE_STRING devName = RTL_CONSTANT_STRING(AO_CONTROL_DEVICE_NAME);
+    UNICODE_STRING symLink = RTL_CONSTANT_STRING(AO_CONTROL_SYMLINK_NAME);
+    NTSTATUS status;
+
+    status = IoCreateDevice(
+        DriverObject,
+        0,
+        &devName,
+        FILE_DEVICE_UNKNOWN,
+        FILE_DEVICE_SECURE_OPEN,
+        FALSE,
+        &g_ControlDevice);
+
+    if (!NT_SUCCESS(status))
+    {
+        DPF(D_ERROR, ("[AoCreateControlDevice] IoCreateDevice failed 0x%x", status));
+        return status;
+    }
+
+    status = IoCreateSymbolicLink(&symLink, &devName);
+    if (!NT_SUCCESS(status))
+    {
+        DPF(D_ERROR, ("[AoCreateControlDevice] IoCreateSymbolicLink failed 0x%x", status));
+        IoDeleteDevice(g_ControlDevice);
+        g_ControlDevice = NULL;
+        return status;
+    }
+
+    g_ControlDevice->Flags &= ~DO_DEVICE_INITIALIZING;
+    g_ControlDevice->Flags |= DO_BUFFERED_IO;
+
+    DPF(D_TERSE, ("[AoCreateControlDevice] Control device created: %wZ", &symLink));
+    return STATUS_SUCCESS;
+}
+
+#pragma code_seg("PAGE")
+static VOID
+AoDeleteControlDevice(VOID)
+{
+    PAGED_CODE();
+
+    if (g_ControlDevice)
+    {
+        UNICODE_STRING symLink = RTL_CONSTANT_STRING(AO_CONTROL_SYMLINK_NAME);
+        IoDeleteSymbolicLink(&symLink);
+        IoDeleteDevice(g_ControlDevice);
+        g_ControlDevice = NULL;
+    }
 }
 
 //=============================================================================
@@ -1211,15 +1413,6 @@ Return Value:
     {
     case IRP_MN_REMOVE_DEVICE:
     case IRP_MN_SURPRISE_REMOVAL:
-    case IRP_MN_STOP_DEVICE:
-        // Disable device interface for control panel
-        if (g_DeviceInterfaceName.Buffer != NULL)
-        {
-            IoSetDeviceInterfaceState(&g_DeviceInterfaceName, FALSE);
-            RtlFreeUnicodeString(&g_DeviceInterfaceName);
-            g_DeviceInterfaceName.Buffer = NULL;
-        }
-
         ext = static_cast<PortClassDeviceContext*>(_DeviceObject->DeviceExtension);
 
         if (ext->m_pCommon != NULL)
@@ -1229,6 +1422,10 @@ Return Value:
             ext->m_pCommon->Release();
             ext->m_pCommon = NULL;
         }
+        break;
+
+    case IRP_MN_STOP_DEVICE:
+        // Do not release adapter common here - device may restart via IRP_MN_START_DEVICE.
         break;
 
     default:

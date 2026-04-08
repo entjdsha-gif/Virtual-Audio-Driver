@@ -501,6 +501,8 @@ NTSTATUS LoopbackInit(PLOOPBACK_BUFFER pLoopback)
 
     RtlZeroMemory(&pLoopback->SpeakerSrcState, sizeof(LB_SRC_STATE));
     RtlZeroMemory(&pLoopback->MicSrcState, sizeof(LB_SRC_STATE));
+    pLoopback->SpeakerSrcResetPending = FALSE;
+    pLoopback->MicSrcResetPending = FALSE;
 
     // Allocate conversion scratch buffers (separate for Speaker/Mic DPCs to avoid race)
     pLoopback->ConvertBufSize = LB_CONVERT_BUF_SIZE;
@@ -766,12 +768,12 @@ VOID LoopbackRegisterFormat(
     if (isSpeaker)
     {
         pLoopback->SpeakerActive = TRUE;
-        RtlZeroMemory(&pLoopback->SpeakerSrcState, sizeof(LB_SRC_STATE));
+        pLoopback->SpeakerSrcResetPending = TRUE;
     }
     else
     {
         pLoopback->MicActive = TRUE;
-        RtlZeroMemory(&pLoopback->MicSrcState, sizeof(LB_SRC_STATE));
+        pLoopback->MicSrcResetPending = TRUE;
     }
 
     BOOLEAN oldMatch = pLoopback->FormatMatch;
@@ -872,6 +874,13 @@ VOID LoopbackWriteConverted(
     // Step 2: SRC from speaker rate to internal rate
     ULONG maxOutFrames = pLoopback->ConvertBufSize / (nCh * sizeof(INT32));
     INT32* srcOutput = (INT32*)pLoopback->SpkConvertBufB;
+
+    // Consume reset flag (set by IOCTL/RegisterFormat, safe to reset here in DPC context)
+    if (pLoopback->SpeakerSrcResetPending)
+    {
+        RtlZeroMemory(&pLoopback->SpeakerSrcState, sizeof(LB_SRC_STATE));
+        pLoopback->SpeakerSrcResetPending = FALSE;
+    }
 
     ULONG srcFrames = SrcConvert(
         intSamples, intFrames,
@@ -1046,16 +1055,29 @@ VOID LoopbackReadConverted(
     // Step 2: Convert internal packed bytes -> N-channel INT32
     LB_FORMAT internalFmt = { internalRate, LB_INTERNAL_BITS, LB_INTERNAL_CHANNELS, LB_INTERNAL_BLOCKALIGN, FALSE };
     ULONG readFrames = toRead / LB_INTERNAL_BLOCKALIGN;
+    // Clamp to scratch buffer capacity: ConvertToInternal outputs readFrames * nCh * sizeof(INT32)
+    if (readFrames > maxFrames)
+        readFrames = maxFrames;
 
     INT32* intSamples = (INT32*)pLoopback->MicConvertBufB;
     ULONG intFrames = ConvertToInternal(pLoopback->MicConvertBufA, readFrames, &internalFmt, intSamples);
 
     // Step 3: SRC from internal rate to mic rate
     INT32* srcOutput = (INT32*)pLoopback->MicConvertBufA;
+
+    // Consume reset flag (set by IOCTL/RegisterFormat, safe to reset here in DPC context)
+    if (pLoopback->MicSrcResetPending)
+    {
+        RtlZeroMemory(&pLoopback->MicSrcState, sizeof(LB_SRC_STATE));
+        pLoopback->MicSrcResetPending = FALSE;
+    }
+
+    // Clamp output frames to scratch buffer capacity
+    ULONG maxSrcOut = min(outFrames, maxFrames);
     ULONG srcFrames = SrcConvert(
         intSamples, intFrames,
         internalRate, micFmt.SampleRate,
-        srcOutput, outFrames,
+        srcOutput, maxSrcOut,
         &pLoopback->MicSrcState
     );
 
@@ -1110,9 +1132,9 @@ NTSTATUS LoopbackResizeBuffer(PLOOPBACK_BUFFER pLoopback, ULONG newLatencyMs)
     pLoopback->DataCount = 0;
     pLoopback->MaxLatencyMs = newLatencyMs;
 
-    // Reset SRC states
-    RtlZeroMemory(&pLoopback->SpeakerSrcState, sizeof(LB_SRC_STATE));
-    RtlZeroMemory(&pLoopback->MicSrcState, sizeof(LB_SRC_STATE));
+    // Signal DPCs to reset their own SRC states (avoids race with DPC using SrcState)
+    pLoopback->SpeakerSrcResetPending = TRUE;
+    pLoopback->MicSrcResetPending = TRUE;
 
     KeReleaseSpinLock(&pLoopback->SpinLock, oldIrql);
 
@@ -1157,9 +1179,9 @@ NTSTATUS LoopbackSetInternalRate(PLOOPBACK_BUFFER pLoopback, ULONG newRate)
     pLoopback->DataCount = 0;
     pLoopback->InternalRate = newRate;
 
-    // Reset SRC states
-    RtlZeroMemory(&pLoopback->SpeakerSrcState, sizeof(LB_SRC_STATE));
-    RtlZeroMemory(&pLoopback->MicSrcState, sizeof(LB_SRC_STATE));
+    // Signal DPCs to reset their own SRC states (avoids race with DPC using SrcState)
+    pLoopback->SpeakerSrcResetPending = TRUE;
+    pLoopback->MicSrcResetPending = TRUE;
 
     // Update format match
     UpdateFormatMatch(pLoopback);

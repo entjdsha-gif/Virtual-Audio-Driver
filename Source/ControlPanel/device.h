@@ -3,7 +3,7 @@ Module Name:
     device.h
 Abstract:
     Device communication helpers for AO Virtual Cable Control Panel.
-    Uses SetupDi to locate the driver device interface and DeviceIoControl
+    Opens driver control device by name and uses DeviceIoControl
     to send/receive IOCTL commands.
 --*/
 

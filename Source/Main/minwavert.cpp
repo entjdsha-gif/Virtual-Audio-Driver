@@ -279,6 +279,11 @@ Arguments:
         KSDATAFORMAT_WAVEFORMATEXTENSIBLE* pFormats = m_DeviceFormatsAndModes[streamingPinIndex].WaveFormats;
         ULONG cFormats = m_DeviceFormatsAndModes[streamingPinIndex].WaveFormatsCount;
 
+        if (pFormats == NULL || cFormats == 0)
+        {
+            return STATUS_NO_MATCH;
+        }
+
         for (ULONG i = 0; i < cFormats; i++)
         {
             PWAVEFORMATEX pWfx = &pFormats[i].WaveFormatExt.Format;

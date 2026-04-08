@@ -46,11 +46,11 @@ typedef struct _AO_CONFIG {
     ULONG InternalRate;         // Internal ring buffer sample rate (default 48000)
     ULONG MaxLatencyMs;         // Max latency in ms (default 20)
     ULONG InternalBits;         // Internal bit depth (always 24)
-    ULONG InternalChannels;     // Internal channel count (always 2)
+    ULONG InternalChannels;     // Internal channel count
 } AO_CONFIG;
 
-// Registry key path for persistent settings
-#define AO_REGISTRY_PATH L"SOFTWARE\\AOAudio\\VirtualCable"
+// Registry value names for persistent settings (stored under service Parameters key)
+// e.g. HKLM\SYSTEM\CurrentControlSet\Services\AOCableA\Parameters
 #define AO_REG_INTERNAL_RATE L"InternalRate"
 #define AO_REG_MAX_LATENCY   L"MaxLatencyMs"
 

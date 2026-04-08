@@ -6,7 +6,9 @@
 #include "minwavertstream.h"
 #include "loopback.h"
 #define MINWAVERTSTREAM_POOLTAG 'SRWM'
-#define FADE_SAMPLES 192  // ~4ms fade-in at 48kHz to prevent pop/click
+// ~4ms fade-in to prevent pop/click, scaled to sample rate
+#define FADE_MS 4
+#define FADE_SAMPLES_FOR_RATE(rate) ((ULONG)((ULONGLONG)(rate) * FADE_MS / 1000))
 
 #pragma warning (disable : 4127)
 
@@ -1403,9 +1405,9 @@ NTSTATUS CMiniportWaveRTStream::SetState
             }
 
             // Phase 6: Initialize fade-in for capture to prevent pop/click
-            if (m_bCapture)
+            if (m_bCapture && m_pWfExt)
             {
-                m_ulFadeInRemaining = FADE_SAMPLES;
+                m_ulFadeInRemaining = FADE_SAMPLES_FOR_RATE(m_pWfExt->Format.nSamplesPerSec);
             }
 
             // Reset block alignment carry for clean start
@@ -1686,7 +1688,7 @@ For other devices: output silence (original behavior).
 
     // Phase 6: Apply fade-in ramp to prevent pop/click at capture stream start.
     // Applies to data from both paths (MicSink direct-push or LoopbackRead).
-    // Supports both 16-bit and 24-bit formats.
+    // Supports 16-bit, 24-bit, and 32-bit float formats.
     if (m_ulFadeInRemaining > 0 && totalBytes > 0 && m_pWfExt)
     {
         ULONG nBlockAlign = m_pWfExt->Format.nBlockAlign;
@@ -1694,17 +1696,19 @@ For other devices: output silence (original behavior).
         ULONG bitsPerSample = m_pWfExt->Format.wBitsPerSample;
         ULONG sampleCount = totalBytes / nBlockAlign;
         ULONG fadePos = fadeStartOffset;
+        ULONG fadeTotalSamples = FADE_SAMPLES_FOR_RATE(m_pWfExt->Format.nSamplesPerSec);
+        if (fadeTotalSamples == 0) fadeTotalSamples = 1;
 
         for (ULONG i = 0; i < sampleCount && m_ulFadeInRemaining > 0; i++)
         {
-            ULONG rampPos = FADE_SAMPLES - m_ulFadeInRemaining;
+            ULONG rampPos = fadeTotalSamples - m_ulFadeInRemaining;
 
             if (bitsPerSample == 16)
             {
                 INT16* pSample = (INT16*)(m_pDmaBuffer + fadePos);
                 for (ULONG ch = 0; ch < nChannels; ch++)
                 {
-                    pSample[ch] = (INT16)(((INT32)pSample[ch] * rampPos) / FADE_SAMPLES);
+                    pSample[ch] = (INT16)(((INT32)pSample[ch] * rampPos) / fadeTotalSamples);
                 }
             }
             else if (bitsPerSample == 24)
@@ -1713,13 +1717,59 @@ For other devices: output silence (original behavior).
                 for (ULONG ch = 0; ch < nChannels; ch++)
                 {
                     BYTE* p = pFrame + ch * 3;
-                    // Read 24-bit packed sample (little-endian, sign-extended)
                     INT32 val = (INT32)(p[0] | (p[1] << 8) | ((INT8)p[2] << 16));
-                    val = (INT32)(((INT64)val * rampPos) / FADE_SAMPLES);
-                    // Write back
+                    val = (INT32)(((INT64)val * rampPos) / fadeTotalSamples);
                     p[0] = (BYTE)(val & 0xFF);
                     p[1] = (BYTE)((val >> 8) & 0xFF);
                     p[2] = (BYTE)((val >> 16) & 0xFF);
+                }
+            }
+            else if (bitsPerSample == 32)
+            {
+                // 32-bit IEEE float: integer-only ramp using sign+magnitude scaling.
+                // Extract sign and exponent, scale mantissa, reconstruct.
+                UINT32* pSample = (UINT32*)(m_pDmaBuffer + fadePos);
+                for (ULONG ch = 0; ch < nChannels; ch++)
+                {
+                    UINT32 bits = pSample[ch];
+                    UINT32 sign = bits & 0x80000000;
+                    INT32 exp = (INT32)((bits >> 23) & 0xFF) - 127;
+                    UINT32 mant = (bits & 0x7FFFFF) | 0x800000;
+
+                    // Float to INT24: value = mant * 2^exp (scaled to [-0x800000, +0x7FFFFF])
+                    INT32 val;
+                    if (exp < -23)      val = 0;
+                    else if (exp >= 0)  val = (exp > 0) ? 0x7FFFFF : (INT32)mant;
+                    else                val = (INT32)(mant >> (-exp));
+
+                    // Apply ramp in INT24 domain
+                    val = (INT32)(((INT64)val * rampPos) / fadeTotalSamples);
+
+                    // INT24 back to float bits (same algorithm as loopback.cpp Int24ToFloatBits)
+                    if (val == 0)
+                    {
+                        pSample[ch] = sign;
+                    }
+                    else
+                    {
+                        UINT32 abs_val = (UINT32)val;
+                        // Binary search for highest set bit position
+                        ULONG bitpos = 0;
+                        UINT32 tmp = abs_val;
+                        if (tmp & 0xFF0000) { bitpos += 16; tmp >>= 16; }
+                        if (tmp & 0xFF00)   { bitpos += 8;  tmp >>= 8;  }
+                        if (tmp & 0xF0)     { bitpos += 4;  tmp >>= 4;  }
+                        if (tmp & 0xC)      { bitpos += 2;  tmp >>= 2;  }
+                        if (tmp & 0x2)      { bitpos += 1; }
+                        // IEEE exponent: biased = 127 + bitpos - 23
+                        INT32 bexp = 127 + (INT32)bitpos - 23;
+                        if (bexp <= 0) { pSample[ch] = sign; }
+                        else {
+                            UINT32 m = (bitpos >= 23) ?
+                                (abs_val >> (bitpos - 23)) : (abs_val << (23 - bitpos));
+                            pSample[ch] = sign | ((UINT32)bexp << 23) | (m & 0x7FFFFF);
+                        }
+                    }
                 }
             }
 
