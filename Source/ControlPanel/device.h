@@ -29,4 +29,8 @@ BOOL AoSetMaxLatency(HANDLE hDevice, ULONG ms);
 // Get per-endpoint stream status for all 4 endpoints.
 BOOL AoGetStreamStatus(HANDLE hDevice, AO_STREAM_STATUS* pStatus);
 
+// Set max channel count (8 or 16). Writes to registry only; takes effect
+// after device restart.
+BOOL AoSetMaxChannels(HANDLE hDevice, ULONG channels);
+
 #endif // _AO_CONTROLPANEL_DEVICE_H_

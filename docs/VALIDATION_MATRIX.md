@@ -15,8 +15,8 @@
 | F09 | SRC 8kHz -> internal | PyAudio 8000Hz stream | No exception | PASS |
 | F10 | SRC 192kHz -> internal | PyAudio 192000Hz stream | No exception | PASS |
 | F11 | Multi-client (2 streams) | Concurrent render | Both succeed | PASS |
-| F12 | 16ch render + capture | Multichannel test | Loopback verified | TODO |
-| F13 | 8/16 channel switch via registry | Registry + device restart | Both modes work | TODO |
+| F12 | 16ch render + capture | `test_16ch_isolation.py` | Loopback verified | PASS |
+| F13 | 8/16 channel switch via registry | Registry + device restart + `test_ioctl_diag.py` | Both modes work | PASS |
 | F14 | Mono render (channel upmix) | PyAudio 1ch | No exception | PASS |
 
 ## 2. IOCTL / Control Panel Verification
@@ -98,6 +98,7 @@
 |--------|---------------|-------------|
 | `test_formats.py` | F01-F05, F14 | High |
 | `test_multichannel.py` | F06, F07 | Medium (stream-level only) |
+| `test_16ch_isolation.py` | F12, F13 | High |
 | `test_ioctl_diag.py` | I01-I08 | High |
 | `test_complete.ps1` | Mixed | Medium |
 | `test_peak.ps1` | Manual loopback check | Manual only |

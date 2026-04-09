@@ -1,28 +1,42 @@
 #include "resource.h"
 #include <windows.h>
 
-IDD_SETTINGS DIALOGEX 0, 0, 340, 260
+IDD_SETTINGS DIALOGEX 0, 0, 360, 400
 STYLE DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "AO Virtual Cable Settings"
 FONT 9, "Segoe UI"
 BEGIN
-    GROUPBOX "Internal Sample Rate", -1, 10, 10, 150, 50
-    COMBOBOX IDC_COMBO_RATE, 20, 28, 130, 100, CBS_DROPDOWNLIST | WS_TABSTOP
+    GROUPBOX "Configuration", -1, 10, 10, 340, 85
+    LTEXT "Sample Rate:", -1, 20, 28, 50, 10
+    COMBOBOX IDC_COMBO_RATE, 80, 26, 100, 100, CBS_DROPDOWNLIST | WS_TABSTOP
+    LTEXT "Max Latency:", -1, 195, 28, 50, 10
+    CONTROL "", IDC_SLIDER_LATENCY, "msctls_trackbar32", TBS_AUTOTICKS | WS_TABSTOP, 248, 26, 70, 18
+    LTEXT "20 ms", IDC_STATIC_LATENCY, 320, 28, 25, 10
+    LTEXT "Channel Mode:", -1, 20, 52, 55, 10
+    COMBOBOX IDC_COMBO_CHANNELS, 80, 50, 100, 60, CBS_DROPDOWNLIST | WS_TABSTOP
+    PUSHBUTTON "Set && Restart", IDC_BTN_RESTART, 195, 49, 70, 16
+    LTEXT "(requires device restart)", -1, 270, 52, 75, 10
 
-    GROUPBOX "Max Latency", -1, 170, 10, 160, 50
-    CONTROL "", IDC_SLIDER_LATENCY, "msctls_trackbar32", TBS_AUTOTICKS | WS_TABSTOP, 180, 28, 110, 20
-    LTEXT "20 ms", IDC_STATIC_LATENCY, 295, 30, 30, 12
+    GROUPBOX "Runtime State", -1, 10, 100, 340, 45
+    LTEXT "--", IDC_RUNTIME_STATE_A, 20, 114, 320, 10
+    LTEXT "--", IDC_RUNTIME_STATE_B, 20, 128, 320, 10
 
-    GROUPBOX "Stream Monitor", -1, 10, 70, 320, 130
-    LTEXT "Cable A Speaker:", -1, 20, 88, 70, 12
-    LTEXT "--", IDC_STATUS_A_SPK, 95, 88, 220, 12
-    LTEXT "Cable A Mic:", -1, 20, 104, 70, 12
-    LTEXT "--", IDC_STATUS_A_MIC, 95, 104, 220, 12
-    LTEXT "Cable B Speaker:", -1, 20, 124, 70, 12
-    LTEXT "--", IDC_STATUS_B_SPK, 95, 124, 220, 12
-    LTEXT "Cable B Mic:", -1, 20, 140, 70, 12
-    LTEXT "--", IDC_STATUS_B_MIC, 95, 140, 220, 12
+    GROUPBOX "Stream Monitor", -1, 10, 150, 340, 100
+    LTEXT "Cable A Speaker:", -1, 20, 168, 70, 10
+    LTEXT "--", IDC_STATUS_A_SPK, 95, 168, 245, 10
+    LTEXT "Cable A Mic:", -1, 20, 182, 70, 10
+    LTEXT "--", IDC_STATUS_A_MIC, 95, 182, 245, 10
+    LTEXT "Cable B Speaker:", -1, 20, 200, 70, 10
+    LTEXT "--", IDC_STATUS_B_SPK, 95, 200, 245, 10
+    LTEXT "Cable B Mic:", -1, 20, 214, 70, 10
+    LTEXT "--", IDC_STATUS_B_MIC, 95, 214, 245, 10
 
-    DEFPUSHBUTTON "Apply", IDAPPLY, 200, 210, 60, 20
-    PUSHBUTTON "Close", IDCANCEL, 270, 210, 60, 20
+    GROUPBOX "Driver Info", -1, 10, 258, 340, 50
+    LTEXT "--", IDC_DRIVER_INFO_A, 20, 273, 320, 10
+    LTEXT "--", IDC_DRIVER_INFO_B, 20, 287, 320, 10
+
+    PUSHBUTTON "Self-Test", IDC_BTN_SELFTEST, 10, 320, 65, 20
+    PUSHBUTTON "Defaults", IDC_BTN_DEFAULTS, 140, 320, 60, 20
+    DEFPUSHBUTTON "Apply", IDAPPLY, 210, 320, 60, 20
+    PUSHBUTTON "Close", IDCANCEL, 280, 320, 60, 20
 END

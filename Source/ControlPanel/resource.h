@@ -20,6 +20,14 @@ Abstract:
 #define IDC_STATUS_B_SPK    1006
 #define IDC_STATUS_B_MIC    1007
 #define IDAPPLY             1008
+#define IDC_COMBO_CHANNELS  1009
+#define IDC_BTN_RESTART     1010
+#define IDC_RUNTIME_STATE_A 1011
+#define IDC_RUNTIME_STATE_B 1015
+#define IDC_DRIVER_INFO_A   1012
+#define IDC_DRIVER_INFO_B   1013
+#define IDC_BTN_SELFTEST    1014
+#define IDC_BTN_DEFAULTS    1016
 
 #define ID_TRAY_SETTINGS    40001
 #define ID_TRAY_EXIT        40002

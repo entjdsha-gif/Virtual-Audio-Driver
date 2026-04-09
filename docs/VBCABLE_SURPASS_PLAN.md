@@ -1,11 +1,14 @@
 # AO Virtual Cable: VB-Cable Surpass Plan
 
-## Current State (2026-04-09)
+## Current State (2026-04-10)
 
 ### Verified Working
 - 48 PCM formats (8/16/24/32-bit, mono/stereo, 8k-192k)
 - Float32 render + capture
 - 5.1 / 7.1 multichannel
+- 16-channel selectable mode (8/16 switch via registry + device restart)
+- 16-channel render + capture
+- 16-channel channel isolation verified (16/16 sequential RMS + simultaneous FFT)
 - SRC (44.1k / 8k / 192k)
 - Multi-client (2+ concurrent streams)
 - Control Panel tray app with IOCTL communication
@@ -24,9 +27,8 @@
 - Stale AO Driver Store packages can be removed automatically after install or manually via cleanup.
 
 ### Remaining Gaps
-- No 16-channel support yet
 - No live operational diagnostics in Control Panel
-- No quantitative quality harness yet (bit-exact, latency, dropout, drift)
+- No quantitative quality harness yet for bit-exact, latency, dropout, or drift
 - Some legacy/manual test scripts still need cleanup
 - Upgrade still often requires reboot because the standalone control device and kernel service can remain loaded after PnP removal
 
@@ -36,7 +38,7 @@
 
 | Axis | VB-Cable (Known) | AO Virtual Cable | Gap |
 |------|-------------------|------------------|-----|
-| Features | 2ch free, up to 8ch paid, no SRC | 8ch, SRC, float32, multi-client | AO ahead on SRC/format. Gap: no 16ch |
+| Features | 2ch free, up to 8ch paid, no SRC | 8/16ch selectable, SRC, float32, multi-client | AO ahead on channels, SRC, and format support |
 | Install | EXE installer, generally clean | Scripted flow, now reproducible and hash-verified | Gap reduced; polish still possible |
 | Management | Minimal systray app | IOCTL control panel, config/status | Needs live status and self-test |
 | Quality | Perceived stable (large user base) | No published measurements yet | Gap: provability |
@@ -74,7 +76,7 @@
 **Optional final smoke test (non-blocking):**
 - `install.ps1 -Action uninstall` -> `install.ps1 -Action install` one more clean cycle
 
-### M2: 16-Channel Selectable Architecture
+### M2: 16-Channel Selectable Architecture - COMPLETE
 
 **Goal:** Registry-driven 8/16 channel selection
 
@@ -84,23 +86,36 @@
 - Require device restart for channel-mode changes
 - Keep compile-time struct layout guards and add runtime validation for allowed channel counts
 
-**Steps:**
-1. Audit every 8-channel assumption and produce `channel-audit.md`
-2. Lift internal channel count into a runtime parameter
-3. Implement 8/16 selectable mode
-4. Validate all existing tests at 8ch and add new 16ch coverage
+**Outcomes:**
+1. Internal channel count was lifted into validated runtime state (`8` or `16`)
+2. Static 16ch PortCls advertisement data was eliminated from the image
+3. 16ch advertisement is now built dynamically at device start and selected through binding-based miniport configuration
+4. `MaxChannelCount` registry changes now apply on device restart without requiring full reinstall
+5. Existing 8ch behavior remains stable and regression-tested
+
+**Success criteria achieved:**
+- `GET_CONFIG` reports `Channels=8` and `Channels=16` correctly after registry change + device restart
+- `SET -> GET` roundtrip remains valid in both modes
+- `verify-install.ps1` passes with the M2 build installed
+- 16ch render + capture streams open successfully
+- Channel isolation verification passes:
+  - Stage 1: `16/16` sequential RMS isolation
+  - Stage 2: `16/16` simultaneous FFT frequency ownership
+  - Crosstalk remains below `-60 dB`
+- No BSOD observed across install, restart, or mode-switch validation
 
 ### M3: Control Panel Operations Tool
 
-**Goal:** Move beyond a settings UI into an operational tool
+**Goal:** Move beyond a settings UI into an operational tool for the completed 8/16 selectable architecture
 
 | Feature | Priority |
 |---------|----------|
 | Live stream status (format, state, stream count) | Must |
-| Current config display (rate, depth, channels, latency) | Must |
+| Current config display (rate, depth, runtime channels, latency, MaxChannelCount) | Must |
 | Self-test (one-click loopback verification) | Must |
-| Channel mode selector (8/16, triggers device restart) | Must |
+| Channel mode selector (8/16, triggers device restart and shows result) | Must |
 | Rate/latency control | Must |
+| Restart/apply workflow with explicit success/failure feedback | Must |
 | Diagnostic info (driver version, hash, driver store status) | Should |
 
 ### M4: Quality Measurement Framework

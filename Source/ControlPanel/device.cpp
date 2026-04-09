@@ -107,3 +107,22 @@ AoGetStreamStatus(HANDLE hDevice, AO_STREAM_STATUS* pStatus)
         &bytesReturned,
         NULL);
 }
+
+BOOL
+AoSetMaxChannels(HANDLE hDevice, ULONG channels)
+{
+    if (hDevice == INVALID_HANDLE_VALUE) {
+        return FALSE;
+    }
+
+    DWORD bytesReturned = 0;
+    return DeviceIoControl(
+        hDevice,
+        IOCTL_AO_SET_MAX_CHANNELS,
+        &channels,
+        sizeof(channels),
+        NULL,
+        0,
+        &bytesReturned,
+        NULL);
+}

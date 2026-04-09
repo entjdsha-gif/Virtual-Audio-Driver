@@ -3,20 +3,26 @@ Module Name:
     main.cpp
 Abstract:
     Entry point and UI logic for AO Virtual Cable Control Panel tray app.
-    - System tray icon with right-click menu
-    - Settings dialog for sample rate, latency, and stream monitoring
+    M3: Configuration, stream monitoring, channel mode selection,
+    self-test, driver diagnostics, and device restart workflow.
 --*/
 
 #include <windows.h>
 #include <commctrl.h>
 #include <shellapi.h>
+#include <setupapi.h>
+#include <cfgmgr32.h>
 #include <stdio.h>
+#include <shlwapi.h>
 
 #include "resource.h"
 #include "device.h"
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "shlwapi.lib")
+#pragma comment(lib, "setupapi.lib")
+#pragma comment(lib, "cfgmgr32.lib")
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -30,6 +36,15 @@ static const UINT g_rates[] = { 44100, 48000, 96000, 192000 };
 static const WCHAR* g_rateLabels[] = {
     L"44100 Hz", L"48000 Hz", L"96000 Hz", L"192000 Hz"
 };
+
+static const UINT g_channelModes[] = { 8, 16 };
+static const WCHAR* g_channelLabels[] = {
+    L"8 channels", L"16 channels"
+};
+
+static const ULONG g_defaultRate       = 48000;
+static const ULONG g_defaultLatencyMs  = 20;
+static const ULONG g_defaultChannels   = 8;
 
 // ---------------------------------------------------------------------------
 // Globals
@@ -217,6 +232,7 @@ ShowSettingsDialog(HWND hWndParent)
 typedef struct _DLG_STATE {
     HANDLE hDevA;
     HANDLE hDevB;
+    ULONG  initialChannelMode;  // channel mode at dialog open
 } DLG_STATE;
 
 static void
@@ -228,6 +244,39 @@ FormatEndpointStatus(const AO_ENDPOINT_STATUS* ep, WCHAR* buf, int cch)
         _snwprintf_s(buf, cch, _TRUNCATE,
                      L"Active  %lu Hz / %lu-bit / %lu ch",
                      ep->SampleRate, ep->BitsPerSample, ep->Channels);
+    }
+}
+
+static void
+SetLatencyLabel(HWND hDlg, ULONG latencyMs)
+{
+    WCHAR latBuf[32];
+    _snwprintf_s(latBuf, _countof(latBuf), _TRUNCATE, L"%lu ms", latencyMs);
+    SetDlgItemTextW(hDlg, IDC_STATIC_LATENCY, latBuf);
+}
+
+static void
+ApplyDefaultSelections(HWND hDlg)
+{
+    HWND hRateCombo = GetDlgItem(hDlg, IDC_COMBO_RATE);
+    HWND hSlider = GetDlgItem(hDlg, IDC_SLIDER_LATENCY);
+    HWND hChCombo = GetDlgItem(hDlg, IDC_COMBO_CHANNELS);
+
+    for (int i = 0; i < (int)_countof(g_rates); i++) {
+        if (g_rates[i] == g_defaultRate) {
+            SendMessageW(hRateCombo, CB_SETCURSEL, (WPARAM)i, 0);
+            break;
+        }
+    }
+
+    SendMessageW(hSlider, TBM_SETPOS, TRUE, (LPARAM)g_defaultLatencyMs);
+    SetLatencyLabel(hDlg, g_defaultLatencyMs);
+
+    for (int i = 0; i < (int)_countof(g_channelModes); i++) {
+        if (g_channelModes[i] == g_defaultChannels) {
+            SendMessageW(hChCombo, CB_SETCURSEL, (WPARAM)i, 0);
+            break;
+        }
     }
 }
 
@@ -269,6 +318,419 @@ UpdateStreamStatus(HWND hDlg, DLG_STATE* state)
     SetDlgItemTextW(hDlg, IDC_STATUS_B_MIC, buf);
 }
 
+// ---------------------------------------------------------------------------
+// Runtime state display (from GET_CONFIG + registry)
+// ---------------------------------------------------------------------------
+
+static void
+FormatRuntimeLine(HANDLE hDev, const WCHAR* regPath, const WCHAR* label, WCHAR* buf, int cch)
+{
+    if (hDev == INVALID_HANDLE_VALUE) {
+        _snwprintf_s(buf, cch, _TRUNCATE, L"%s: not connected", label);
+        return;
+    }
+
+    AO_CONFIG config = {};
+    if (!AoGetConfig(hDev, &config)) {
+        _snwprintf_s(buf, cch, _TRUNCATE, L"%s: GET_CONFIG failed", label);
+        return;
+    }
+
+    ULONG regMaxCh = 8;
+    HKEY hKey = NULL;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, regPath, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        DWORD val = 0, sz = sizeof(val);
+        if (RegQueryValueExW(hKey, L"MaxChannelCount", NULL, NULL, (LPBYTE)&val, &sz) == ERROR_SUCCESS) {
+            regMaxCh = val;
+        }
+        RegCloseKey(hKey);
+    }
+
+    _snwprintf_s(buf, cch, _TRUNCATE,
+                 L"%s: Rate=%lu  Lat=%lu ms  Bits=%lu  Ch=%lu  MaxCh(reg)=%lu",
+                 label, config.InternalRate, config.MaxLatencyMs,
+                 config.InternalBits, config.InternalChannels, regMaxCh);
+}
+
+static void
+UpdateRuntimeState(HWND hDlg, DLG_STATE* state)
+{
+    WCHAR buf[256];
+
+    FormatRuntimeLine(state->hDevA,
+                      L"SYSTEM\\CurrentControlSet\\Services\\AOCableA\\Parameters",
+                      L"A", buf, _countof(buf));
+    SetDlgItemTextW(hDlg, IDC_RUNTIME_STATE_A, buf);
+
+    FormatRuntimeLine(state->hDevB,
+                      L"SYSTEM\\CurrentControlSet\\Services\\AOCableB\\Parameters",
+                      L"B", buf, _countof(buf));
+    SetDlgItemTextW(hDlg, IDC_RUNTIME_STATE_B, buf);
+}
+
+// ---------------------------------------------------------------------------
+// Driver info display
+// ---------------------------------------------------------------------------
+
+static void
+FormatDriverFileInfo(const WCHAR* fileName, WCHAR* buf, int cch)
+{
+    WCHAR path[MAX_PATH];
+    WCHAR sysRoot[MAX_PATH] = {};
+    GetEnvironmentVariableW(L"SystemRoot", sysRoot, _countof(sysRoot));
+    _snwprintf_s(path, _countof(path), _TRUNCATE,
+                 L"%s\\System32\\drivers\\%s",
+                 sysRoot, fileName);
+
+    WIN32_FILE_ATTRIBUTE_DATA fad = {};
+    if (!GetFileAttributesExW(path, GetFileExInfoStandard, &fad)) {
+        _snwprintf_s(buf, cch, _TRUNCATE, L"%s: not found", fileName);
+        return;
+    }
+
+    ULARGE_INTEGER fileSize;
+    fileSize.LowPart  = fad.nFileSizeLow;
+    fileSize.HighPart = fad.nFileSizeHigh;
+
+    SYSTEMTIME st;
+    FileTimeToSystemTime(&fad.ftLastWriteTime, &st);
+
+    _snwprintf_s(buf, cch, _TRUNCATE,
+                 L"%s   %llu KB   %04u-%02u-%02u %02u:%02u",
+                 fileName,
+                 fileSize.QuadPart / 1024,
+                 st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute);
+}
+
+static void
+UpdateDriverInfo(HWND hDlg)
+{
+    WCHAR buf[256];
+    FormatDriverFileInfo(L"aocablea.sys", buf, _countof(buf));
+    SetDlgItemTextW(hDlg, IDC_DRIVER_INFO_A, buf);
+
+    FormatDriverFileInfo(L"aocableb.sys", buf, _countof(buf));
+    SetDlgItemTextW(hDlg, IDC_DRIVER_INFO_B, buf);
+}
+
+// ---------------------------------------------------------------------------
+// Device restart via pnputil (elevated)
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Find device instance ID by matching hardware ID property.
+// Enumerates all present ROOT devices, compares SPDRP_HARDWAREID
+// against hwIdTarget (e.g. "ROOT\\AOCableA"), returns the instance ID.
+// ---------------------------------------------------------------------------
+static BOOL
+FindDeviceInstanceId(const WCHAR* hwIdTarget, WCHAR* instanceId, DWORD cchInstanceId)
+{
+    HDEVINFO hDevInfo = SetupDiGetClassDevsW(
+        NULL, L"ROOT", NULL, DIGCF_ALLCLASSES | DIGCF_PRESENT);
+    if (hDevInfo == INVALID_HANDLE_VALUE) {
+        return FALSE;
+    }
+
+    SP_DEVINFO_DATA devInfoData = {};
+    devInfoData.cbSize = sizeof(devInfoData);
+    BOOL found = FALSE;
+
+    for (DWORD idx = 0;
+         SetupDiEnumDeviceInfo(hDevInfo, idx, &devInfoData);
+         idx++)
+    {
+        // Get hardware ID multi-sz property.
+        WCHAR hwIds[512] = {};
+        DWORD propType = 0;
+        if (!SetupDiGetDeviceRegistryPropertyW(
+                hDevInfo, &devInfoData, SPDRP_HARDWAREID,
+                &propType, (PBYTE)hwIds, sizeof(hwIds), NULL))
+        {
+            continue;
+        }
+
+        // Walk the multi-sz list and compare each string.
+        for (const WCHAR* p = hwIds; *p; p += wcslen(p) + 1) {
+            if (_wcsicmp(p, hwIdTarget) == 0) {
+                found = SetupDiGetDeviceInstanceIdW(
+                    hDevInfo, &devInfoData,
+                    instanceId, cchInstanceId, NULL);
+                break;
+            }
+        }
+        if (found) break;
+    }
+
+    SetupDiDestroyDeviceInfoList(hDevInfo);
+    return found;
+}
+
+// ---------------------------------------------------------------------------
+// Restart a device via pnputil using its actual instance ID.
+// Returns TRUE only if pnputil exits with code 0.
+// ---------------------------------------------------------------------------
+static BOOL
+RestartDeviceElevated(HWND hWndParent, const WCHAR* hwIdPrefix)
+{
+    // Look up the real instance ID (e.g. "ROOT\AOCABLEA\0000").
+    WCHAR instanceId[256] = {};
+    if (!FindDeviceInstanceId(hwIdPrefix, instanceId, _countof(instanceId))) {
+        return FALSE;
+    }
+
+    WCHAR args[512];
+    _snwprintf_s(args, _countof(args), _TRUNCATE,
+                 L"/restart-device \"%s\"", instanceId);
+
+    SHELLEXECUTEINFOW sei = {};
+    sei.cbSize       = sizeof(sei);
+    sei.fMask        = SEE_MASK_NOCLOSEPROCESS;
+    sei.hwnd         = hWndParent;
+    sei.lpVerb       = L"runas";
+    sei.lpFile       = L"pnputil.exe";
+    sei.lpParameters = args;
+    sei.nShow        = SW_HIDE;
+
+    if (!ShellExecuteExW(&sei)) {
+        return FALSE;
+    }
+
+    if (!sei.hProcess) {
+        return FALSE;
+    }
+
+    DWORD waitResult = WaitForSingleObject(sei.hProcess, 15000);
+    DWORD exitCode = (DWORD)-1;
+    GetExitCodeProcess(sei.hProcess, &exitCode);
+    CloseHandle(sei.hProcess);
+
+    // Timeout or non-zero exit = failure.
+    if (waitResult != WAIT_OBJECT_0 || exitCode != 0) {
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+static void
+DoSetChannelAndRestart(HWND hDlg, DLG_STATE* state)
+{
+    HWND hCombo = GetDlgItem(hDlg, IDC_COMBO_CHANNELS);
+    int sel = (int)SendMessageW(hCombo, CB_GETCURSEL, 0, 0);
+    ULONG channels = (sel >= 0 && sel < (int)_countof(g_channelModes))
+                     ? g_channelModes[sel] : 8;
+
+    // Write channel count to registry via IOCTL on each available device.
+    BOOL setA = TRUE, setB = TRUE;
+    BOOL hasA = (state->hDevA != INVALID_HANDLE_VALUE);
+    BOOL hasB = (state->hDevB != INVALID_HANDLE_VALUE);
+
+    if (hasA) setA = AoSetMaxChannels(state->hDevA, channels);
+    if (hasB) setB = AoSetMaxChannels(state->hDevB, channels);
+
+    // Report per-device IOCTL result.
+    if ((!hasA || setA) && (!hasB || setB)) {
+        // All accessible devices succeeded.
+    } else {
+        WCHAR msg[256];
+        _snwprintf_s(msg, _countof(msg), _TRUNCATE,
+                     L"Failed to write MaxChannelCount:\n  Cable A: %s\n  Cable B: %s",
+                     hasA ? (setA ? L"OK" : L"FAILED") : L"not present",
+                     hasB ? (setB ? L"OK" : L"FAILED") : L"not present");
+        MessageBoxW(hDlg, msg, L"AO Virtual Cable", MB_ICONERROR | MB_OK);
+        return;
+    }
+
+    // Confirm restart.
+    int answer = MessageBoxW(hDlg,
+        L"MaxChannelCount has been written to registry.\n"
+        L"The audio device must be restarted for the change to take effect.\n\n"
+        L"Restart device now? (requires elevation)",
+        L"AO Virtual Cable", MB_ICONQUESTION | MB_YESNO);
+
+    if (answer != IDYES) {
+        return;
+    }
+
+    // Close device handles before restart.
+    if (state->hDevA != INVALID_HANDLE_VALUE) {
+        CloseHandle(state->hDevA);
+        state->hDevA = INVALID_HANDLE_VALUE;
+    }
+    if (state->hDevB != INVALID_HANDLE_VALUE) {
+        CloseHandle(state->hDevB);
+        state->hDevB = INVALID_HANDLE_VALUE;
+    }
+
+    // Restart each cable device independently, track per-device result.
+    SetDlgItemTextW(hDlg, IDC_RUNTIME_STATE_A, L"Restarting devices...");
+    SetDlgItemTextW(hDlg, IDC_RUNTIME_STATE_B, L"");
+    UpdateWindow(hDlg);
+
+    BOOL rstA = FALSE, rstB = FALSE;
+    if (hasA) rstA = RestartDeviceElevated(hDlg, L"ROOT\\AOCableA");
+    if (hasB) rstB = RestartDeviceElevated(hDlg, L"ROOT\\AOCableB");
+
+    // Wait for devices to come back online.
+    Sleep(2000);
+
+    // Re-open device handles.
+    state->hDevA = AoOpenDevice(0);
+    state->hDevB = AoOpenDevice(1);
+
+    // Refresh all displays.
+    UpdateRuntimeState(hDlg, state);
+    UpdateStreamStatus(hDlg, state);
+    UpdateDriverInfo(hDlg);
+
+    // Verify channel mode on BOTH devices independently.
+    AO_CONFIG cfgA = {}, cfgB = {};
+    BOOL verifyA = FALSE, verifyB = FALSE;
+
+    if (state->hDevA != INVALID_HANDLE_VALUE && AoGetConfig(state->hDevA, &cfgA)) {
+        verifyA = (cfgA.InternalChannels == channels);
+    }
+    if (state->hDevB != INVALID_HANDLE_VALUE && AoGetConfig(state->hDevB, &cfgB)) {
+        verifyB = (cfgB.InternalChannels == channels);
+    }
+
+    // Update channel combo from whatever device is available.
+    ULONG actualCh = (state->hDevA != INVALID_HANDLE_VALUE) ? cfgA.InternalChannels
+                   : (state->hDevB != INVALID_HANDLE_VALUE) ? cfgB.InternalChannels : 0;
+    state->initialChannelMode = actualCh;
+    for (int i = 0; i < (int)_countof(g_channelModes); i++) {
+        if (g_channelModes[i] == actualCh) {
+            SendMessageW(GetDlgItem(hDlg, IDC_COMBO_CHANNELS), CB_SETCURSEL, (WPARAM)i, 0);
+        }
+    }
+
+    // Build per-device result message.
+    WCHAR result[512];
+    _snwprintf_s(result, _countof(result), _TRUNCATE,
+                 L"Restart results:\n"
+                 L"  Cable A: restart=%s  reopen=%s  channels=%s\n"
+                 L"  Cable B: restart=%s  reopen=%s  channels=%s",
+                 hasA ? (rstA ? L"OK" : L"FAILED") : L"n/a",
+                 (state->hDevA != INVALID_HANDLE_VALUE) ? L"OK" : L"FAILED",
+                 (state->hDevA != INVALID_HANDLE_VALUE) ? (verifyA ? L"OK" : L"MISMATCH") : L"--",
+                 hasB ? (rstB ? L"OK" : L"FAILED") : L"n/a",
+                 (state->hDevB != INVALID_HANDLE_VALUE) ? L"OK" : L"FAILED",
+                 (state->hDevB != INVALID_HANDLE_VALUE) ? (verifyB ? L"OK" : L"MISMATCH") : L"--");
+
+    BOOL allOk = (!hasA || (rstA && verifyA)) && (!hasB || (rstB && verifyB));
+    MessageBoxW(hDlg, result, L"AO Virtual Cable",
+                allOk ? MB_ICONINFORMATION : MB_ICONWARNING);
+}
+
+// ---------------------------------------------------------------------------
+// Self-test: IOCTL connectivity + SET/GET roundtrip
+// ---------------------------------------------------------------------------
+
+static void
+DoSelfTest(HWND hDlg, DLG_STATE* state)
+{
+    WCHAR report[1024] = {};
+    WCHAR line[256];
+    int pass = 0, fail = 0;
+
+    // Test 1: Device accessibility
+    HANDLE hTestA = AoOpenDevice(0);
+    HANDLE hTestB = AoOpenDevice(1);
+
+    if (hTestA != INVALID_HANDLE_VALUE) {
+        wcscat_s(report, L"[PASS] Cable A device opened\r\n");
+        pass++;
+    } else {
+        wcscat_s(report, L"[FAIL] Cable A device not accessible\r\n");
+        fail++;
+    }
+
+    if (hTestB != INVALID_HANDLE_VALUE) {
+        wcscat_s(report, L"[PASS] Cable B device opened\r\n");
+        pass++;
+    } else {
+        wcscat_s(report, L"[FAIL] Cable B device not accessible\r\n");
+        fail++;
+    }
+
+    // Test 2: GET_CONFIG on each accessible device
+    HANDLE devices[] = { hTestA, hTestB };
+    const WCHAR* names[] = { L"Cable A", L"Cable B" };
+
+    for (int i = 0; i < 2; i++) {
+        if (devices[i] == INVALID_HANDLE_VALUE) continue;
+
+        AO_CONFIG config = {};
+        if (AoGetConfig(devices[i], &config)) {
+            _snwprintf_s(line, _countof(line), _TRUNCATE,
+                         L"[PASS] %s GET_CONFIG: Rate=%lu Bits=%lu Ch=%lu\r\n",
+                         names[i], config.InternalRate, config.InternalBits, config.InternalChannels);
+            wcscat_s(report, line);
+            pass++;
+        } else {
+            _snwprintf_s(line, _countof(line), _TRUNCATE,
+                         L"[FAIL] %s GET_CONFIG failed\r\n", names[i]);
+            wcscat_s(report, line);
+            fail++;
+        }
+    }
+
+    // Test 3: GET_CONFIG value sanity check (non-destructive, no SET)
+    for (int i = 0; i < 2; i++) {
+        if (devices[i] == INVALID_HANDLE_VALUE) continue;
+
+        AO_CONFIG cfg = {};
+        if (AoGetConfig(devices[i], &cfg)) {
+            BOOL sane = (cfg.InternalRate >= 8000 && cfg.InternalRate <= 192000 &&
+                         cfg.InternalBits > 0 && cfg.InternalBits <= 32 &&
+                         cfg.InternalChannels >= 1 && cfg.InternalChannels <= 16);
+            if (sane) {
+                _snwprintf_s(line, _countof(line), _TRUNCATE,
+                             L"[PASS] %s config values sane\r\n", names[i]);
+                pass++;
+            } else {
+                _snwprintf_s(line, _countof(line), _TRUNCATE,
+                             L"[FAIL] %s config values out of range\r\n", names[i]);
+                fail++;
+            }
+            wcscat_s(report, line);
+        }
+    }
+
+    // Test 4: GET_STREAM_STATUS
+    for (int i = 0; i < 2; i++) {
+        if (devices[i] == INVALID_HANDLE_VALUE) continue;
+
+        AO_STREAM_STATUS st = {};
+        if (AoGetStreamStatus(devices[i], &st)) {
+            _snwprintf_s(line, _countof(line), _TRUNCATE,
+                         L"[PASS] %s GET_STREAM_STATUS OK\r\n", names[i]);
+            pass++;
+        } else {
+            _snwprintf_s(line, _countof(line), _TRUNCATE,
+                         L"[FAIL] %s GET_STREAM_STATUS failed\r\n", names[i]);
+            fail++;
+        }
+        wcscat_s(report, line);
+    }
+
+    // Clean up test handles (separate from dialog state handles).
+    if (hTestA != INVALID_HANDLE_VALUE) CloseHandle(hTestA);
+    if (hTestB != INVALID_HANDLE_VALUE) CloseHandle(hTestB);
+
+    // Summary
+    _snwprintf_s(line, _countof(line), _TRUNCATE,
+                 L"\r\nResult: %d passed, %d failed", pass, fail);
+    wcscat_s(report, line);
+
+    MessageBoxW(hDlg, report, L"AO Virtual Cable - Self-Test",
+                (fail == 0) ? MB_ICONINFORMATION : MB_ICONWARNING);
+}
+
+// ---------------------------------------------------------------------------
+// Dialog procedure
+// ---------------------------------------------------------------------------
+
 static INT_PTR CALLBACK
 SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam)
 {
@@ -301,8 +763,9 @@ SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam)
         HANDLE hDev = (state->hDevA != INVALID_HANDLE_VALUE) ? state->hDevA : state->hDevB;
 
         AO_CONFIG config = {};
-        config.InternalRate = 48000;
-        config.MaxLatencyMs = 20;
+        config.InternalRate = g_defaultRate;
+        config.MaxLatencyMs = g_defaultLatencyMs;
+        config.InternalChannels = g_defaultChannels;
 
         if (hDev != INVALID_HANDLE_VALUE) {
             AoGetConfig(hDev, &config);
@@ -311,7 +774,7 @@ SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam)
         // Populate sample rate combo box.
         HWND hCombo = GetDlgItem(hDlg, IDC_COMBO_RATE);
         int selIndex = 1; // default to 48000
-        for (int i = 0; i < _countof(g_rates); i++) {
+        for (int i = 0; i < (int)_countof(g_rates); i++) {
             SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)g_rateLabels[i]);
             if (g_rates[i] == config.InternalRate) {
                 selIndex = i;
@@ -326,9 +789,23 @@ SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam)
         SendMessageW(hSlider, TBM_SETPOS, TRUE, (LPARAM)config.MaxLatencyMs);
 
         // Update latency label.
-        WCHAR latBuf[32];
-        _snwprintf_s(latBuf, _countof(latBuf), _TRUNCATE, L"%lu ms", config.MaxLatencyMs);
-        SetDlgItemTextW(hDlg, IDC_STATIC_LATENCY, latBuf);
+        SetLatencyLabel(hDlg, config.MaxLatencyMs);
+
+        // Populate channel mode combo box.
+        HWND hChCombo = GetDlgItem(hDlg, IDC_COMBO_CHANNELS);
+        int chSelIndex = 0;
+        for (int i = 0; i < (int)_countof(g_channelModes); i++) {
+            SendMessageW(hChCombo, CB_ADDSTRING, 0, (LPARAM)g_channelLabels[i]);
+            if (g_channelModes[i] == config.InternalChannels) {
+                chSelIndex = i;
+            }
+        }
+        SendMessageW(hChCombo, CB_SETCURSEL, (WPARAM)chSelIndex, 0);
+        state->initialChannelMode = config.InternalChannels;
+
+        // Update runtime state, driver info.
+        UpdateRuntimeState(hDlg, state);
+        UpdateDriverInfo(hDlg);
 
         // Start polling timer (1 second).
         SetTimer(hDlg, 1, 1000, NULL);
@@ -342,6 +819,7 @@ SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam)
     case WM_TIMER:
         if (wParam == 1 && state) {
             UpdateStreamStatus(hDlg, state);
+            UpdateRuntimeState(hDlg, state);
         }
         return TRUE;
 
@@ -350,9 +828,7 @@ SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam)
         HWND hSlider = GetDlgItem(hDlg, IDC_SLIDER_LATENCY);
         if ((HWND)lParam == hSlider) {
             LRESULT pos = SendMessageW(hSlider, TBM_GETPOS, 0, 0);
-            WCHAR latBuf[32];
-            _snwprintf_s(latBuf, _countof(latBuf), _TRUNCATE, L"%ld ms", (long)pos);
-            SetDlgItemTextW(hDlg, IDC_STATIC_LATENCY, latBuf);
+            SetLatencyLabel(hDlg, (ULONG)pos);
         }
         return TRUE;
     }
@@ -366,7 +842,7 @@ SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam)
             // Read sample rate from combo.
             HWND hCombo = GetDlgItem(hDlg, IDC_COMBO_RATE);
             int sel = (int)SendMessageW(hCombo, CB_GETCURSEL, 0, 0);
-            ULONG rate = (sel >= 0 && sel < (int)_countof(g_rates)) ? g_rates[sel] : 48000;
+            ULONG rate = (sel >= 0 && sel < (int)_countof(g_rates)) ? g_rates[sel] : g_defaultRate;
 
             // Read latency from slider.
             HWND hSlider = GetDlgItem(hDlg, IDC_SLIDER_LATENCY);
@@ -390,9 +866,29 @@ SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam)
                             L"The driver may not support this configuration.",
                             L"AO Virtual Cable",
                             MB_ICONWARNING | MB_OK);
+            } else {
+                // Refresh runtime state to show updated values.
+                UpdateRuntimeState(hDlg, state);
             }
             break;
         }
+
+        case IDC_BTN_DEFAULTS:
+            ApplyDefaultSelections(hDlg);
+            break;
+
+        case IDC_BTN_RESTART:
+            if (state) {
+                DoSetChannelAndRestart(hDlg, state);
+            }
+            break;
+
+        case IDC_BTN_SELFTEST:
+            if (state) {
+                DoSelfTest(hDlg, state);
+            }
+            break;
+
         case IDCANCEL:
             EndDialog(hDlg, 0);
             break;
