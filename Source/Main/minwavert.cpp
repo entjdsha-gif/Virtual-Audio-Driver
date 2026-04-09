@@ -692,7 +692,7 @@ CMiniportWaveRT::GetModes
     ULONG                   numModes    = 0;
     MODE_AND_DEFAULT_FORMAT *modeInfo   = NULL;
 
-    if (Pin >= m_pMiniportPair->WaveDescriptor->PinCount)
+    if (Pin >= m_FilterDesc.PinCount)
     {
         return STATUS_INVALID_PARAMETER;
     }
@@ -1130,7 +1130,7 @@ CMiniportWaveRT::IsFormatSupported
 
     UNREFERENCED_PARAMETER(_bCapture);
 
-    if (_ulPin >= m_pMiniportPair->WaveDescriptor->PinCount)
+    if (_ulPin >= m_FilterDesc.PinCount)
     {
         return STATUS_INVALID_PARAMETER;
     }
@@ -1366,7 +1366,7 @@ CMiniportWaveRT::PropertyHandlerProposedFormat2
     // Extract property descriptor from property request instance data
     kspPin = CONTAINING_RECORD(PropertyRequest->Instance, KSP_PIN, PinId);
 
-    if (kspPin->PinId >= m_pMiniportPair->WaveDescriptor->PinCount)
+    if (kspPin->PinId >= m_FilterDesc.PinCount)
     {
         return STATUS_INVALID_PARAMETER;
     }

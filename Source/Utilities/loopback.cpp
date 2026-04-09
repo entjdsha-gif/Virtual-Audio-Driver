@@ -12,9 +12,12 @@ Abstract:
 #include "loopback.h"
 
 // Layout verification (must match adapter.cpp)
-C_ASSERT(sizeof(LOOPBACK_BUFFER) == 728);
-C_ASSERT(FIELD_OFFSET(LOOPBACK_BUFFER, InternalRate) == 0x2CC);
-C_ASSERT(FIELD_OFFSET(LOOPBACK_BUFFER, MaxLatencyMs) == 0x2D0);
+C_ASSERT(sizeof(LB_SRC_STATE) == 528);
+C_ASSERT(sizeof(LOOPBACK_BUFFER) == 1248);
+C_ASSERT(FIELD_OFFSET(LOOPBACK_BUFFER, InternalRate) == 0x4CC);
+C_ASSERT(FIELD_OFFSET(LOOPBACK_BUFFER, MaxLatencyMs) == 0x4D0);
+C_ASSERT(FIELD_OFFSET(LOOPBACK_BUFFER, InternalChannels) == 0x4D4);
+C_ASSERT(FIELD_OFFSET(LOOPBACK_BUFFER, InternalBlockAlign) == 0x4D8);
 
 // Global instances
 LOOPBACK_BUFFER g_CableALoopback = { 0 };
@@ -211,10 +214,11 @@ static ULONG ConvertToInternal(
     const BYTE*     inData,
     ULONG           inFrames,
     const LB_FORMAT* inFmt,
-    INT32*          outSamples
+    INT32*          outSamples,
+    ULONG           nInternalCh
 )
 {
-    const ULONG nCh = LB_INTERNAL_CHANNELS;
+    const ULONG nCh = nInternalCh;
     const ULONG bps = BytesPerSample(inFmt);
     const BYTE* p = inData;
 
@@ -259,10 +263,11 @@ static ULONG ConvertFromInternal(
     const INT32*    inSamples,
     ULONG           inFrames,
     const LB_FORMAT* outFmt,
-    BYTE*           outData
+    BYTE*           outData,
+    ULONG           nInternalCh
 )
 {
-    const ULONG nCh = LB_INTERNAL_CHANNELS;
+    const ULONG nCh = nInternalCh;
     const ULONG bps = BytesPerSample(outFmt);
     BYTE* p = outData;
 
@@ -281,6 +286,11 @@ static ULONG ConvertFromInternal(
             for (ULONG ch = 0; ch < chToCopy; ch++)
             {
                 WriteSample(p + ch * bps, in[ch], outFmt);
+            }
+            // Zero remaining output channels beyond internal count
+            for (ULONG ch = chToCopy; ch < outFmt->nChannels; ch++)
+            {
+                WriteSample(p + ch * bps, 0, outFmt);
             }
         }
 
@@ -309,10 +319,11 @@ static ULONG SrcConvert(
     ULONG           dstRate,
     INT32*          outSamples,
     ULONG           maxOutFrames,
-    LB_SRC_STATE*   state
+    LB_SRC_STATE*   state,
+    ULONG           nInternalCh
 )
 {
-    const ULONG nCh = LB_INTERNAL_CHANNELS;
+    const ULONG nCh = nInternalCh;
     const ULONG halfTaps = LB_SINC_TAPS / 2;
 
     if (srcRate == dstRate)
@@ -405,11 +416,11 @@ static ULONG SrcConvert(
 //=============================================================================
 // Helper: check if format matches internal format
 //=============================================================================
-static BOOLEAN FormatMatchesInternal(const LB_FORMAT* fmt, ULONG internalRate)
+static BOOLEAN FormatMatchesInternal(const LB_FORMAT* fmt, ULONG internalRate, ULONG internalChannels)
 {
     return (fmt->SampleRate == internalRate &&
             fmt->BitsPerSample == LB_INTERNAL_BITS &&
-            fmt->nChannels == LB_INTERNAL_CHANNELS &&
+            fmt->nChannels == internalChannels &&
             !fmt->IsFloat);  // internal format is always PCM
 }
 
@@ -425,15 +436,15 @@ static VOID UpdateFormatMatch(PLOOPBACK_BUFFER pLB)
             (pLB->SpeakerFormat.SampleRate == pLB->MicFormat.SampleRate) &&
             (pLB->SpeakerFormat.BitsPerSample == pLB->MicFormat.BitsPerSample) &&
             (pLB->SpeakerFormat.nChannels == pLB->MicFormat.nChannels) &&
-            FormatMatchesInternal(&pLB->SpeakerFormat, pLB->InternalRate);
+            FormatMatchesInternal(&pLB->SpeakerFormat, pLB->InternalRate, pLB->InternalChannels);
     }
     else if (pLB->SpeakerActive)
     {
-        pLB->FormatMatch = FormatMatchesInternal(&pLB->SpeakerFormat, pLB->InternalRate);
+        pLB->FormatMatch = FormatMatchesInternal(&pLB->SpeakerFormat, pLB->InternalRate, pLB->InternalChannels);
     }
     else if (pLB->MicActive)
     {
-        pLB->FormatMatch = FormatMatchesInternal(&pLB->MicFormat, pLB->InternalRate);
+        pLB->FormatMatch = FormatMatchesInternal(&pLB->MicFormat, pLB->InternalRate, pLB->InternalChannels);
     }
     else
     {
@@ -444,15 +455,15 @@ static VOID UpdateFormatMatch(PLOOPBACK_BUFFER pLB)
 //=============================================================================
 // Calculate buffer size from rate and latency
 //=============================================================================
-static ULONG CalcBufferSize(ULONG internalRate, ULONG latencyMs)
+static ULONG CalcBufferSize(ULONG internalRate, ULONG latencyMs, ULONG blockAlign)
 {
     // 4 seconds of internal format buffer for ring stability
     // (latencyMs controls the conceptual latency, but ring is larger for safety)
-    ULONG minSize = internalRate * LB_INTERNAL_BLOCKALIGN * latencyMs / 1000;
-    // Round up to LB_INTERNAL_BLOCKALIGN alignment
-    minSize = ((minSize + LB_INTERNAL_BLOCKALIGN - 1) / LB_INTERNAL_BLOCKALIGN) * LB_INTERNAL_BLOCKALIGN;
+    ULONG minSize = internalRate * blockAlign * latencyMs / 1000;
+    // Round up to block alignment
+    minSize = ((minSize + blockAlign - 1) / blockAlign) * blockAlign;
     // At least 4 seconds for ring stability
-    ULONG safeSize = internalRate * LB_INTERNAL_BLOCKALIGN * 4;
+    ULONG safeSize = internalRate * blockAlign * 4;
     return max(minSize, safeSize);
 }
 
@@ -460,15 +471,21 @@ static ULONG CalcBufferSize(ULONG internalRate, ULONG latencyMs)
 // LoopbackInit
 //=============================================================================
 #pragma code_seg("PAGE")
-NTSTATUS LoopbackInit(PLOOPBACK_BUFFER pLoopback)
+NTSTATUS LoopbackInit(PLOOPBACK_BUFFER pLoopback, ULONG internalChannels)
 {
     PAGED_CODE();
+
+    // Validate channel count (runtime, 8 or 16)
+    if (internalChannels != 8 && internalChannels != 16)
+        internalChannels = LB_INTERNAL_CHANNELS;
 
     // Set defaults
     pLoopback->InternalRate = LB_DEFAULT_INTERNAL_RATE;
     pLoopback->MaxLatencyMs = LB_DEFAULT_LATENCY_MS;
+    pLoopback->InternalChannels = internalChannels;
+    pLoopback->InternalBlockAlign = (LB_INTERNAL_BITS / 8) * internalChannels;
 
-    pLoopback->BufferSize = CalcBufferSize(pLoopback->InternalRate, pLoopback->MaxLatencyMs);
+    pLoopback->BufferSize = CalcBufferSize(pLoopback->InternalRate, pLoopback->MaxLatencyMs, pLoopback->InternalBlockAlign);
     pLoopback->Buffer = (BYTE*)ExAllocatePool2(
         POOL_FLAG_NON_PAGED,
         pLoopback->BufferSize,
@@ -852,15 +869,21 @@ VOID LoopbackWriteConverted(
 
     LB_FORMAT spkFmt;
     ULONG internalRate;
+    ULONG intCh;
+    ULONG intBA;
 
-    // Snapshot format under spinlock
+    // Snapshot format + channel config under spinlock
     KIRQL oldIrql;
     KeAcquireSpinLock(&pLoopback->SpinLock, &oldIrql);
     spkFmt = pLoopback->SpeakerFormat;
     internalRate = pLoopback->InternalRate;
+    intCh = pLoopback->InternalChannels;
+    intBA = pLoopback->InternalBlockAlign;
     KeReleaseSpinLock(&pLoopback->SpinLock, oldIrql);
 
     if (spkFmt.nBlockAlign == 0 || spkFmt.SampleRate == 0)
+        return;
+    if (intCh == 0 || intBA == 0)
         return;
 
     ULONG inFrames = ByteCount / spkFmt.nBlockAlign;
@@ -868,13 +891,13 @@ VOID LoopbackWriteConverted(
         return;
 
     // Step 1: Convert input to internal N-channel INT32 samples (24-bit range)
-    const ULONG nCh = LB_INTERNAL_CHANNELS;
+    const ULONG nCh = intCh;
     ULONG maxIntFrames = pLoopback->ConvertBufSize / (nCh * sizeof(INT32));
     if (inFrames > maxIntFrames)
         inFrames = maxIntFrames;
 
     INT32* intSamples = (INT32*)pLoopback->SpkConvertBufA;
-    ULONG intFrames = ConvertToInternal(Data, inFrames, &spkFmt, intSamples);
+    ULONG intFrames = ConvertToInternal(Data, inFrames, &spkFmt, intSamples, nCh);
 
     // Step 2: SRC from speaker rate to internal rate
     ULONG maxOutFrames = pLoopback->ConvertBufSize / (nCh * sizeof(INT32));
@@ -891,15 +914,16 @@ VOID LoopbackWriteConverted(
         intSamples, intFrames,
         spkFmt.SampleRate, internalRate,
         srcOutput, maxOutFrames,
-        &pLoopback->SpeakerSrcState
+        &pLoopback->SpeakerSrcState,
+        nCh
     );
 
     if (srcFrames == 0)
         return;
 
     // Step 3: Convert N-channel INT32 -> internal packed format
-    LB_FORMAT internalFmt = { internalRate, LB_INTERNAL_BITS, LB_INTERNAL_CHANNELS, LB_INTERNAL_BLOCKALIGN, FALSE };
-    ULONG packedBytes = ConvertFromInternal(srcOutput, srcFrames, &internalFmt, pLoopback->SpkConvertBufA);
+    LB_FORMAT internalFmt = { internalRate, LB_INTERNAL_BITS, nCh, intBA, FALSE };
+    ULONG packedBytes = ConvertFromInternal(srcOutput, srcFrames, &internalFmt, pLoopback->SpkConvertBufA, nCh);
 
     // Step 4: Write packed data to ring buffer
     // Need to acquire spinlock for ring buffer write AND mic sink push
@@ -933,7 +957,7 @@ VOID LoopbackWriteConverted(
     if (pLoopback->MicSink.Active && pLoopback->MicSink.DmaBuffer && pLoopback->MicActive)
     {
         // Check if Mic format == internal format for direct push
-        if (FormatMatchesInternal(&pLoopback->MicFormat, internalRate))
+        if (FormatMatchesInternal(&pLoopback->MicFormat, internalRate, pLoopback->InternalChannels))
         {
             BYTE*  micBuf  = pLoopback->MicSink.DmaBuffer;
             ULONG  micSize = pLoopback->MicSink.DmaBufferSize;
@@ -992,12 +1016,22 @@ VOID LoopbackReadConverted(
 
     // Snapshot format
     KIRQL oldIrql;
+    ULONG intCh;
+    ULONG intBA;
+
     KeAcquireSpinLock(&pLoopback->SpinLock, &oldIrql);
     micFmt = pLoopback->MicFormat;
     internalRate = pLoopback->InternalRate;
+    intCh = pLoopback->InternalChannels;
+    intBA = pLoopback->InternalBlockAlign;
     KeReleaseSpinLock(&pLoopback->SpinLock, oldIrql);
 
     if (micFmt.nBlockAlign == 0 || micFmt.SampleRate == 0)
+    {
+        RtlZeroMemory(Data, ByteCount);
+        return;
+    }
+    if (intCh == 0 || intBA == 0)
     {
         RtlZeroMemory(Data, ByteCount);
         return;
@@ -1011,19 +1045,17 @@ VOID LoopbackReadConverted(
     }
 
     // Calculate how many internal frames we need to read
-    // internalFrames = outFrames * internalRate / micRate (approximately)
     ULONG internalFrames = (ULONG)(((ULONGLONG)outFrames * internalRate + micFmt.SampleRate - 1) / micFmt.SampleRate);
-    // Add 1 extra for SRC interpolation
     internalFrames += 1;
 
     // Limit to scratch buffer capacity
-    const ULONG nCh = LB_INTERNAL_CHANNELS;
+    const ULONG nCh = intCh;
     ULONG maxFrames = pLoopback->ConvertBufSize / (nCh * sizeof(INT32));
     if (internalFrames > maxFrames)
         internalFrames = maxFrames;
 
     // Step 1: Read internal format bytes from ring buffer
-    ULONG internalBytes = internalFrames * LB_INTERNAL_BLOCKALIGN;
+    ULONG internalBytes = internalFrames * intBA;
     if (internalBytes > pLoopback->ConvertBufSize)
         internalBytes = pLoopback->ConvertBufSize;
 
@@ -1034,7 +1066,7 @@ VOID LoopbackReadConverted(
     ULONG available = pLoopback->DataCount;
     ULONG toRead = min(internalBytes, available);
     // Align to internal block
-    toRead = (toRead / LB_INTERNAL_BLOCKALIGN) * LB_INTERNAL_BLOCKALIGN;
+    toRead = (toRead / intBA) * intBA;
 
     ULONG dstOff = 0;
     ULONG rem = toRead;
@@ -1058,19 +1090,19 @@ VOID LoopbackReadConverted(
     }
 
     // Step 2: Convert internal packed bytes -> N-channel INT32
-    LB_FORMAT internalFmt = { internalRate, LB_INTERNAL_BITS, LB_INTERNAL_CHANNELS, LB_INTERNAL_BLOCKALIGN, FALSE };
-    ULONG readFrames = toRead / LB_INTERNAL_BLOCKALIGN;
-    // Clamp to scratch buffer capacity: ConvertToInternal outputs readFrames * nCh * sizeof(INT32)
+    LB_FORMAT internalFmt = { internalRate, LB_INTERNAL_BITS, nCh, intBA, FALSE };
+    ULONG readFrames = toRead / intBA;
+    // Clamp to scratch buffer capacity
     if (readFrames > maxFrames)
         readFrames = maxFrames;
 
     INT32* intSamples = (INT32*)pLoopback->MicConvertBufB;
-    ULONG intFrames = ConvertToInternal(pLoopback->MicConvertBufA, readFrames, &internalFmt, intSamples);
+    ULONG intFrames = ConvertToInternal(pLoopback->MicConvertBufA, readFrames, &internalFmt, intSamples, nCh);
 
     // Step 3: SRC from internal rate to mic rate
     INT32* srcOutput = (INT32*)pLoopback->MicConvertBufA;
 
-    // Consume reset flag (set by IOCTL/RegisterFormat, safe to reset here in DPC context)
+    // Consume reset flag
     if (pLoopback->MicSrcResetPending)
     {
         RtlZeroMemory(&pLoopback->MicSrcState, sizeof(LB_SRC_STATE));
@@ -1083,13 +1115,14 @@ VOID LoopbackReadConverted(
         intSamples, intFrames,
         internalRate, micFmt.SampleRate,
         srcOutput, maxSrcOut,
-        &pLoopback->MicSrcState
+        &pLoopback->MicSrcState,
+        nCh
     );
 
     // Step 4: Convert N-channel INT32 -> Mic output format
     if (srcFrames > 0)
     {
-        ULONG written = ConvertFromInternal(srcOutput, srcFrames, &micFmt, Data);
+        ULONG written = ConvertFromInternal(srcOutput, srcFrames, &micFmt, Data, nCh);
         // Zero-fill remainder
         if (written < ByteCount)
         {
@@ -1118,7 +1151,7 @@ NTSTATUS LoopbackResizeBuffer(PLOOPBACK_BUFFER pLoopback, ULONG newLatencyMs)
     if (newLatencyMs > LB_MAX_LATENCY_MS)
         newLatencyMs = LB_MAX_LATENCY_MS;
 
-    ULONG newSize = CalcBufferSize(pLoopback->InternalRate, newLatencyMs);
+    ULONG newSize = CalcBufferSize(pLoopback->InternalRate, newLatencyMs, pLoopback->InternalBlockAlign);
 
     BYTE* newBuf = (BYTE*)ExAllocatePool2(POOL_FLAG_NON_PAGED, newSize, 'pooL');
     if (!newBuf)
@@ -1165,7 +1198,7 @@ NTSTATUS LoopbackSetInternalRate(PLOOPBACK_BUFFER pLoopback, ULONG newRate)
         return STATUS_INVALID_PARAMETER;
 
     // Resize buffer for new rate
-    ULONG newSize = CalcBufferSize(newRate, pLoopback->MaxLatencyMs);
+    ULONG newSize = CalcBufferSize(newRate, pLoopback->MaxLatencyMs, pLoopback->InternalBlockAlign);
 
     BYTE* newBuf = (BYTE*)ExAllocatePool2(POOL_FLAG_NON_PAGED, newSize, 'pooL');
     if (!newBuf)

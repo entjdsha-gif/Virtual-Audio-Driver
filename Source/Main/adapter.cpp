@@ -26,9 +26,12 @@ Abstract:
 #include "ioctl.h"
 
 // Layout verification (must match loopback.cpp in Utilities.lib)
-C_ASSERT(sizeof(LOOPBACK_BUFFER) == 728);
-C_ASSERT(FIELD_OFFSET(LOOPBACK_BUFFER, InternalRate) == 0x2CC);
-C_ASSERT(FIELD_OFFSET(LOOPBACK_BUFFER, MaxLatencyMs) == 0x2D0);
+C_ASSERT(sizeof(LB_SRC_STATE) == 528);
+C_ASSERT(sizeof(LOOPBACK_BUFFER) == 1248);
+C_ASSERT(FIELD_OFFSET(LOOPBACK_BUFFER, InternalRate) == 0x4CC);
+C_ASSERT(FIELD_OFFSET(LOOPBACK_BUFFER, MaxLatencyMs) == 0x4D0);
+C_ASSERT(FIELD_OFFSET(LOOPBACK_BUFFER, InternalChannels) == 0x4D4);
+C_ASSERT(FIELD_OFFSET(LOOPBACK_BUFFER, InternalBlockAlign) == 0x4D8);
 
 typedef void (*fnPcDriverUnload) (PDRIVER_OBJECT);
 fnPcDriverUnload gPCDriverUnloadRoutine = NULL;
@@ -46,6 +49,35 @@ static HANDLE g_hParametersKey = NULL;
 
 // Standalone control device (separate from PortCls device stack)
 static PDEVICE_OBJECT g_ControlDevice = NULL;
+
+//=============================================================================
+// Dynamic 16ch format block -- single allocation holds all PortCls tables.
+// Built at StartDevice for 16ch mode; static 16ch tables removed from binary
+// because their mere presence in .data causes PortCls BugCheck 0xD1.
+//=============================================================================
+#define CABLE_8CH_FORMAT_COUNT   108
+#define CABLE_16CH_EXTRA_COUNT    12   // 4 rates x (16bit + 24bit + 32float)
+#define CABLE_16CH_TOTAL_COUNT  (CABLE_8CH_FORMAT_COUNT + CABLE_16CH_EXTRA_COUNT)
+#define AO_DYN16_POOLTAG        '61oA'
+
+typedef struct _AO_DYN16_BLOCK {
+    AO_ENDPOINT_FORMAT_BINDING          Binding;
+    PCFILTER_DESCRIPTOR                 FilterDesc;
+    PCPIN_DESCRIPTOR                    Pins[2];
+    KSDATARANGE_AUDIO                   DataRanges[2];
+    PKSDATARANGE                        DataRangePointers[4];
+    MODE_AND_DEFAULT_FORMAT             Mode;
+    PIN_DEVICE_FORMATS_AND_MODES        PinFmtModes[2];
+    KSDATAFORMAT_WAVEFORMATEXTENSIBLE   WaveFormats[CABLE_16CH_TOTAL_COUNT];
+} AO_DYN16_BLOCK, *PAO_DYN16_BLOCK;
+
+static PAO_DYN16_BLOCK g_pDyn16RenderA  = NULL;
+static PAO_DYN16_BLOCK g_pDyn16CaptureA = NULL;
+static PAO_DYN16_BLOCK g_pDyn16RenderB  = NULL;
+static PAO_DYN16_BLOCK g_pDyn16CaptureB = NULL;
+
+static VOID AoFree16chBlock(_Inout_ PAO_DYN16_BLOCK *ppBlock);
+static NTSTATUS AoBuild16chBlock(_In_ BOOLEAN IsRender, _Out_ PAO_DYN16_BLOCK *ppBlock);
 
 // Control device names
 #if defined(CABLE_A)
@@ -77,7 +109,7 @@ static VOID     AoDeleteControlDevice(VOID);
 
 // Forward declarations for registry persistence
 static NTSTATUS AoOpenParametersKey(_In_ ACCESS_MASK DesiredAccess, _Out_ PHANDLE phKey);
-static VOID AoReadRegistryConfig(_Out_ PULONG pInternalRate, _Out_ PULONG pMaxLatencyMs);
+static VOID AoReadRegistryConfig(_Out_ PULONG pInternalRate, _Out_ PULONG pMaxLatencyMs, _Out_ PULONG pMaxChannelCount);
 static VOID AoWriteRegistryValue(_In_ PCWSTR ValueName, _In_ ULONG Value);
 
 NTSTATUS
@@ -176,6 +208,22 @@ Environment:
     {
         WdfDriverMiniportUnload(WdfGetDriver());
     }
+
+    //
+    // Free any remaining dynamic 16ch blocks (belt-and-suspenders).
+    //
+#if defined(CABLE_A)
+    AoFree16chBlock(&g_pDyn16RenderA);
+    AoFree16chBlock(&g_pDyn16CaptureA);
+#elif defined(CABLE_B)
+    AoFree16chBlock(&g_pDyn16RenderB);
+    AoFree16chBlock(&g_pDyn16CaptureB);
+#else
+    AoFree16chBlock(&g_pDyn16RenderA);
+    AoFree16chBlock(&g_pDyn16CaptureA);
+    AoFree16chBlock(&g_pDyn16RenderB);
+    AoFree16chBlock(&g_pDyn16CaptureB);
+#endif
 
     //
     // Cleanup loopback buffers.
@@ -445,37 +493,9 @@ Return Value:
     DriverObject->DriverUnload = DriverUnload;
 
     //
-    // Initialize loopback buffers.
-    //
-#if defined(CABLE_A)
-    ntStatus = LoopbackInit(&g_CableALoopback);
-    IF_FAILED_ACTION_JUMP(
-        ntStatus,
-        DPF(D_ERROR, ("LoopbackInit CableA failed, 0x%x", ntStatus)),
-        Done);
-#elif defined(CABLE_B)
-    ntStatus = LoopbackInit(&g_CableBLoopback);
-    IF_FAILED_ACTION_JUMP(
-        ntStatus,
-        DPF(D_ERROR, ("LoopbackInit CableB failed, 0x%x", ntStatus)),
-        Done);
-#else
-    ntStatus = LoopbackInit(&g_CableALoopback);
-    IF_FAILED_ACTION_JUMP(
-        ntStatus,
-        DPF(D_ERROR, ("LoopbackInit CableA failed, 0x%x", ntStatus)),
-        Done);
-
-    ntStatus = LoopbackInit(&g_CableBLoopback);
-    IF_FAILED_ACTION_JUMP(
-        ntStatus,
-        DPF(D_ERROR, ("LoopbackInit CableB failed, 0x%x", ntStatus)),
-        Done);
-#endif
-
-    //
     // Open registry Parameters key for persistent settings.
     // Must be done here (system thread context) so Zw* calls bypass access checks.
+    // Opened BEFORE LoopbackInit so channel count can be read first.
     //
     {
         NTSTATUS regStatus = AoOpenParametersKey(KEY_READ | KEY_WRITE, &g_hParametersKey);
@@ -487,27 +507,59 @@ Return Value:
     }
 
     //
-    // Apply saved registry settings to loopback buffers.
+    // Read saved registry settings (rate, latency, channel count).
     //
-    {
-        ULONG savedRate = LB_DEFAULT_INTERNAL_RATE;
-        ULONG savedLatency = LB_DEFAULT_LATENCY_MS;
-        AoReadRegistryConfig(&savedRate, &savedLatency);
+    ULONG savedRate = LB_DEFAULT_INTERNAL_RATE;
+    ULONG savedLatency = LB_DEFAULT_LATENCY_MS;
+    ULONG savedChannels = LB_INTERNAL_CHANNELS;
+    AoReadRegistryConfig(&savedRate, &savedLatency, &savedChannels);
+    DPF(D_TERSE, ("[DriverEntry] Registry config: Rate=%u, Latency=%ums, Channels=%u",
+                   savedRate, savedLatency, savedChannels));
 
+    //
+    // Initialize loopback buffers with configured channel count.
+    //
 #if defined(CABLE_A)
-        LoopbackSetInternalRate(&g_CableALoopback, savedRate);
-        LoopbackResizeBuffer(&g_CableALoopback, savedLatency);
+    ntStatus = LoopbackInit(&g_CableALoopback, savedChannels);
+    IF_FAILED_ACTION_JUMP(
+        ntStatus,
+        DPF(D_ERROR, ("LoopbackInit CableA failed, 0x%x", ntStatus)),
+        Done);
 #elif defined(CABLE_B)
-        LoopbackSetInternalRate(&g_CableBLoopback, savedRate);
-        LoopbackResizeBuffer(&g_CableBLoopback, savedLatency);
+    ntStatus = LoopbackInit(&g_CableBLoopback, savedChannels);
+    IF_FAILED_ACTION_JUMP(
+        ntStatus,
+        DPF(D_ERROR, ("LoopbackInit CableB failed, 0x%x", ntStatus)),
+        Done);
 #else
-        LoopbackSetInternalRate(&g_CableALoopback, savedRate);
-        LoopbackResizeBuffer(&g_CableALoopback, savedLatency);
-        LoopbackSetInternalRate(&g_CableBLoopback, savedRate);
-        LoopbackResizeBuffer(&g_CableBLoopback, savedLatency);
+    ntStatus = LoopbackInit(&g_CableALoopback, savedChannels);
+    IF_FAILED_ACTION_JUMP(
+        ntStatus,
+        DPF(D_ERROR, ("LoopbackInit CableA failed, 0x%x", ntStatus)),
+        Done);
+
+    ntStatus = LoopbackInit(&g_CableBLoopback, savedChannels);
+    IF_FAILED_ACTION_JUMP(
+        ntStatus,
+        DPF(D_ERROR, ("LoopbackInit CableB failed, 0x%x", ntStatus)),
+        Done);
 #endif
-        DPF(D_TERSE, ("[DriverEntry] Registry config: Rate=%u, Latency=%ums", savedRate, savedLatency));
-    }
+
+    //
+    // Apply saved rate and latency settings.
+    //
+#if defined(CABLE_A)
+    LoopbackSetInternalRate(&g_CableALoopback, savedRate);
+    LoopbackResizeBuffer(&g_CableALoopback, savedLatency);
+#elif defined(CABLE_B)
+    LoopbackSetInternalRate(&g_CableBLoopback, savedRate);
+    LoopbackResizeBuffer(&g_CableBLoopback, savedLatency);
+#else
+    LoopbackSetInternalRate(&g_CableALoopback, savedRate);
+    LoopbackResizeBuffer(&g_CableALoopback, savedLatency);
+    LoopbackSetInternalRate(&g_CableBLoopback, savedRate);
+    LoopbackResizeBuffer(&g_CableBLoopback, savedLatency);
+#endif
 
     //
     // All done.
@@ -633,12 +685,13 @@ PowerControlCallback
 }
 
 #pragma code_seg("PAGE")
-NTSTATUS 
+NTSTATUS
 InstallEndpointRenderFilters(
-    _In_ PDEVICE_OBJECT     _pDeviceObject, 
-    _In_ PIRP               _pIrp, 
+    _In_ PDEVICE_OBJECT     _pDeviceObject,
+    _In_ PIRP               _pIrp,
     _In_ PADAPTERCOMMON     _pAdapterCommon,
-    _In_ PENDPOINT_MINIPAIR _pAeMiniports
+    _In_ PENDPOINT_MINIPAIR _pAeMiniports,
+    _In_opt_ PVOID          _pDeviceContext = NULL
     )
 {
     NTSTATUS                    ntStatus                = STATUS_SUCCESS;
@@ -652,13 +705,13 @@ InstallEndpointRenderFilters(
     PPORTCLSStreamResourceManager2 pPortClsResMgr2      = NULL;
 
     PAGED_CODE();
-    
+
     UNREFERENCED_PARAMETER(_pDeviceObject);
 
     ntStatus = _pAdapterCommon->InstallEndpointFilters(
         _pIrp,
         _pAeMiniports,
-        NULL,
+        _pDeviceContext,
         &unknownTopology,
         &unknownWave,
         NULL, NULL);
@@ -802,7 +855,8 @@ InstallEndpointCaptureFilters(
     _In_ PDEVICE_OBJECT     _pDeviceObject,
     _In_ PIRP               _pIrp,
     _In_ PADAPTERCOMMON     _pAdapterCommon,
-    _In_ PENDPOINT_MINIPAIR _pAeMiniports
+    _In_ PENDPOINT_MINIPAIR _pAeMiniports,
+    _In_opt_ PVOID          _pDeviceContext = NULL
 )
 {
     NTSTATUS    ntStatus = STATUS_SUCCESS;
@@ -814,7 +868,7 @@ InstallEndpointCaptureFilters(
     ntStatus = _pAdapterCommon->InstallEndpointFilters(
         _pIrp,
         _pAeMiniports,
-        NULL,
+        _pDeviceContext,
         NULL,
         NULL,
         NULL, NULL);
@@ -848,12 +902,227 @@ Exit:
 }
 
 //=============================================================================
+// Dynamic 16ch format block: free
+//=============================================================================
+#pragma code_seg("PAGE")
+static
+VOID
+AoFree16chBlock(
+    _Inout_ PAO_DYN16_BLOCK *ppBlock
+)
+{
+    PAGED_CODE();
+    if (ppBlock && *ppBlock)
+    {
+        ExFreePoolWithTag(*ppBlock, AO_DYN16_POOLTAG);
+        *ppBlock = NULL;
+    }
+}
+
+//=============================================================================
+// Dynamic 16ch format block: runtime helper to fill one WAVEFORMATEXTENSIBLE
+//=============================================================================
+#pragma code_seg("PAGE")
+static
+VOID
+AoFillWaveFormat(
+    _Out_ PKSDATAFORMAT_WAVEFORMATEXTENSIBLE pFmt,
+    _In_  ULONG   SampleRate,
+    _In_  USHORT  BitsPerSample,
+    _In_  USHORT  Channels,
+    _In_  ULONG   ChannelMask,
+    _In_  BOOLEAN IsFloat
+)
+{
+    PAGED_CODE();
+
+    RtlZeroMemory(pFmt, sizeof(*pFmt));
+
+    pFmt->DataFormat.FormatSize  = sizeof(KSDATAFORMAT_WAVEFORMATEXTENSIBLE);
+    pFmt->DataFormat.MajorFormat = KSDATAFORMAT_TYPE_AUDIO;
+    pFmt->DataFormat.SubFormat   = IsFloat ? KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
+                                           : KSDATAFORMAT_SUBTYPE_PCM;
+    pFmt->DataFormat.Specifier   = KSDATAFORMAT_SPECIFIER_WAVEFORMATEX;
+
+    USHORT blockAlign = (USHORT)(Channels * BitsPerSample / 8);
+
+    pFmt->WaveFormatExt.Format.wFormatTag      = WAVE_FORMAT_EXTENSIBLE;
+    pFmt->WaveFormatExt.Format.nChannels       = Channels;
+    pFmt->WaveFormatExt.Format.nSamplesPerSec  = SampleRate;
+    pFmt->WaveFormatExt.Format.nAvgBytesPerSec = SampleRate * blockAlign;
+    pFmt->WaveFormatExt.Format.nBlockAlign     = blockAlign;
+    pFmt->WaveFormatExt.Format.wBitsPerSample  = BitsPerSample;
+    pFmt->WaveFormatExt.Format.cbSize          =
+        sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
+
+    pFmt->WaveFormatExt.Samples.wValidBitsPerSample = BitsPerSample;
+    pFmt->WaveFormatExt.dwChannelMask               = ChannelMask;
+    pFmt->WaveFormatExt.SubFormat = IsFloat ? KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
+                                            : KSDATAFORMAT_SUBTYPE_PCM;
+}
+
+//=============================================================================
+// Dynamic 16ch format block: build
+//   Allocates a single AO_DYN16_BLOCK containing all PortCls tables needed
+//   to advertise 16-channel formats. Called at StartDevice (PASSIVE_LEVEL).
+//=============================================================================
+#pragma code_seg("PAGE")
+static
+NTSTATUS
+AoBuild16chBlock(
+    _In_  BOOLEAN         IsRender,
+    _Out_ PAO_DYN16_BLOCK *ppBlock
+)
+{
+    PAGED_CODE();
+    ASSERT(ppBlock);
+
+    *ppBlock = NULL;
+
+    PAO_DYN16_BLOCK pB = (PAO_DYN16_BLOCK)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED, sizeof(AO_DYN16_BLOCK), AO_DYN16_POOLTAG);
+    if (!pB)
+    {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    RtlZeroMemory(pB, sizeof(*pB));
+
+    //
+    // 1. WaveFormats: copy 108 base 8ch formats, then build 12 16ch entries.
+    //
+    C_ASSERT(SIZEOF_ARRAY(CableHostPinSupportedDeviceFormats) == CABLE_8CH_FORMAT_COUNT);
+    RtlCopyMemory(pB->WaveFormats,
+                   CableHostPinSupportedDeviceFormats,
+                   sizeof(CableHostPinSupportedDeviceFormats));
+
+    // 16ch direct-out: 4 rates x 2 PCM depths + 4 rates x 1 FLOAT = 12 entries
+    static const ULONG s_16chRates[] = { 48000, 44100, 96000, 192000 };
+    ULONG idx = CABLE_8CH_FORMAT_COUNT;
+    for (ULONG r = 0; r < ARRAYSIZE(s_16chRates); r++)
+    {
+        AoFillWaveFormat(&pB->WaveFormats[idx++], s_16chRates[r], 16, 16,
+                         KSAUDIO_SPEAKER_DIRECTOUT, FALSE);
+        AoFillWaveFormat(&pB->WaveFormats[idx++], s_16chRates[r], 24, 16,
+                         KSAUDIO_SPEAKER_DIRECTOUT, FALSE);
+    }
+    for (ULONG r = 0; r < ARRAYSIZE(s_16chRates); r++)
+    {
+        AoFillWaveFormat(&pB->WaveFormats[idx++], s_16chRates[r], 32, 16,
+                         KSAUDIO_SPEAKER_DIRECTOUT, TRUE);
+    }
+    ASSERT(idx == CABLE_16CH_TOTAL_COUNT);
+
+    //
+    // 2. DataRanges: copy from static 8ch ranges, patch MaximumChannels = 16.
+    //
+    RtlCopyMemory(pB->DataRanges, CablePinDataRangesStream, sizeof(CablePinDataRangesStream));
+    pB->DataRanges[0].MaximumChannels = 16;  // PCM
+    pB->DataRanges[1].MaximumChannels = 16;  // FLOAT
+
+    //
+    // 3. DataRangePointers: PCM, attributes, FLOAT, attributes.
+    //
+    pB->DataRangePointers[0] = PKSDATARANGE(&pB->DataRanges[0]);
+    pB->DataRangePointers[1] = PKSDATARANGE(&PinDataRangeAttributeList);
+    pB->DataRangePointers[2] = PKSDATARANGE(&pB->DataRanges[1]);
+    pB->DataRangePointers[3] = PKSDATARANGE(&PinDataRangeAttributeList);
+
+    //
+    // 4. Mode: RAW, default format = first wave format.
+    //
+    pB->Mode.Mode           = AUDIO_SIGNALPROCESSINGMODE_RAW;
+    pB->Mode.DefaultFormat  = &pB->WaveFormats[0].DataFormat;
+
+    //
+    // 5. PinFmtModes: streaming pin + bridge pin (order depends on render/capture).
+    //
+    PIN_DEVICE_FORMATS_AND_MODES streamingFmt = {
+        IsRender ? SystemRenderPin : SystemCapturePin,
+        pB->WaveFormats,
+        CABLE_16CH_TOTAL_COUNT,
+        &pB->Mode,
+        1
+    };
+    PIN_DEVICE_FORMATS_AND_MODES bridgeFmt = { BridgePin, NULL, 0, NULL, 0 };
+
+    if (IsRender)
+    {
+        pB->PinFmtModes[0] = streamingFmt;   // Pin 0 = system render
+        pB->PinFmtModes[1] = bridgeFmt;      // Pin 1 = bridge
+    }
+    else
+    {
+        pB->PinFmtModes[0] = bridgeFmt;      // Pin 0 = bridge
+        pB->PinFmtModes[1] = streamingFmt;   // Pin 1 = system capture
+    }
+
+    //
+    // 6. Pins: copy from static 8ch pins, patch streaming pin's data ranges.
+    //
+    if (IsRender)
+    {
+        RtlCopyMemory(pB->Pins, CableRenderWaveMiniportPins,
+                       sizeof(CableRenderWaveMiniportPins));
+        // Pin 0 = streaming: patch data range pointers
+        pB->Pins[0].KsPinDescriptor.DataRangesCount = ARRAYSIZE(pB->DataRangePointers);
+        pB->Pins[0].KsPinDescriptor.DataRanges      = pB->DataRangePointers;
+    }
+    else
+    {
+        RtlCopyMemory(pB->Pins, CableCaptureWaveMiniportPins,
+                       sizeof(CableCaptureWaveMiniportPins));
+        // Pin 1 = streaming: patch data range pointers
+        pB->Pins[1].KsPinDescriptor.DataRangesCount = ARRAYSIZE(pB->DataRangePointers);
+        pB->Pins[1].KsPinDescriptor.DataRanges      = pB->DataRangePointers;
+    }
+
+    //
+    // 7. FilterDesc: reuse static automation table, nodes, connections.
+    //
+    pB->FilterDesc.Version         = 0;
+    pB->FilterDesc.PinSize         = sizeof(PCPIN_DESCRIPTOR);
+    pB->FilterDesc.PinCount        = 2;
+    pB->FilterDesc.Pins            = pB->Pins;
+    pB->FilterDesc.NodeSize        = sizeof(PCNODE_DESCRIPTOR);
+    pB->FilterDesc.CategoryCount   = 0;
+    pB->FilterDesc.Categories      = NULL;
+
+    if (IsRender)
+    {
+        pB->FilterDesc.AutomationTable = &AutomationCableRenderWaveFilter;
+        pB->FilterDesc.NodeCount       = 0;
+        pB->FilterDesc.Nodes           = NULL;
+        pB->FilterDesc.ConnectionCount = SIZEOF_ARRAY(CableRenderWaveMiniportConnections);
+        pB->FilterDesc.Connections     = CableRenderWaveMiniportConnections;
+    }
+    else
+    {
+        pB->FilterDesc.AutomationTable = &AutomationCableCaptureWaveFilter;
+        pB->FilterDesc.NodeCount       = SIZEOF_ARRAY(CableCaptureWaveMiniportNodes);
+        pB->FilterDesc.Nodes           = CableCaptureWaveMiniportNodes;
+        pB->FilterDesc.ConnectionCount = SIZEOF_ARRAY(CableCaptureWaveMiniportConnections);
+        pB->FilterDesc.Connections     = CableCaptureWaveMiniportConnections;
+    }
+
+    //
+    // 8. Binding: wire up for CMiniportWaveRT constructor consumption.
+    //
+    pB->Binding.DeviceMaxChannels           = 16;
+    pB->Binding.WaveFilterDescriptor        = &pB->FilterDesc;
+    pB->Binding.PinDeviceFormatsAndModes    = pB->PinFmtModes;
+    pB->Binding.PinDeviceFormatsAndModesCount = 2;
+
+    *ppBlock = pB;
+    return STATUS_SUCCESS;
+}
+
+//=============================================================================
 #pragma code_seg("PAGE")
 NTSTATUS
 StartDevice
-( 
-    _In_  PDEVICE_OBJECT          DeviceObject,     
-    _In_  PIRP                    Irp,              
+(
+    _In_  PDEVICE_OBJECT          DeviceObject,
+    _In_  PIRP                    Irp,
     _In_  PRESOURCELIST           ResourceList      
 )  
 {
@@ -919,6 +1188,63 @@ Return Value:
     IF_FAILED_JUMP(ntStatus, Exit);
 
     //
+    // Re-read registry config on every StartDevice (covers device restart
+    // after IOCTL_AO_SET_MAX_CHANNELS without a full DriverEntry cycle).
+    // If MaxChannelCount changed, re-init the loopback with the new value.
+    //
+    {
+        ULONG desiredRate = LB_DEFAULT_INTERNAL_RATE;
+        ULONG desiredLatency = LB_DEFAULT_LATENCY_MS;
+        ULONG desiredChannels = LB_INTERNAL_CHANNELS;
+        AoReadRegistryConfig(&desiredRate, &desiredLatency, &desiredChannels);
+
+#if defined(CABLE_A)
+        if (desiredChannels != g_CableALoopback.InternalChannels)
+        {
+            DPF(D_TERSE, ("[StartDevice] Channel mode changed %u -> %u, re-init loopback A",
+                           g_CableALoopback.InternalChannels, desiredChannels));
+            LoopbackCleanup(&g_CableALoopback);
+            ntStatus = LoopbackInit(&g_CableALoopback, desiredChannels);
+            IF_FAILED_JUMP(ntStatus, Exit);
+            LoopbackSetInternalRate(&g_CableALoopback, desiredRate);
+            LoopbackResizeBuffer(&g_CableALoopback, desiredLatency);
+        }
+#elif defined(CABLE_B)
+        if (desiredChannels != g_CableBLoopback.InternalChannels)
+        {
+            DPF(D_TERSE, ("[StartDevice] Channel mode changed %u -> %u, re-init loopback B",
+                           g_CableBLoopback.InternalChannels, desiredChannels));
+            LoopbackCleanup(&g_CableBLoopback);
+            ntStatus = LoopbackInit(&g_CableBLoopback, desiredChannels);
+            IF_FAILED_JUMP(ntStatus, Exit);
+            LoopbackSetInternalRate(&g_CableBLoopback, desiredRate);
+            LoopbackResizeBuffer(&g_CableBLoopback, desiredLatency);
+        }
+#else
+        if (desiredChannels != g_CableALoopback.InternalChannels)
+        {
+            DPF(D_TERSE, ("[StartDevice] Channel mode changed %u -> %u, re-init loopback A",
+                           g_CableALoopback.InternalChannels, desiredChannels));
+            LoopbackCleanup(&g_CableALoopback);
+            ntStatus = LoopbackInit(&g_CableALoopback, desiredChannels);
+            IF_FAILED_JUMP(ntStatus, Exit);
+            LoopbackSetInternalRate(&g_CableALoopback, desiredRate);
+            LoopbackResizeBuffer(&g_CableALoopback, desiredLatency);
+        }
+        if (desiredChannels != g_CableBLoopback.InternalChannels)
+        {
+            DPF(D_TERSE, ("[StartDevice] Channel mode changed %u -> %u, re-init loopback B",
+                           g_CableBLoopback.InternalChannels, desiredChannels));
+            LoopbackCleanup(&g_CableBLoopback);
+            ntStatus = LoopbackInit(&g_CableBLoopback, desiredChannels);
+            IF_FAILED_JUMP(ntStatus, Exit);
+            LoopbackSetInternalRate(&g_CableBLoopback, desiredRate);
+            LoopbackResizeBuffer(&g_CableBLoopback, desiredLatency);
+        }
+#endif
+    }
+
+    //
     // Determine which endpoints to install based on hardware ID.
     // ROOT\AOCableA  -> Cable A only
     // ROOT\AOCableB  -> Cable B only
@@ -941,18 +1267,72 @@ Return Value:
 
         if (wcsstr(hardwareId, L"AOCableA") != NULL)
         {
-            DPF(D_TERSE, ("[StartDevice] Hardware ID: AOCableA"));
-            ntStatus = InstallEndpointRenderFilters(DeviceObject, Irp, pAdapterCommon, &CableASpeakerMiniports);
+            ULONG ch = g_CableALoopback.InternalChannels;
+
+            // Free any stale dynamic blocks from a previous StartDevice cycle
+            AoFree16chBlock(&g_pDyn16RenderA);
+            AoFree16chBlock(&g_pDyn16CaptureA);
+
+            PAO_ENDPOINT_FORMAT_BINDING pRenderBinding  = &CableRenderBinding8ch;
+            PAO_ENDPOINT_FORMAT_BINDING pCaptureBinding = &CableCaptureBinding8ch;
+
+            if (ch == 16)
+            {
+                ntStatus = AoBuild16chBlock(TRUE, &g_pDyn16RenderA);
+                IF_FAILED_JUMP(ntStatus, Exit);
+
+                ntStatus = AoBuild16chBlock(FALSE, &g_pDyn16CaptureA);
+                if (!NT_SUCCESS(ntStatus))
+                {
+                    AoFree16chBlock(&g_pDyn16RenderA);
+                    goto Exit;
+                }
+
+                pRenderBinding  = &g_pDyn16RenderA->Binding;
+                pCaptureBinding = &g_pDyn16CaptureA->Binding;
+            }
+
+            DPF(D_TERSE, ("[StartDevice] Hardware ID: AOCableA, Channels=%u, Binding=%uch",
+                           ch, (ULONG)pRenderBinding->DeviceMaxChannels));
+
+            ntStatus = InstallEndpointRenderFilters(DeviceObject, Irp, pAdapterCommon, &CableASpeakerMiniports, pRenderBinding);
             IF_FAILED_JUMP(ntStatus, Exit);
-            ntStatus = InstallEndpointCaptureFilters(DeviceObject, Irp, pAdapterCommon, &CableAMicMiniports);
+            ntStatus = InstallEndpointCaptureFilters(DeviceObject, Irp, pAdapterCommon, &CableAMicMiniports, pCaptureBinding);
             IF_FAILED_JUMP(ntStatus, Exit);
         }
         else if (wcsstr(hardwareId, L"AOCableB") != NULL)
         {
-            DPF(D_TERSE, ("[StartDevice] Hardware ID: AOCableB"));
-            ntStatus = InstallEndpointRenderFilters(DeviceObject, Irp, pAdapterCommon, &CableBSpeakerMiniports);
+            ULONG ch = g_CableBLoopback.InternalChannels;
+
+            // Free any stale dynamic blocks from a previous StartDevice cycle
+            AoFree16chBlock(&g_pDyn16RenderB);
+            AoFree16chBlock(&g_pDyn16CaptureB);
+
+            PAO_ENDPOINT_FORMAT_BINDING pRenderBinding  = &CableRenderBinding8ch;
+            PAO_ENDPOINT_FORMAT_BINDING pCaptureBinding = &CableCaptureBinding8ch;
+
+            if (ch == 16)
+            {
+                ntStatus = AoBuild16chBlock(TRUE, &g_pDyn16RenderB);
+                IF_FAILED_JUMP(ntStatus, Exit);
+
+                ntStatus = AoBuild16chBlock(FALSE, &g_pDyn16CaptureB);
+                if (!NT_SUCCESS(ntStatus))
+                {
+                    AoFree16chBlock(&g_pDyn16RenderB);
+                    goto Exit;
+                }
+
+                pRenderBinding  = &g_pDyn16RenderB->Binding;
+                pCaptureBinding = &g_pDyn16CaptureB->Binding;
+            }
+
+            DPF(D_TERSE, ("[StartDevice] Hardware ID: AOCableB, Channels=%u, Binding=%uch",
+                           ch, (ULONG)pRenderBinding->DeviceMaxChannels));
+
+            ntStatus = InstallEndpointRenderFilters(DeviceObject, Irp, pAdapterCommon, &CableBSpeakerMiniports, pRenderBinding);
             IF_FAILED_JUMP(ntStatus, Exit);
-            ntStatus = InstallEndpointCaptureFilters(DeviceObject, Irp, pAdapterCommon, &CableBMicMiniports);
+            ntStatus = InstallEndpointCaptureFilters(DeviceObject, Irp, pAdapterCommon, &CableBMicMiniports, pCaptureBinding);
             IF_FAILED_JUMP(ntStatus, Exit);
         }
         else
@@ -1045,13 +1425,15 @@ static VOID AoWriteRegistryValue(
 #pragma code_seg("PAGE")
 static VOID AoReadRegistryConfig(
     _Out_ PULONG pInternalRate,
-    _Out_ PULONG pMaxLatencyMs
+    _Out_ PULONG pMaxLatencyMs,
+    _Out_ PULONG pMaxChannelCount
 )
 {
     PAGED_CODE();
 
     *pInternalRate = LB_DEFAULT_INTERNAL_RATE;
     *pMaxLatencyMs = LB_DEFAULT_LATENCY_MS;
+    *pMaxChannelCount = LB_INTERNAL_CHANNELS;
 
     // Use the pre-opened handle from DriverEntry.
     if (!g_hParametersKey)
@@ -1098,6 +1480,26 @@ static VOID AoReadRegistryConfig(
         }
     }
 
+    // Read MaxChannelCount
+    {
+        UNICODE_STRING valName;
+        RtlInitUnicodeString(&valName, AO_REG_MAX_CHANNELS);
+
+        UCHAR buf[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + sizeof(ULONG)];
+        ULONG resultLen = 0;
+        NTSTATUS st = ZwQueryValueKey(hKey, &valName, KeyValuePartialInformation, buf, sizeof(buf), &resultLen);
+        if (NT_SUCCESS(st))
+        {
+            PKEY_VALUE_PARTIAL_INFORMATION info = (PKEY_VALUE_PARTIAL_INFORMATION)buf;
+            if (info->Type == REG_DWORD && info->DataLength == sizeof(ULONG))
+            {
+                ULONG val = *(PULONG)info->Data;
+                if (val == 8 || val == 16)
+                    *pMaxChannelCount = val;
+            }
+        }
+    }
+
     // Do NOT close hKey -- it is the shared g_hParametersKey handle.
 }
 
@@ -1140,7 +1542,13 @@ AoDeviceControlHandler(
         pConfig->MaxLatencyMs = g_CableALoopback.MaxLatencyMs;
 #endif
         pConfig->InternalBits = LB_INTERNAL_BITS;
-        pConfig->InternalChannels = LB_INTERNAL_CHANNELS;
+#if defined(CABLE_A)
+        pConfig->InternalChannels = g_CableALoopback.InternalChannels;
+#elif defined(CABLE_B)
+        pConfig->InternalChannels = g_CableBLoopback.InternalChannels;
+#else
+        pConfig->InternalChannels = g_CableALoopback.InternalChannels;
+#endif
         bytesReturned = sizeof(AO_CONFIG);
         status = STATUS_SUCCESS;
         break;
@@ -1187,6 +1595,25 @@ AoDeviceControlHandler(
 #endif
         if (NT_SUCCESS(status))
             AoWriteRegistryValue(AO_REG_MAX_LATENCY, newLatency);
+        break;
+    }
+
+    case IOCTL_AO_SET_MAX_CHANNELS:
+    {
+        // Writes MaxChannelCount to registry only. Takes effect after device restart.
+        if (irpSp->Parameters.DeviceIoControl.InputBufferLength < sizeof(ULONG))
+        {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        ULONG newChannels = *(ULONG*)Irp->AssociatedIrp.SystemBuffer;
+        if (newChannels != 8 && newChannels != 16)
+        {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        AoWriteRegistryValue(AO_REG_MAX_CHANNELS, newChannels);
+        status = STATUS_SUCCESS;
         break;
     }
 
@@ -1427,10 +1854,29 @@ Return Value:
             ext->m_pCommon->Release();
             ext->m_pCommon = NULL;
         }
+
+        // Free dynamic 16ch blocks after subdevices are unregistered
+        AoFree16chBlock(&g_pDyn16RenderA);
+        AoFree16chBlock(&g_pDyn16CaptureA);
+        AoFree16chBlock(&g_pDyn16RenderB);
+        AoFree16chBlock(&g_pDyn16CaptureB);
         break;
 
     case IRP_MN_STOP_DEVICE:
-        // Do not release adapter common here - device may restart via IRP_MN_START_DEVICE.
+        // Flush subdevice cache so restart loads fresh bindings
+        // (e.g., after MaxChannelCount registry change + device restart).
+        // Do NOT release adapter common - device may restart via IRP_MN_START_DEVICE.
+        ext = static_cast<PortClassDeviceContext*>(_DeviceObject->DeviceExtension);
+        if (ext->m_pCommon != NULL)
+        {
+            ext->m_pCommon->Cleanup();
+        }
+
+        // Free dynamic 16ch blocks after subdevices are unregistered
+        AoFree16chBlock(&g_pDyn16RenderA);
+        AoFree16chBlock(&g_pDyn16CaptureA);
+        AoFree16chBlock(&g_pDyn16RenderB);
+        AoFree16chBlock(&g_pDyn16CaptureB);
         break;
 
     default:

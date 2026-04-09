@@ -819,4 +819,27 @@ PCFILTER_DESCRIPTOR CableCaptureWaveMiniportFilterDescriptor =
     NULL                                                    // Categories
 };
 
+//=============================================================================
+// Endpoint format bindings: static 8ch bindings only.
+// 16ch bindings are built dynamically at StartDevice time in adapter.cpp
+// to avoid having 16ch PortCls tables in the binary (causes BugCheck 0xD1).
+//=============================================================================
+static
+AO_ENDPOINT_FORMAT_BINDING CableRenderBinding8ch =
+{
+    CABLE_DEVICE_MAX_CHANNELS,                          // DeviceMaxChannels = 8
+    &CableRenderWaveMiniportFilterDescriptor,           // WaveFilterDescriptor
+    CableRenderPinDeviceFormatsAndModes,                // PinDeviceFormatsAndModes
+    SIZEOF_ARRAY(CableRenderPinDeviceFormatsAndModes)   // PinDeviceFormatsAndModesCount
+};
+
+static
+AO_ENDPOINT_FORMAT_BINDING CableCaptureBinding8ch =
+{
+    CABLE_DEVICE_MAX_CHANNELS,                              // DeviceMaxChannels = 8
+    &CableCaptureWaveMiniportFilterDescriptor,              // WaveFilterDescriptor
+    CableCapturePinDeviceFormatsAndModes,                   // PinDeviceFormatsAndModes
+    SIZEOF_ARRAY(CableCapturePinDeviceFormatsAndModes)      // PinDeviceFormatsAndModesCount
+};
+
 #endif // _VIRTUALAUDIODRIVER_CABLEWAVTABLE_H_

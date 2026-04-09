@@ -134,13 +134,36 @@ public:
 
         m_pAdapterCommon = (PADAPTERCOMMON)UnknownAdapter; // weak ref.
 
-        if (MiniportPair->WaveDescriptor)
+        //
+        // Apply format binding override for Cable endpoints.
+        // When DeviceContext is non-NULL for a Cable device type,
+        // it carries an AO_ENDPOINT_FORMAT_BINDING* that selects
+        // the correct 8ch or 16ch advertisement tables.
+        //
+        if (DeviceContext != NULL &&
+            (m_DeviceType == eCableASpeaker || m_DeviceType == eCableAMic ||
+             m_DeviceType == eCableBSpeaker || m_DeviceType == eCableBMic))
+        {
+            PAO_ENDPOINT_FORMAT_BINDING pBinding = (PAO_ENDPOINT_FORMAT_BINDING)DeviceContext;
+            m_DeviceMaxChannels = pBinding->DeviceMaxChannels;
+            m_DeviceFormatsAndModes = pBinding->PinDeviceFormatsAndModes;
+            m_DeviceFormatsAndModesCount = pBinding->PinDeviceFormatsAndModesCount;
+
+            if (pBinding->WaveFilterDescriptor)
+            {
+                RtlCopyMemory(&m_FilterDesc, pBinding->WaveFilterDescriptor, sizeof(m_FilterDesc));
+            }
+        }
+        else if (MiniportPair->WaveDescriptor)
         {
             RtlCopyMemory(&m_FilterDesc, MiniportPair->WaveDescriptor, sizeof(m_FilterDesc));
-            
-            //
-            // Get the max # of pin instances.
-            //
+        }
+
+        //
+        // Get the max # of pin instances from m_FilterDesc.
+        //
+        if (m_FilterDesc.Pins != NULL)
+        {
             if (IsRenderDevice())
             {
                 if (m_FilterDesc.PinCount > KSPIN_WAVE_RENDER2_SOURCE)

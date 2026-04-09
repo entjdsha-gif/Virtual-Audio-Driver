@@ -59,7 +59,7 @@ def ioctl_set_latency(h, ms):
     return ok, kernel32.GetLastError() if not ok else 0
 
 def read_registry(svc_name):
-    """Read InternalRate and MaxLatencyMs from service Parameters key."""
+    """Read InternalRate, MaxLatencyMs, and MaxChannelCount from service Parameters key."""
     try:
         key = winreg.OpenKey(
             winreg.HKEY_LOCAL_MACHINE,
@@ -67,8 +67,12 @@ def read_registry(svc_name):
             0, winreg.KEY_READ)
         rate = winreg.QueryValueEx(key, "InternalRate")[0]
         latency = winreg.QueryValueEx(key, "MaxLatencyMs")[0]
+        try:
+            channels = winreg.QueryValueEx(key, "MaxChannelCount")[0]
+        except FileNotFoundError:
+            channels = 8  # default when key absent
         winreg.CloseKey(key)
-        return {'InternalRate': rate, 'MaxLatencyMs': latency}
+        return {'InternalRate': rate, 'MaxLatencyMs': latency, 'MaxChannelCount': channels}
     except FileNotFoundError:
         return None
     except OSError as e:
@@ -140,7 +144,7 @@ def run_diag(device_path, svc_name, label):
     elif isinstance(reg, str):
         print(f"  [WARN] {reg}")
     else:
-        print(f"  [REG] InternalRate={reg['InternalRate']}, MaxLatencyMs={reg['MaxLatencyMs']}")
+        print(f"  [REG] InternalRate={reg['InternalRate']}, MaxLatencyMs={reg['MaxLatencyMs']}, MaxChannelCount={reg['MaxChannelCount']}")
 
     return not bug_detected
 

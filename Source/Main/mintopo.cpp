@@ -64,12 +64,21 @@ Return Value:
     ASSERT(Unknown);
     ASSERT(MiniportPair);
 
-    CMiniportTopology *obj = 
-        new (PoolFlags, MINWAVERT_POOLTAG) 
+    // Use binding's DeviceMaxChannels for Cable endpoints if available
+    USHORT deviceMaxCh = MiniportPair->DeviceMaxChannels;
+    if (DeviceContext != NULL &&
+        (MiniportPair->DeviceType == eCableASpeaker || MiniportPair->DeviceType == eCableAMic ||
+         MiniportPair->DeviceType == eCableBSpeaker || MiniportPair->DeviceType == eCableBMic))
+    {
+        deviceMaxCh = ((PAO_ENDPOINT_FORMAT_BINDING)DeviceContext)->DeviceMaxChannels;
+    }
+
+    CMiniportTopology *obj =
+        new (PoolFlags, MINWAVERT_POOLTAG)
             CMiniportTopology( UnknownOuter,
                                MiniportPair->TopoDescriptor,
-                               MiniportPair->DeviceMaxChannels,
-                               MiniportPair->DeviceType, 
+                               deviceMaxCh,
+                               MiniportPair->DeviceType,
                                DeviceContext );
     if (NULL == obj)
     {

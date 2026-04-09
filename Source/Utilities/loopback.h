@@ -20,12 +20,13 @@ Abstract:
 #define LB_INTERNAL_BITS               24
 #define LB_INTERNAL_CHANNELS           8
 #define LB_INTERNAL_BLOCKALIGN         24  // 24bit(3bytes) * 8ch = 24 bytes/frame
+#define LB_MAX_INTERNAL_CHANNELS       16  // for static array sizing only (PrevSamples)
 #define LB_DEFAULT_LATENCY_MS          20
 #define LB_MIN_LATENCY_MS             5
 #define LB_MAX_LATENCY_MS             100
 
-// Convert buffer: 192kHz/8ch/2ms = 192*8*4(INT32)*2 = 12288, round up
-#define LB_CONVERT_BUF_SIZE           16384
+// Convert buffer: sized for up to 16ch at 192kHz/2ms
+#define LB_CONVERT_BUF_SIZE           32768
 
 // Default buffer size: 4 seconds @ internal format
 #define LOOPBACK_BUFFER_SIZE  (48000 * LB_INTERNAL_BLOCKALIGN * 4)
@@ -54,7 +55,7 @@ typedef struct _LB_FORMAT {
 
 typedef struct _LB_SRC_STATE {
     ULONGLONG  Accumulator;                                     // 32.32 fixed-point position
-    INT32      PrevSamples[LB_SINC_TAPS * LB_INTERNAL_CHANNELS]; // history for sinc interp
+    INT32      PrevSamples[LB_SINC_TAPS * LB_MAX_INTERNAL_CHANNELS]; // history sized for max channels
     ULONG      HistoryCount;                                    // valid history frames
     BOOLEAN    Valid;
 } LB_SRC_STATE;
@@ -118,6 +119,8 @@ typedef struct _LOOPBACK_BUFFER {
     // Dynamic configuration (IOCTL-settable)
     ULONG          InternalRate;       // Default 48000
     ULONG          MaxLatencyMs;       // Default 20
+    ULONG          InternalChannels;   // 8 or 16 (set at init, read-only after)
+    ULONG          InternalBlockAlign; // (LB_INTERNAL_BITS/8) * InternalChannels
 
     // Multi-client render stream tracking
     ULONG          ActiveRenderCount;  // Number of active render streams
@@ -127,7 +130,7 @@ typedef struct _LOOPBACK_BUFFER {
 //=============================================================================
 // Core ring buffer functions
 //=============================================================================
-NTSTATUS LoopbackInit(PLOOPBACK_BUFFER pLoopback);
+NTSTATUS LoopbackInit(PLOOPBACK_BUFFER pLoopback, ULONG internalChannels = LB_INTERNAL_CHANNELS);
 VOID LoopbackCleanup(PLOOPBACK_BUFFER pLoopback);
 VOID LoopbackWrite(PLOOPBACK_BUFFER pLoopback, const BYTE* Data, ULONG Count);
 VOID LoopbackRead(PLOOPBACK_BUFFER pLoopback, BYTE* Data, ULONG Count);

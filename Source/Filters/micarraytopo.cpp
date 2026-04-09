@@ -78,13 +78,21 @@ Return Value:
     ASSERT(MiniportPair);
 
     UNREFERENCED_PARAMETER(UnknownAdapter);
-    UNREFERENCED_PARAMETER(DeviceContext);
+
+    // Use binding's DeviceMaxChannels for Cable endpoints if available
+    USHORT deviceMaxCh = MiniportPair->DeviceMaxChannels;
+    if (DeviceContext != NULL &&
+        (MiniportPair->DeviceType == eCableASpeaker || MiniportPair->DeviceType == eCableAMic ||
+         MiniportPair->DeviceType == eCableBSpeaker || MiniportPair->DeviceType == eCableBMic))
+    {
+        deviceMaxCh = ((PAO_ENDPOINT_FORMAT_BINDING)DeviceContext)->DeviceMaxChannels;
+    }
 
     CMicArrayMiniportTopology* obj =
         new (PoolFlags, MINTOPORT_POOLTAG)
         CMicArrayMiniportTopology(UnknownOuter,
             MiniportPair->TopoDescriptor,
-            MiniportPair->DeviceMaxChannels,
+            deviceMaxCh,
             MiniportPair->DeviceType);
     if (NULL == obj)
     {

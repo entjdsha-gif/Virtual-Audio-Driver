@@ -235,6 +235,18 @@ typedef struct _ENDPOINT_MINIPAIR
     ULONG                           DeviceFlags;
 } ENDPOINT_MINIPAIR;
 
+//
+// Runtime format binding: selects 8ch or 16ch advertisement tables
+// without modifying static ENDPOINT_MINIPAIR structures.
+// Passed as DeviceContext to wave/topology miniports for Cable endpoints.
+//
+typedef struct _AO_ENDPOINT_FORMAT_BINDING {
+    USHORT                          DeviceMaxChannels;
+    PCFILTER_DESCRIPTOR*            WaveFilterDescriptor;
+    PIN_DEVICE_FORMATS_AND_MODES*   PinDeviceFormatsAndModes;
+    ULONG                           PinDeviceFormatsAndModesCount;
+} AO_ENDPOINT_FORMAT_BINDING, *PAO_ENDPOINT_FORMAT_BINDING;
+
 //=============================================================================
 // Defines
 //=============================================================================

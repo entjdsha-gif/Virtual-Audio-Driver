@@ -330,5 +330,13 @@
   <ItemGroup>
     <ClInclude Exclude="@(ClInclude)" Include="*.h;*.hpp;*.hxx;*.hm;*.inl;*.xsd" />
   </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Utilities\Utilities.vcxproj">
+      <Project>{33E61864-6F2C-4F9F-BE70-8F8985A4F283}</Project>
+    </ProjectReference>
+    <ProjectReference Include="..\Filters\Filters.vcxproj">
+      <Project>{771312CF-E5A2-4676-8142-86CEBDF99E2B}</Project>
+    </ProjectReference>
+  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>
