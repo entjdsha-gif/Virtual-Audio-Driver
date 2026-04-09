@@ -11,6 +11,11 @@ Abstract:
 
 #include "loopback.h"
 
+// Layout verification (must match adapter.cpp)
+C_ASSERT(sizeof(LOOPBACK_BUFFER) == 728);
+C_ASSERT(FIELD_OFFSET(LOOPBACK_BUFFER, InternalRate) == 0x2CC);
+C_ASSERT(FIELD_OFFSET(LOOPBACK_BUFFER, MaxLatencyMs) == 0x2D0);
+
 // Global instances
 LOOPBACK_BUFFER g_CableALoopback = { 0 };
 LOOPBACK_BUFFER g_CableBLoopback = { 0 };

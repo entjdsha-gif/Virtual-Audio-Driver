@@ -25,6 +25,11 @@ Abstract:
 #include "loopback.h"
 #include "ioctl.h"
 
+// Layout verification (must match loopback.cpp in Utilities.lib)
+C_ASSERT(sizeof(LOOPBACK_BUFFER) == 728);
+C_ASSERT(FIELD_OFFSET(LOOPBACK_BUFFER, InternalRate) == 0x2CC);
+C_ASSERT(FIELD_OFFSET(LOOPBACK_BUFFER, MaxLatencyMs) == 0x2D0);
+
 typedef void (*fnPcDriverUnload) (PDRIVER_OBJECT);
 fnPcDriverUnload gPCDriverUnloadRoutine = NULL;
 extern "C" DRIVER_UNLOAD DriverUnload;

@@ -72,6 +72,8 @@ typedef struct _LOOPBACK_MIC_SINK {
 
 //=============================================================================
 // Main loopback buffer with format conversion support
+// NOTE: explicit packing to guarantee identical layout across translation units
+// (adapter.cpp in Main and loopback.cpp in Utilities must agree on field offsets)
 //=============================================================================
 typedef struct _LOOPBACK_BUFFER {
     BYTE*       Buffer;
@@ -120,6 +122,7 @@ typedef struct _LOOPBACK_BUFFER {
     // Multi-client render stream tracking
     ULONG          ActiveRenderCount;  // Number of active render streams
 } LOOPBACK_BUFFER, *PLOOPBACK_BUFFER;
+
 
 //=============================================================================
 // Core ring buffer functions
