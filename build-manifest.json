@@ -1,0 +1,49 @@
+﻿{
+    "config":  "Debug",
+    "timestamp":  "2026-04-10 05:00:18",
+    "artifacts":  {
+                      "aocableb.inf":  {
+                                           "path":  "D:\\mywork\\Virtual-Audio-Driver\\Source\\Main\\x64\\Debug\\CableB\\aocableb.inf",
+                                           "sha256":  "29BAAFE5A396979F599EB08E619B0B86DD1C53189EA2881020DDD655F67A5726",
+                                           "size":  13292,
+                                           "modified":  "2026-04-10 04:59:42"
+                                       },
+                      "aocableb.sys":  {
+                                           "path":  "D:\\mywork\\Virtual-Audio-Driver\\Source\\Main\\x64\\Debug\\CableB\\aocableb.sys",
+                                           "sha256":  "1CBA5B8987EA690DED29ECE1FE1E44D9861472C8D431607F552431B662DEA786",
+                                           "size":  155616,
+                                           "modified":  "2026-04-10 04:59:43"
+                                       },
+                      "Utilities.lib":  {
+                                            "path":  "D:\\mywork\\Virtual-Audio-Driver\\Source\\Utilities\\x64\\Debug\\Utilities.lib",
+                                            "sha256":  "DBE69722306CBFFBAD113B9F129FF25D8762FD865DBCAC2E16BEF599459FA9F3",
+                                            "size":  372334,
+                                            "modified":  "2026-04-10 04:53:10"
+                                        },
+                      "aocablea.sys":  {
+                                           "path":  "D:\\mywork\\Virtual-Audio-Driver\\Source\\Main\\x64\\Debug\\CableA\\aocablea.sys",
+                                           "sha256":  "7129BD4EAD1667CC9896E96E84296983D284FC7FBE59E30BEDB0A6E6A38E41DF",
+                                           "size":  155616,
+                                           "modified":  "2026-04-10 04:59:39"
+                                       },
+                      "aocablea.inf":  {
+                                           "path":  "D:\\mywork\\Virtual-Audio-Driver\\Source\\Main\\x64\\Debug\\CableA\\aocablea.inf",
+                                           "sha256":  "FE082183D33E1CD52C609A0707921B000FB3E3166222DF8A5DAF9CCB240E5176",
+                                           "size":  12942,
+                                           "modified":  "2026-04-10 04:59:37"
+                                       },
+                      "AOControlPanel.exe":  {
+                                                 "path":  "D:\\mywork\\Virtual-Audio-Driver\\Source\\ControlPanel\\x64\\Debug\\AOControlPanel.exe",
+                                                 "sha256":  "D614C8501B749584FF5231F9CDEA13D3A20218CE395033662B721031BB8D419A",
+                                                 "size":  1255424,
+                                                 "modified":  "2026-04-10 01:57:02"
+                                             },
+                      "Filters.lib":  {
+                                          "path":  "D:\\mywork\\Virtual-Audio-Driver\\Source\\Filters\\x64\\Debug\\Filters.lib",
+                                          "sha256":  "D348FC1FA9AFEFCD254B9A8EBD6136F1DD7088B4C79DBB405D6DB8CEA2FF4AE6",
+                                          "size":  174498,
+                                          "modified":  "2026-04-10 04:53:11"
+                                      }
+                  },
+    "platform":  "x64"
+}
