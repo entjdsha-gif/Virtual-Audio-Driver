@@ -110,14 +110,19 @@ Copy-Item (Join-Path $PSScriptRoot "install-core.ps1") $pkgDir -Force
 Copy-Item (Join-Path $PSScriptRoot "Setup.bat") $pkgDir -Force
 Copy-Item (Join-Path $PSScriptRoot "Uninstall.bat") $pkgDir -Force
 
-# Bundle devgen.exe (required for root device creation on clean PCs)
+# Bundle devgen.exe + devcon.exe (required for clean-PC root device creation
+# and same-session driver binding)
 $devgenSrc = $null
+$devconSrc = $null
 $wdkPaths = @(
-    "C:\Program Files (x86)\Windows Kits\10\Tools\10.0.26100.0\x64\devgen.exe",
-    "C:\Program Files (x86)\Windows Kits\10\Tools\10.0.22621.0\x64\devgen.exe"
+    "C:\Program Files (x86)\Windows Kits\10\Tools\10.0.26100.0\x64",
+    "C:\Program Files (x86)\Windows Kits\10\Tools\10.0.22621.0\x64"
 )
 foreach ($p in $wdkPaths) {
-    if (Test-Path $p) { $devgenSrc = $p; break }
+    $candidateDevgen = Join-Path $p "devgen.exe"
+    $candidateDevcon = Join-Path $p "devcon.exe"
+    if ((-not $devgenSrc) -and (Test-Path $candidateDevgen)) { $devgenSrc = $candidateDevgen }
+    if ((-not $devconSrc) -and (Test-Path $candidateDevcon)) { $devconSrc = $candidateDevcon }
 }
 if ($devgenSrc) {
     Copy-Item $devgenSrc $pkgDir -Force
@@ -126,6 +131,32 @@ if ($devgenSrc) {
     Write-Error "devgen.exe not found in WDK. Fresh install requires it for root device creation."
     Write-Error "Install Windows Driver Kit or copy devgen.exe manually to: $pkgDir"
     exit 1
+}
+if ($devconSrc) {
+    Copy-Item $devconSrc $pkgDir -Force
+    Write-Host "  devcon.exe: bundled from WDK ($devconSrc)"
+} else {
+    Write-Error "devcon.exe not found in WDK. Same-session device binding requires it."
+    Write-Error "Install Windows Driver Kit or copy devcon.exe manually to: $pkgDir"
+    exit 1
+}
+
+# Copy Setup.exe if built (from launcher project)
+$launcherBuild = Join-Path $root "installer\launcher\x64\$Config\Setup.exe"
+if (Test-Path $launcherBuild) {
+    Copy-Item $launcherBuild $pkgDir -Force
+    Write-Host "  Setup.exe: bundled (native launcher)"
+    # When Setup.exe is present, Setup.bat/install-core.ps1 are internal-only
+    # Move them to a subdirectory so users see only Setup.exe
+    $internalDir = Join-Path $pkgDir "_internal"
+    New-Item -ItemType Directory -Path $internalDir -Force | Out-Null
+    Move-Item (Join-Path $pkgDir "install-core.ps1") (Join-Path $internalDir "install-core.ps1") -Force
+    Move-Item (Join-Path $pkgDir "Setup.bat") (Join-Path $internalDir "Setup.bat") -Force
+    Move-Item (Join-Path $pkgDir "Uninstall.bat") (Join-Path $internalDir "Uninstall.bat") -Force
+    Write-Host "  .ps1/.bat moved to _internal/"
+} else {
+    Write-Host "  Setup.exe: not built (using Setup.bat fallback)"
+    Write-Host "  To build: compile installer\launcher\launcher.vcxproj"
 }
 
 # Generate manifest
@@ -148,4 +179,9 @@ Get-ChildItem $pkgDir -Recurse -File | ForEach-Object {
     Write-Host "  $rel ($([math]::Round($_.Length/1KB, 1)) KB)"
 }
 Write-Host ""
-Write-Host "To create distributable: zip $pkgDir or wrap with SFX tool"
+if (Test-Path (Join-Path $pkgDir "Setup.exe")) {
+    Write-Host "Ready for distribution: $pkgDir (user sees Setup.exe only)"
+} else {
+    Write-Host "Fallback mode: $pkgDir (user sees Setup.bat)"
+    Write-Host "Build installer\launcher\launcher.vcxproj for Setup.exe"
+}

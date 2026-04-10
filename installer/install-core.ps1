@@ -66,7 +66,9 @@ if (-not $isAdmin -and $Action -ne 'health-check') {
 }
 
 # --- Paths ---
-$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+# AO_PACKAGE_ROOT overrides scriptDir when launched from Setup.exe bootstrapper
+# (install-core.ps1 is extracted to temp, but drivers/ stay next to the EXE)
+$scriptDir = if ($env:AO_PACKAGE_ROOT) { $env:AO_PACKAGE_ROOT } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 $driverDirA = Join-Path $scriptDir "drivers\CableA"
 $driverDirB = Join-Path $scriptDir "drivers\CableB"
 $cpExe = Join-Path $scriptDir "AOControlPanel.exe"
