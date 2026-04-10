@@ -95,6 +95,9 @@ function Save-DefaultDevices {
             $recording = Get-AudioDevice -Recording 2>$null
             if ($playback) { $result.Render = @{ Name = $playback.Name; ID = $playback.ID } }
             if ($recording) { $result.Capture = @{ Name = $recording.Name; ID = $recording.ID } }
+            Write-Host "   [Save] Method: AudioDeviceCmdlets"
+            Write-Host "   [Save] Render:  $($result.Render.Name) -> $($result.Render.ID)"
+            Write-Host "   [Save] Capture: $($result.Capture.Name) -> $($result.Capture.ID)"
             return $result
         }
     } catch {}
@@ -144,7 +147,12 @@ public class AudioDefaults {
 
         if ($renderId) { $result.Render = @{ Name = $null; ID = $renderId } }
         if ($captureId) { $result.Capture = @{ Name = $null; ID = $captureId } }
-    } catch {}
+        Write-Host "   [Save] Method: COM (MMDevice)"
+        Write-Host "   [Save] Render ID:  $renderId"
+        Write-Host "   [Save] Capture ID: $captureId"
+    } catch {
+        Write-Host "   [Save] COM method failed: $_"
+    }
 
     return $result
 }
@@ -152,9 +160,11 @@ public class AudioDefaults {
 function Restore-DefaultDevices {
     param($Saved)
 
-    if (-not $Saved) { return }
+    if (-not $Saved) { Write-Host "   [Restore] No saved devices"; return }
+    if (-not $Saved.Render -and -not $Saved.Capture) { Write-Host "   [Restore] Both saved as null"; return }
 
-    Start-Sleep -Seconds 3  # wait for new devices to settle
+    Write-Host "   [Restore] Waiting 3s for device settle..."
+    Start-Sleep -Seconds 3
 
     try {
         # Try AudioDeviceCmdlets first
@@ -238,19 +248,39 @@ public class AudioDefaultSetter {
 }
 "@ -ErrorAction SilentlyContinue
 
+        Write-Host "   [Restore] Method: COM (IPolicyConfig)"
         if ($Saved.Render -and $Saved.Render.ID) {
-            # eConsole=0, eMultimedia=1, eCommunications=2
+            Write-Host "   [Restore] Setting render default: $($Saved.Render.ID)"
             foreach ($role in @(0, 1, 2)) {
-                [AudioDefaultSetter]::SetDefault($Saved.Render.ID, $role) | Out-Null
+                $ok = [AudioDefaultSetter]::SetDefault($Saved.Render.ID, $role)
+                Write-Host "   [Restore]   role=$role result=$ok"
             }
-            Write-OK "Playback restored via COM: $($Saved.Render.ID)"
+            Write-OK "Playback restored via COM"
+        } else {
+            Write-Host "   [Restore] No render device to restore"
         }
         if ($Saved.Capture -and $Saved.Capture.ID) {
+            Write-Host "   [Restore] Setting capture default: $($Saved.Capture.ID)"
             foreach ($role in @(0, 1, 2)) {
-                [AudioDefaultSetter]::SetDefault($Saved.Capture.ID, $role) | Out-Null
+                $ok = [AudioDefaultSetter]::SetDefault($Saved.Capture.ID, $role)
+                Write-Host "   [Restore]   role=$role result=$ok"
             }
-            Write-OK "Recording restored via COM: $($Saved.Capture.ID)"
+            Write-OK "Recording restored via COM"
+        } else {
+            Write-Host "   [Restore] No capture device to restore"
         }
+
+        # Verify final state
+        try {
+            $finalRender = [AudioDefaults]::GetDefaultDeviceId(0)
+            $finalCapture = [AudioDefaults]::GetDefaultDeviceId(1)
+            Write-Host "   [Restore] Final render default:  $finalRender"
+            Write-Host "   [Restore] Final capture default: $finalCapture"
+            if ($Saved.Render -and $finalRender -eq $Saved.Render.ID) { Write-OK "Render verified" }
+            elseif ($Saved.Render) { Write-Warn "Render mismatch: expected $($Saved.Render.ID)" }
+            if ($Saved.Capture -and $finalCapture -eq $Saved.Capture.ID) { Write-OK "Capture verified" }
+            elseif ($Saved.Capture) { Write-Warn "Capture mismatch: expected $($Saved.Capture.ID)" }
+        } catch {}
     } catch {
         Write-Warn "Could not restore default audio devices: $_"
     }
