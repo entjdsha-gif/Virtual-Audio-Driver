@@ -195,16 +195,15 @@
 - Success: auto-close after 3s; failure: interactive reboot prompt
 - Post-commit failures: unified reboot-resume with exit 3010
 
-#### M6c: Production Signing + Release Flow
+#### M6c: Production Signing + Release Flow - DESIGN READY
 
-**Goal**
-- Remove test-signing dependency for normal users
-- Produce a release artifact that can be installed without development setup
+**Status:** Plan documented in `docs/M6C_SIGNING_PLAN.md`. Implementation deferred until EV certificate procurement.
 
-**Implementation goals**
-1. Define release packaging flow for signed binaries
-2. Prepare installer flow for production certificate usage
-3. Document release checklist and rollback path
+**Two-phase approach:**
+- Phase 1 (self-signed, free): Removes publisher warning via Trusted Publishers. Still needs test signing.
+- Phase 2 (EV + Microsoft attestation): Full production trust, no test signing, Secure Boot compatible.
+
+**Decision:** Phase 1 doesn't close the "any Windows PC" goal (test signing still required). Phase 2 requires EV certificate purchase. Both deferred to production release timeline.
 
 ---
 
