@@ -466,8 +466,12 @@ function Remove-AllAODevices {
     }
 }
 
-function Remove-ControlPanel {
+function Stop-ControlPanelProcess {
     Stop-Process -Name AOControlPanel -Force -ErrorAction SilentlyContinue
+}
+
+function Remove-ControlPanel {
+    Stop-ControlPanelProcess
     reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v "AOControlPanel" /f 2>$null | Out-Null
     Remove-Item "$env:ProgramFiles\AOAudio\AOControlPanel.exe" -Force -ErrorAction SilentlyContinue
     Remove-Item "$env:ProgramFiles\AOAudio" -Force -ErrorAction SilentlyContinue
@@ -555,8 +559,8 @@ function Invoke-PreUpgradeQuiesce {
 
     Write-Info "Attempting in-session quiesce..."
 
-    # 1. Kill Control Panel (release user-mode handles)
-    Remove-ControlPanel
+    # 1. Kill Control Panel process (release user-mode handles, keep app installed)
+    Stop-ControlPanelProcess
     Start-Sleep -Milliseconds 500
 
     # 2. Send PREPARE_UNLOAD to each cable's control device
