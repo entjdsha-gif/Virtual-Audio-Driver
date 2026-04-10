@@ -473,6 +473,173 @@ function Remove-ControlPanel {
     Remove-Item "$env:ProgramFiles\AOAudio" -Force -ErrorAction SilentlyContinue
 }
 
+# ---------------------------------------------------------------------------
+# Pre-upgrade quiesce: attempt to unload driver in-session
+# ---------------------------------------------------------------------------
+
+# IOCTL_AO_PREPARE_UNLOAD = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x805, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+# = ((0x22) << 16) | ((0x2) << 14) | ((0x805) << 2) | (0) = 0x0022A014
+$IOCTL_AO_PREPARE_UNLOAD = 0x0022A014
+
+function Send-PrepareUnload {
+    param([string]$DevicePath)
+
+    # Open handle, send IOCTL, close handle.
+    # The close triggers the last-handle cleanup in the driver.
+    try {
+        $handle = [System.IO.File]::Open(
+            $DevicePath,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::ReadWrite,
+            [System.IO.FileShare]::ReadWrite
+        )
+    } catch {
+        Write-Info "Cannot open $DevicePath (may already be gone): $($_.Exception.Message)"
+        return $true  # device gone = success
+    }
+
+    try {
+        # P/Invoke DeviceIoControl
+        $safeHandle = $handle.SafeFileHandle
+        $bytesReturned = [uint32]0
+        $result = [AoNative]::DeviceIoControl(
+            $safeHandle.DangerousGetHandle(),
+            $IOCTL_AO_PREPARE_UNLOAD,
+            [IntPtr]::Zero, 0,
+            [IntPtr]::Zero, 0,
+            [ref]$bytesReturned,
+            [IntPtr]::Zero
+        )
+        if ($result) {
+            Write-OK "PREPARE_UNLOAD sent to $DevicePath"
+        } else {
+            $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            Write-Info "PREPARE_UNLOAD failed on $DevicePath (Win32 error $err)"
+        }
+    } finally {
+        $handle.Close()
+        $handle.Dispose()
+    }
+
+    return $result
+}
+
+function Test-FileUnlocked {
+    param([string]$Path)
+    if (-not (Test-Path $Path)) { return $true }
+    try {
+        $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+        $fs.Close()
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Invoke-PreUpgradeQuiesce {
+    <#
+    .SYNOPSIS
+        Attempt to fully unload AO driver in-session via PREPARE_UNLOAD protocol.
+        Returns $true if .sys files are unlocked and ready for replacement.
+        This is a COMMIT POINT: after PREPARE_UNLOAD, the control device is
+        permanently destroyed. If anything fails after this, fall back to reboot.
+    #>
+
+    Write-Info "Attempting in-session quiesce..."
+
+    # 1. Kill Control Panel (release user-mode handles)
+    Remove-ControlPanel
+    Start-Sleep -Milliseconds 500
+
+    # 2. Send PREPARE_UNLOAD to each cable's control device
+    #    This deletes the symlink immediately and arms the quiesce flag.
+    #    When our handle closes (end of Send-PrepareUnload), the driver
+    #    deletes the control device object if no other handles remain.
+    foreach ($devPath in @('\\.\AOCableA', '\\.\AOCableB')) {
+        Send-PrepareUnload -DevicePath $devPath | Out-Null
+    }
+
+    # === COMMIT POINT ===
+    # Symlinks are deleted, control devices are being torn down.
+    # There is no rollback from here - if anything fails below,
+    # we must go to reboot-resume.
+
+    Start-Sleep -Seconds 1
+
+    # 3. Verify control devices are gone (reopen should fail)
+    foreach ($devPath in @('\\.\AOCableA', '\\.\AOCableB')) {
+        try {
+            $h = [System.IO.File]::Open($devPath, [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+            $h.Close()
+            Write-Info "WARNING: $devPath is still reachable after PREPARE_UNLOAD"
+            return $false
+        } catch {
+            Write-OK "$devPath is closed"
+        }
+    }
+
+    # 4. Remove PnP devices
+    $devices = @(Get-AoMediaDevices)
+    foreach ($device in $devices) {
+        Write-Info "Removing PnP device: $($device.InstanceId)"
+        pnputil /remove-device "$($device.InstanceId)" 2>$null | Out-Null
+    }
+
+    # 5. Wait for services to stop (driver module unload)
+    $allStopped = $true
+    foreach ($service in @('AOCableA', 'AOCableB')) {
+        Wait-For-ServiceStop $service
+        $svc = Get-Service $service -ErrorAction SilentlyContinue
+        if ($svc -and $svc.Status -ne 'Stopped') {
+            Write-Info "$service still running after wait"
+            $allStopped = $false
+        }
+    }
+
+    if (-not $allStopped) {
+        Write-Info "Services did not stop in time"
+        return $false
+    }
+
+    # 6. Delete services
+    foreach ($service in @('AOCableA', 'AOCableB')) {
+        sc.exe delete $service 2>$null | Out-Null
+    }
+
+    Start-Sleep -Milliseconds 500
+
+    # 7. Verify .sys files are unlocked
+    foreach ($name in @('aocablea.sys', 'aocableb.sys')) {
+        $path = Join-Path "$env:SystemRoot\System32\drivers" $name
+        if (-not (Test-FileUnlocked $path)) {
+            Write-Info "$name is still locked"
+            return $false
+        }
+    }
+
+    Write-OK "In-session quiesce succeeded - driver fully unloaded"
+    return $true
+}
+
+# P/Invoke for DeviceIoControl
+if (-not ([System.Management.Automation.PSTypeName]'AoNative').Type) {
+    Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class AoNative {
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool DeviceIoControl(
+        IntPtr hDevice, uint dwIoControlCode,
+        IntPtr lpInBuffer, uint nInBufferSize,
+        IntPtr lpOutBuffer, uint nOutBufferSize,
+        ref uint lpBytesReturned,
+        IntPtr lpOverlapped);
+}
+"@
+}
+
 function New-StagedDriverPackage {
     param(
         [string]$Name,
@@ -755,28 +922,39 @@ if ($loadedServices.Count -gt 0) {
         exit 3010
     }
 
-    Write-Info "Preparing two-phase recovery: remove current package now and resume install after reboot."
-    $resumeCommand = Register-ResumeInstall -BuildConfig $Config -SkipSignature:$SkipSign
-    Write-OK "Resume command registered for next sign-in"
-    Write-Info $resumeCommand
-
+    # --- Try in-session quiesce (PREPARE_UNLOAD protocol) ---
     $step++
-    Write-Step $step $totalSteps "Removing existing installation (reboot-required phase)..."
-    Remove-AllAODevices
-    Remove-ControlPanel
-    Write-OK "Current installation marked for removal"
+    Write-Step $step $totalSteps "Attempting in-session driver unload..."
+    $quiesceOk = Invoke-PreUpgradeQuiesce
 
-    Write-Err "AO kernel driver is loaded in the current boot session."
-    Write-Err "Windows marked the service for deletion, so the new package cannot be activated until reboot."
-    Write-Err "Reboot once and sign in; install.ps1 will resume automatically."
+    if ($quiesceOk) {
+        Write-OK "Driver unloaded in-session - no reboot needed"
+        # Clear loaded services state; fall through to normal install
+        $loadedServices = @()
+    } else {
+        # === COMMIT POINT PASSED BUT UNLOAD FAILED ===
+        # Control device may be destroyed; cannot recover in this session.
+        # Fall back to reboot-resume immediately.
+        Write-Info "In-session quiesce failed after commit point - falling back to reboot"
 
-    if ($AutoReboot) {
-        Write-Info "Restarting Windows in 5 seconds..."
-        shutdown.exe /r /t 5 /c "AO Virtual Cable upgrade will resume after sign-in." | Out-Null
-        exit 0
+        $resumeCommand = Register-ResumeInstall -BuildConfig $Config -SkipSignature:$SkipSign
+        Write-OK "Resume command registered for next sign-in"
+        Write-Info $resumeCommand
+
+        # Clean up whatever remains
+        Remove-AllAODevices | Out-Null
+
+        Write-Err "AO kernel driver could not be fully unloaded in this session."
+        Write-Err "Reboot once and sign in; install.ps1 will resume automatically."
+
+        if ($AutoReboot) {
+            Write-Info "Restarting Windows in 5 seconds..."
+            shutdown.exe /r /t 5 /c "AO Virtual Cable upgrade will resume after sign-in." | Out-Null
+            exit 0
+        }
+
+        exit 3010
     }
-
-    exit 3010
 }
 
 $savedDevices = Save-DefaultDevices
