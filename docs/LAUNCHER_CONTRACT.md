@@ -157,13 +157,20 @@ Installed version is read from `%SystemRoot%\System32\drivers\aocablea.sys`.
 Example launcher invocation:
 ```powershell
 # Package is at C:\AOInstaller\AOVirtualCable\
+# install-core.ps1 and drivers/ are in _internal/ subfolder
 $packageRoot = "C:\AOInstaller\AOVirtualCable"
-$script = Join-Path $packageRoot "install-core.ps1"
+$internalDir = Join-Path $packageRoot "_internal"
+$script = Join-Path $internalDir "install-core.ps1"
 
-# health-check (works from anywhere)
+# health-check (works from anywhere; set AO_PACKAGE_ROOT for bundledVersion)
+$env:AO_PACKAGE_ROOT = $internalDir
 powershell -NoProfile -ExecutionPolicy Bypass -File $script -Action health-check -Silent -JsonOutput
 
-# install/upgrade/repair (must use package root)
+# install/upgrade/repair via Setup.exe (preferred - handles elevation + temp extraction)
+& (Join-Path $packageRoot "Setup.exe") -Action upgrade -Silent -JsonOutput
+
+# Or via install-core.ps1 directly (requires admin + AO_PACKAGE_ROOT)
+$env:AO_PACKAGE_ROOT = $internalDir
 powershell -NoProfile -ExecutionPolicy Bypass -File $script -Action upgrade -Silent -JsonOutput
 ```
 

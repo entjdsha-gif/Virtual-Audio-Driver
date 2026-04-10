@@ -123,20 +123,26 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int)
         return 50;
     }
 
-    // Copy driver files from EXE directory to temp (they stay alongside EXE)
-    // The .ps1 will resolve paths relative to its own location, but
-    // drivers/ must be next to the EXE, not in temp.
-    // Solution: set scriptDir override via environment variable.
+    // Determine package root: drivers/ and support tools live in _internal/
+    // next to the EXE, or directly next to EXE if _internal/ doesn't exist.
     wchar_t exeDir[MAX_PATH];
     GetModuleFileNameW(NULL, exeDir, MAX_PATH);
     PathRemoveFileSpecW(exeDir);
+
+    wchar_t packageRoot[MAX_PATH];
+    wcscpy_s(packageRoot, exeDir);
+    PathAppendW(packageRoot, L"_internal");
+    if (GetFileAttributesW(packageRoot) == INVALID_FILE_ATTRIBUTES) {
+        // No _internal/ subfolder — flat package layout (fallback)
+        wcscpy_s(packageRoot, exeDir);
+    }
 
     // Build PowerShell command line
     wchar_t cmdLine[4096];
     swprintf_s(cmdLine,
         L"powershell.exe -NoProfile -ExecutionPolicy Bypass"
         L" -Command \"$env:AO_PACKAGE_ROOT='%s'; & '%s' -Action %s%s%s\"",
-        exeDir, ps1Path, action,
+        packageRoot, ps1Path, action,
         silent ? L" -Silent" : L"",
         jsonOutput ? L" -JsonOutput" : L"");
 

@@ -149,17 +149,28 @@ if (Test-Path $launcherBuild) {
     Copy-Item $launcherBuild (Join-Path $pkgDir "Uninstall.exe") -Force
     Write-Host "  Setup.exe + Uninstall.exe: bundled (native launcher)"
 
-    # Hide internal files from user view
-    # install-core.ps1 is embedded in Setup.exe; keep copy for launcher contract (health-check)
-    # but move scripts and batch files out of root
+    # Move ALL internal files out of user-visible root.
+    # User sees only: Setup.exe, Uninstall.exe, AOControlPanel.exe
     $internalDir = Join-Path $pkgDir "_internal"
     New-Item -ItemType Directory -Path $internalDir -Force | Out-Null
-    Move-Item (Join-Path $pkgDir "Setup.bat") (Join-Path $internalDir "Setup.bat") -Force -ErrorAction SilentlyContinue
-    Move-Item (Join-Path $pkgDir "Uninstall.bat") (Join-Path $internalDir "Uninstall.bat") -Force -ErrorAction SilentlyContinue
-    # Keep install-core.ps1 in root for launcher health-check (non-EXE path)
-    # but it's also embedded in Setup.exe so the EXE path doesn't need it
 
-    Write-Host "  Package cleaned for distribution"
+    # Move support files
+    foreach ($item in @('install-core.ps1', 'Setup.bat', 'Uninstall.bat', 'devgen.exe', 'devcon.exe')) {
+        $src = Join-Path $pkgDir $item
+        if (Test-Path $src) {
+            Move-Item $src (Join-Path $internalDir $item) -Force
+        }
+    }
+    # Move drivers directory
+    $driversSrc = Join-Path $pkgDir "drivers"
+    if (Test-Path $driversSrc) {
+        Move-Item $driversSrc (Join-Path $internalDir "drivers") -Force
+    }
+
+    # Set hidden attribute on _internal folder
+    (Get-Item $internalDir).Attributes = 'Directory, Hidden'
+
+    Write-Host "  Package cleaned: user sees Setup.exe + Uninstall.exe + AOControlPanel.exe only"
 } else {
     Write-Host "  Setup.exe: not built (using Setup.bat fallback)"
     Write-Host "  To build: compile installer\launcher\launcher.vcxproj"
