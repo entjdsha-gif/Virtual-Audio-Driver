@@ -618,6 +618,63 @@ if ($devices.Count -ge 2) {
     exit 3010
 }
 
+# Write install-manifest.json with actually installed hashes
+Write-Step "Writing install manifest..."
+$installManifest = @{
+    timestamp = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+    artifacts = @{}
+}
+foreach ($pair in @(
+    @{Name="aocablea.sys"; Path=(Join-Path "$env:SystemRoot\System32\drivers" "aocablea.sys")},
+    @{Name="aocableb.sys"; Path=(Join-Path "$env:SystemRoot\System32\drivers" "aocableb.sys")}
+)) {
+    if (Test-Path $pair.Path) {
+        $item = Get-Item $pair.Path
+        $installManifest.artifacts[$pair.Name] = @{
+            sha256   = (Get-FileHash $pair.Path -Algorithm SHA256).Hash
+            size     = $item.Length
+            modified = $item.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss")
+        }
+    }
+}
+# Write to script directory (packaged installer root)
+$manifestPath = Join-Path $scriptDir "install-manifest.json"
+$installManifest | ConvertTo-Json -Depth 4 | Set-Content -Path $manifestPath -Encoding UTF8
+# Also write to repo root if this is a dev machine
+$repoManifest = Join-Path (Split-Path -Parent $scriptDir) "install-manifest.json"
+if (Test-Path (Split-Path -Parent $repoManifest)) {
+    $installManifest | ConvertTo-Json -Depth 4 | Set-Content -Path $repoManifest -Encoding UTF8
+}
+Write-OK "Install manifest written"
+
+# Clean stale AO driver store packages
+Write-Step "Cleaning stale driver packages..."
+$activeOemPkgs = @()
+foreach ($device in @(Get-AoMediaDevices)) {
+    try {
+        $infPath = (Get-PnpDeviceProperty -InstanceId $device.InstanceId `
+            -KeyName 'DEVPKEY_Device_DriverInfPath' -ErrorAction Stop).Data
+        if ($infPath) { $activeOemPkgs += $infPath.ToLowerInvariant() }
+    } catch {}
+}
+$activeOemPkgs = @($activeOemPkgs | Select-Object -Unique)
+
+$allAoPkgs = @(Get-AoOemPackages | ForEach-Object { $_.ToLowerInvariant() })
+$stalePkgs = @($allAoPkgs | Where-Object { $_ -notin $activeOemPkgs })
+
+if ($stalePkgs.Count -eq 0) {
+    Write-OK "No stale packages"
+} else {
+    foreach ($oem in $stalePkgs) {
+        pnputil /delete-driver $oem /uninstall /force 2>$null | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            Write-OK "Removed stale $oem"
+        } else {
+            Write-Warn "Could not remove $oem (non-blocking)"
+        }
+    }
+}
+
 # Install Control Panel
 Install-ControlPanel
 
@@ -626,6 +683,8 @@ $cpDest = "$env:ProgramFiles\AOAudio\AOControlPanel.exe"
 if (Test-Path $cpDest) {
     Start-Process $cpDest -ErrorAction SilentlyContinue
 }
+
+Clear-Resume
 
 Write-Host ""
 Write-Host "=======================================" -ForegroundColor Green
