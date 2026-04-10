@@ -678,16 +678,44 @@ Write-Host "   Active: $($activeOemPkgs -join ', ')"
 $allAoPkgs = @(Get-AoOemPackages | ForEach-Object { $_.ToLowerInvariant() })
 $stalePkgs = @($allAoPkgs | Where-Object { $_ -notin $activeOemPkgs })
 
+Write-Host "   All AO: $($allAoPkgs -join ', ')"
+Write-Host "   Stale:  $($stalePkgs -join ', ')"
+
 if ($stalePkgs.Count -eq 0) {
     Write-OK "No stale packages"
 } else {
+    # First pass: remove stale packages
     foreach ($oem in $stalePkgs) {
-        pnputil /delete-driver $oem /uninstall /force 2>$null | Out-Null
-        if ($LASTEXITCODE -eq 0) {
-            Write-OK "Removed stale $oem"
-        } else {
-            Write-Warn "Could not remove $oem (non-blocking)"
+        Write-Host "   Deleting $oem..."
+        $output = pnputil /delete-driver $oem /uninstall /force 2>&1
+        $exitCode = $LASTEXITCODE
+        Write-Host "   pnputil exit=$exitCode output: $($output | Out-String)".Trim()
+    }
+
+    Start-Sleep -Seconds 1
+
+    # Verify: re-enumerate and check if any stale remain
+    $remainingAll = @(Get-AoOemPackages | ForEach-Object { $_.ToLowerInvariant() })
+    $stillStale = @($remainingAll | Where-Object { $_ -notin $activeOemPkgs })
+
+    if ($stillStale.Count -gt 0) {
+        Write-Warn "Stale packages remain after first pass: $($stillStale -join ', ')"
+        # Retry: some packages need a second attempt after the first batch frees references
+        foreach ($oem in $stillStale) {
+            Write-Host "   Retry deleting $oem..."
+            pnputil /delete-driver $oem /uninstall /force 2>$null | Out-Null
         }
+        Start-Sleep -Milliseconds 500
+
+        $finalAll = @(Get-AoOemPackages | ForEach-Object { $_.ToLowerInvariant() })
+        $finalStale = @($finalAll | Where-Object { $_ -notin $activeOemPkgs })
+        if ($finalStale.Count -eq 0) {
+            Write-OK "All stale packages removed (after retry)"
+        } else {
+            Write-Warn "Could not remove: $($finalStale -join ', ') (non-blocking)"
+        }
+    } else {
+        Write-OK "All stale packages removed"
     }
 }
 
