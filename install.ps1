@@ -922,10 +922,13 @@ if ($loadedServices.Count -gt 0) {
         exit 3010
     }
 
-    # --- Try in-session quiesce (PREPARE_UNLOAD protocol) ---
-    $step++
-    Write-Step $step $totalSteps "Attempting in-session driver unload..."
-    $quiesceOk = Invoke-PreUpgradeQuiesce
+    # --- Try in-session quiesce (upgrade only - PREPARE_UNLOAD is a commit point) ---
+    $quiesceOk = $false
+    if ($Action -eq 'upgrade') {
+        $step++
+        Write-Step $step $totalSteps "Attempting in-session driver unload..."
+        $quiesceOk = Invoke-PreUpgradeQuiesce
+    }
 
     if ($quiesceOk) {
         Write-OK "Driver unloaded in-session - no reboot needed"
