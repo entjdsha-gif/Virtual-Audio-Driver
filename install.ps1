@@ -490,9 +490,9 @@ function Send-PrepareUnload {
 
     # Open device handle via Win32 CreateFile (not .NET File.Open, which
     # rejects non-file device paths like \\.\AOCableA).
-    $GENERIC_READ_WRITE = 0xC0000000  # GENERIC_READ | GENERIC_WRITE
-    $OPEN_EXISTING = 3
-    $FILE_SHARE_RW = 3               # FILE_SHARE_READ | FILE_SHARE_WRITE
+    $GENERIC_READ_WRITE = [uint32]3221225472  # GENERIC_READ | GENERIC_WRITE
+    $OPEN_EXISTING = [uint32]3
+    $FILE_SHARE_RW = [uint32]3               # FILE_SHARE_READ | FILE_SHARE_WRITE
 
     $hDevice = [AoNative]::CreateFileW(
         $DevicePath,
@@ -579,9 +579,9 @@ function Invoke-PreUpgradeQuiesce {
     Start-Sleep -Seconds 1
 
     # 3. Verify control devices are gone (reopen should fail)
-    $GENERIC_READ = 0x80000000
-    $OPEN_EXISTING = 3
-    $FILE_SHARE_RW = 3
+    $GENERIC_READ = [uint32]2147483648
+    $OPEN_EXISTING = [uint32]3
+    $FILE_SHARE_RW = [uint32]3
     foreach ($devPath in @('\\.\AOCableA', '\\.\AOCableB')) {
         $hCheck = [AoNative]::CreateFileW($devPath, $GENERIC_READ, $FILE_SHARE_RW,
             [IntPtr]::Zero, $OPEN_EXISTING, 0, [IntPtr]::Zero)
@@ -593,11 +593,29 @@ function Invoke-PreUpgradeQuiesce {
         Write-OK "$devPath is closed"
     }
 
-    # 4. Remove PnP devices
-    $devices = @(Get-AoMediaDevices)
-    foreach ($device in $devices) {
-        Write-Info "Removing PnP device: $($device.InstanceId)"
+    # 4. Remove PnP devices (broad: devcon root + Get-PnpDevice all AO services + OEM packages)
+    $devcon = Get-DevconPath
+    if ($devcon) {
+        foreach ($hwid in @('ROOT\AOCableA', 'ROOT\AOCableB', 'ROOT\AOVirtualCable', 'ROOT\AOVirtualAudio')) {
+            Write-Info "Removing root device via devcon: $hwid"
+            & $devcon remove $hwid 2>$null | Out-Null
+        }
+    }
+
+    # Remove all AO PnP instances (any status, any service variant)
+    $allAoDevices = @(Get-PnpDevice -Class MEDIA -ErrorAction SilentlyContinue |
+        Where-Object { $_.Service -eq 'AOCableA' -or $_.Service -eq 'AOCableB' -or $_.Service -eq 'VirtualAudioDriver' })
+    foreach ($device in $allAoDevices) {
+        Write-Info "Removing PnP device: $($device.InstanceId) (status=$($device.Status))"
         pnputil /remove-device "$($device.InstanceId)" 2>$null | Out-Null
+    }
+
+    Start-Sleep -Seconds 1
+
+    # Remove OEM driver store packages
+    foreach ($oem in (Get-OemPackages)) {
+        Write-Info "Removing driver store package: $oem"
+        pnputil /delete-driver $oem /uninstall /force 2>$null | Out-Null
     }
 
     # 5. Wait for services to stop (driver module unload)
@@ -944,7 +962,7 @@ $driverIsLive = $loadedServices.Count -gt 0
 
 if (-not $driverIsLive -and $Action -eq 'upgrade') {
     # Services might not show as RUNNING but control device may still be alive
-    $GENERIC_READ = [uint32]0x80000000
+    $GENERIC_READ = [uint32]2147483648
     $OPEN_EXISTING = [uint32]3
     $FILE_SHARE_RW = [uint32]3
     foreach ($devPath in @('\\.\AOCableA', '\\.\AOCableB')) {
