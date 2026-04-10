@@ -63,25 +63,35 @@ function Get-AoMediaDevices {
 }
 
 function Get-AoOemPackages {
+    # Parse pnputil /enum-drivers output. Field names vary by locale:
+    #   English: "Published Name", "Original Name"
+    #   Korean:  "게시된 이름", "원래 이름"
+    # Match by pattern: oem*.inf line for published name, aocable/virtualaudiodriver for original.
     $pkgs = @()
+    $lastOem = $null
     pnputil /enum-drivers 2>$null | ForEach-Object {
-        if ($_ -match 'Published Name\s*:\s*(oem\d+\.inf)') { $script:lastOem = $Matches[1] }
-        if ($_ -match 'Original Name\s*:\s*aocable[ab]\.inf') { $pkgs += $script:lastOem }
-        if ($_ -match 'Original Name\s*:\s*virtualaudiodriver\.inf') { $pkgs += $script:lastOem }
+        if ($_ -match '(oem\d+\.inf)') {
+            $lastOem = $Matches[1]
+        }
+        if ($lastOem -and $_ -match 'aocable[ab]\.inf') {
+            $pkgs += $lastOem
+            $lastOem = $null
+        }
+        if ($lastOem -and $_ -match 'virtualaudiodriver\.inf') {
+            $pkgs += $lastOem
+            $lastOem = $null
+        }
     }
     return ($pkgs | Select-Object -Unique)
 }
 
 function Test-DriverPackagePresent {
     param([Parameter(Mandatory)][string]$OriginalInfName)
-
-    $present = $false
+    $found = $false
     pnputil /enum-drivers 2>$null | ForEach-Object {
-        if ($_ -match ('Original Name\s*:\s*' + [regex]::Escape($OriginalInfName))) {
-            $present = $true
-        }
+        if ($_ -match [regex]::Escape($OriginalInfName)) { $found = $true }
     }
-    return $present
+    return $found
 }
 
 function Wait-ServiceStop([string]$Name, [int]$TimeoutSec = 10) {
@@ -365,7 +375,7 @@ if ($Action -eq 'uninstall') {
     }
     Remove-ControlPanel
     Write-OK "AO Virtual Cable removed"
-    if (-not $Silent) { Read-Host "Press Enter to close" }
+    Start-Sleep -Seconds 3
     exit 0
 }
 
@@ -735,6 +745,5 @@ Write-Host "=======================================" -ForegroundColor Green
 Write-Host " Installation complete!" -ForegroundColor Green
 Write-Host "=======================================" -ForegroundColor Green
 Write-Host ""
-
-if (-not $Silent) { Read-Host "Press Enter to close" }
+Start-Sleep -Seconds 3
 exit 0
