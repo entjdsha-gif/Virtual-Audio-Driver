@@ -147,6 +147,28 @@ Installed version is read from `%SystemRoot%\System32\drivers\aocablea.sys`.
 
 ---
 
+## Execution Location
+
+- **`health-check`**: can run from any directory (reads system state only)
+- **`install`, `upgrade`, `repair`, `uninstall`**: MUST run from the packaged installer root (where `drivers/CableA/` and `drivers/CableB/` exist)
+- Launcher should set working directory to the package root, or invoke with full path to `install-core.ps1` inside the package
+- If run from a source tree without a built package, modifying actions will exit with code 50 and a clear error message
+
+Example launcher invocation:
+```powershell
+# Package is at C:\AOInstaller\AOVirtualCable\
+$packageRoot = "C:\AOInstaller\AOVirtualCable"
+$script = Join-Path $packageRoot "install-core.ps1"
+
+# health-check (works from anywhere)
+powershell -NoProfile -ExecutionPolicy Bypass -File $script -Action health-check -Silent -JsonOutput
+
+# install/upgrade/repair (must use package root)
+powershell -NoProfile -ExecutionPolicy Bypass -File $script -Action upgrade -Silent -JsonOutput
+```
+
+---
+
 ## Notes
 
 - `health-check` does NOT require admin and does NOT modify the system

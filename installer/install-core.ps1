@@ -574,15 +574,27 @@ if ($Action -eq 'repair') {
 
 # --- INSTALL / UPGRADE ---
 
-# Validate package files
+# Validate package files.
+# install/upgrade/repair require driver files under scriptDir/drivers/.
+# If not found, check if we're in a source tree and guide the user.
+$packageValid = $true
 foreach ($dir in @($driverDirA, $driverDirB)) {
     foreach ($ext in @('sys', 'inf')) {
         $pattern = Join-Path $dir "*.$ext"
         if (-not (Get-ChildItem $pattern -ErrorAction SilentlyContinue)) {
-            Write-Err "Missing driver files in $dir"
-            exit 1
+            $packageValid = $false
         }
     }
+}
+if (-not $packageValid) {
+    Write-Err "Driver package files not found under: $scriptDir\drivers\"
+    Write-Err ""
+    Write-Err "install/upgrade/repair must be run from the packaged installer directory."
+    Write-Err "If you are in a source tree, build the package first:"
+    Write-Err "  powershell -File installer\build-installer.ps1"
+    Write-Err "Then run from the output:"
+    Write-Err "  installer\out\AOVirtualCable\Setup.bat"
+    exit $EXIT_INSTALL_FAILED
 }
 
 # Check existing installation / stale residue
