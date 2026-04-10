@@ -598,7 +598,7 @@ function Invoke-PreUpgradeQuiesce {
 
     # 5. Wait for services to stop (driver module unload)
     $allStopped = $true
-    foreach ($service in @('AOCableA', 'AOCableB')) {
+    foreach ($service in @('AOCableA', 'AOCableB', 'VirtualAudioDriver')) {
         Wait-For-ServiceStop $service
         $svc = Get-Service $service -ErrorAction SilentlyContinue
         if ($svc -and $svc.Status -ne 'Stopped') {
@@ -613,14 +613,14 @@ function Invoke-PreUpgradeQuiesce {
     }
 
     # 6. Delete services
-    foreach ($service in @('AOCableA', 'AOCableB')) {
+    foreach ($service in @('AOCableA', 'AOCableB', 'VirtualAudioDriver')) {
         sc.exe delete $service 2>$null | Out-Null
     }
 
     Start-Sleep -Milliseconds 500
 
-    # 7. Verify .sys files are unlocked
-    foreach ($name in @('aocablea.sys', 'aocableb.sys')) {
+    # 7. Verify .sys files are unlocked (including legacy binary)
+    foreach ($name in @('aocablea.sys', 'aocableb.sys', 'virtualaudiodriver.sys')) {
         $path = Join-Path "$env:SystemRoot\System32\drivers" $name
         if (-not (Test-FileUnlocked $path)) {
             Write-Info "$name is still locked"
@@ -934,7 +934,40 @@ if ($Action -eq 'upgrade' -and -not $isInstalled) {
     Write-Info "No existing installation found - proceeding as fresh install"
 }
 
-if ($loadedServices.Count -gt 0) {
+# Determine if driver is live: services running, OR control devices reachable,
+# OR legacy binary locked. Any of these means we need quiesce before upgrade.
+$driverIsLive = $loadedServices.Count -gt 0
+
+if (-not $driverIsLive -and $Action -eq 'upgrade') {
+    # Services might not show as RUNNING but control device may still be alive
+    $GENERIC_READ = [uint32]0x80000000
+    $OPEN_EXISTING = [uint32]3
+    $FILE_SHARE_RW = [uint32]3
+    foreach ($devPath in @('\\.\AOCableA', '\\.\AOCableB')) {
+        $hProbe = [AoNative]::CreateFileW($devPath, $GENERIC_READ, $FILE_SHARE_RW,
+            [IntPtr]::Zero, $OPEN_EXISTING, [uint32]0, [IntPtr]::Zero)
+        if ($hProbe -ne [AoNative]::INVALID_HANDLE) {
+            [AoNative]::CloseHandle($hProbe) | Out-Null
+            Write-Info "$devPath is still reachable - driver is live"
+            $driverIsLive = $true
+            break
+        }
+    }
+}
+
+if (-not $driverIsLive -and $Action -eq 'upgrade') {
+    # Check if legacy .sys files are locked
+    foreach ($name in @('aocablea.sys', 'aocableb.sys', 'virtualaudiodriver.sys')) {
+        $path = Join-Path "$env:SystemRoot\System32\drivers" $name
+        if ((Test-Path $path) -and -not (Test-FileUnlocked $path)) {
+            Write-Info "$name is locked - driver is live"
+            $driverIsLive = $true
+            break
+        }
+    }
+}
+
+if ($driverIsLive) {
     foreach ($service in $loadedServices) {
         Write-Info "$($service.Name) is still loaded"
     }
@@ -956,8 +989,9 @@ if ($loadedServices.Count -gt 0) {
 
     if ($quiesceOk) {
         Write-OK "Driver unloaded in-session - no reboot needed"
-        # Clear loaded services state; fall through to normal install
+        # Clear state; fall through to normal install
         $loadedServices = @()
+        $driverIsLive = $false
     } else {
         # === COMMIT POINT PASSED BUT UNLOAD FAILED ===
         # Control device may be destroyed; cannot recover in this session.
