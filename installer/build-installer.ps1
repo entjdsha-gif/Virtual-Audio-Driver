@@ -108,6 +108,7 @@ if (Test-Path $cpExe) {
 # Copy installer scripts
 Copy-Item (Join-Path $PSScriptRoot "install-core.ps1") $pkgDir -Force
 Copy-Item (Join-Path $PSScriptRoot "Setup.bat") $pkgDir -Force
+Copy-Item (Join-Path $PSScriptRoot "Uninstall.bat") $pkgDir -Force
 
 # Generate manifest
 $manifest = @{

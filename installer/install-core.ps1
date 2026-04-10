@@ -252,10 +252,35 @@ function Clear-Resume {
 
 # --- Test signing ---
 function Ensure-TestSigning {
+    <#
+    .SYNOPSIS
+        Ensure test signing is enabled. Returns $true if ready, $false if reboot needed.
+    #>
     $bcd = bcdedit 2>$null | Out-String
-    if ($bcd -match 'testsigning\s+Yes') { return }
+    if ($bcd -match 'testsigning\s+Yes') {
+        Write-OK "Test signing is enabled"
+        return $true
+    }
+
+    # Check Secure Boot
+    try {
+        $sb = Confirm-SecureBootUEFI -ErrorAction SilentlyContinue
+    } catch { $sb = $false }
+    if ($sb) {
+        Write-Err "Secure Boot is enabled. Test signing cannot be activated."
+        Write-Err "Disable Secure Boot in BIOS/UEFI settings, then run this installer again."
+        return $false
+    }
+
     bcdedit /set testsigning on 2>$null | Out-Null
-    Write-OK "Test signing enabled"
+    if ($LASTEXITCODE -ne 0) {
+        Write-Err "Failed to enable test signing (bcdedit error $LASTEXITCODE)"
+        return $false
+    }
+
+    Write-Warn "Test signing has been enabled. A REBOOT is required before driver installation."
+    Write-Warn "After reboot, run this installer again."
+    return $false
 }
 
 # =========================================================================
@@ -339,35 +364,86 @@ if ($driverLive -and $Action -eq 'upgrade') {
 }
 
 # Enable test signing
-Ensure-TestSigning
+Write-Step "Checking test signing..."
+$signingReady = Ensure-TestSigning
+if (-not $signingReady) {
+    if (-not $Silent) { Read-Host "Press Enter to close" }
+    exit 1
+}
 
 # Install drivers
 Write-Step "Installing driver packages..."
+$installFailed = $false
 foreach ($pkg in @(
-    @{Name="Cable A"; Dir=$driverDirA},
-    @{Name="Cable B"; Dir=$driverDirB}
+    @{Name="Cable A"; Dir=$driverDirA; HwId="ROOT\AOCableA"},
+    @{Name="Cable B"; Dir=$driverDirB; HwId="ROOT\AOCableB"}
 )) {
     $inf = (Get-ChildItem (Join-Path $pkg.Dir "*.inf") | Select-Object -First 1).FullName
-    Write-Host "   Installing $($pkg.Name) from $inf"
+    Write-Host "   Staging $($pkg.Name) from $inf"
     $output = pnputil /add-driver $inf /install 2>&1
     if ($LASTEXITCODE -ne 0) {
-        Write-Err "Failed to install $($pkg.Name)"
+        Write-Err "Failed to stage $($pkg.Name)"
         Write-Host $output
-        exit 1
+        $installFailed = $true
+        break
     }
-    Write-OK "$($pkg.Name) installed"
+    Write-OK "$($pkg.Name) staged"
+}
+
+if ($installFailed) {
+    # Post-commit install failure: register resume so user isn't left without driver
+    Write-Warn "Driver installation failed after quiesce. Registering reboot-resume..."
+    Register-Resume
+    Write-Err "Reboot and sign in to retry installation automatically."
+    if (-not $Silent) { Read-Host "Press Enter to close" }
+    exit 1
+}
+
+# Ensure root-enumerated device instances exist.
+# On a clean PC, pnputil /add-driver stages the package but may not create
+# device instances. Use pnputil /add-device to create them explicitly.
+Write-Step "Ensuring device instances..."
+foreach ($hwid in @('ROOT\AOCableA', 'ROOT\AOCableB')) {
+    # Check if instance already exists
+    $exists = Get-PnpDevice -InstanceId "$hwid\*" -ErrorAction SilentlyContinue
+    if ($exists) {
+        Write-OK "$hwid already present"
+        continue
+    }
+    # Try pnputil --add-device (Win10 1903+)
+    $output = pnputil /add-device /instanceid "$hwid\0000" /deviceids $hwid 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        Write-OK "$hwid device instance created"
+    } else {
+        # Fallback: devgen if available, otherwise warn
+        $devgen = Get-Command devgen.exe -ErrorAction SilentlyContinue
+        if ($devgen) {
+            & devgen.exe /add /bus ROOT /hardwareid $hwid 2>$null | Out-Null
+            Write-OK "$hwid created via devgen"
+        } else {
+            Write-Warn "$hwid: device instance not created (pnputil /add-device unavailable)"
+            Write-Warn "Device may need manual creation or a newer Windows version"
+        }
+    }
+}
+
+# Restart devices to trigger driver load
+foreach ($dev in @(Get-AoMediaDevices)) {
+    pnputil /restart-device "$($dev.InstanceId)" 2>$null | Out-Null
 }
 
 # Wait for devices to appear
-Start-Sleep -Seconds 2
+Start-Sleep -Seconds 3
 
 # Verify
 Write-Step "Verifying installation..."
 $devices = @(Get-AoMediaDevices | Where-Object { $_.Status -eq 'OK' })
 if ($devices.Count -ge 2) {
     Write-OK "$($devices.Count) AO devices active"
+} elseif ($devices.Count -gt 0) {
+    Write-Warn "Only $($devices.Count) device(s) active (expected 2)"
 } else {
-    Write-Warn "Expected 2+ devices, found $($devices.Count)"
+    Write-Warn "No active AO devices found. Driver may need a reboot to activate."
 }
 
 # Install Control Panel
