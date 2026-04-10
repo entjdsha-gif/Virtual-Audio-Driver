@@ -484,42 +484,49 @@ $IOCTL_AO_PREPARE_UNLOAD = 0x0022A014
 function Send-PrepareUnload {
     param([string]$DevicePath)
 
-    # Open handle, send IOCTL, close handle.
-    # The close triggers the last-handle cleanup in the driver.
-    try {
-        $handle = [System.IO.File]::Open(
-            $DevicePath,
-            [System.IO.FileMode]::Open,
-            [System.IO.FileAccess]::ReadWrite,
-            [System.IO.FileShare]::ReadWrite
-        )
-    } catch {
-        Write-Info "Cannot open $DevicePath (may already be gone): $($_.Exception.Message)"
+    # Open device handle via Win32 CreateFile (not .NET File.Open, which
+    # rejects non-file device paths like \\.\AOCableA).
+    $GENERIC_READ_WRITE = 0xC0000000  # GENERIC_READ | GENERIC_WRITE
+    $OPEN_EXISTING = 3
+    $FILE_SHARE_RW = 3               # FILE_SHARE_READ | FILE_SHARE_WRITE
+
+    $hDevice = [AoNative]::CreateFileW(
+        $DevicePath,
+        $GENERIC_READ_WRITE,
+        $FILE_SHARE_RW,
+        [IntPtr]::Zero,
+        $OPEN_EXISTING,
+        0,
+        [IntPtr]::Zero
+    )
+
+    if ($hDevice -eq [AoNative]::INVALID_HANDLE) {
+        $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        Write-Info "Cannot open $DevicePath (Win32 error $err - may already be gone)"
         return $true  # device gone = success
     }
 
-    try {
-        # P/Invoke DeviceIoControl
-        $safeHandle = $handle.SafeFileHandle
-        $bytesReturned = [uint32]0
-        $result = [AoNative]::DeviceIoControl(
-            $safeHandle.DangerousGetHandle(),
-            $IOCTL_AO_PREPARE_UNLOAD,
-            [IntPtr]::Zero, 0,
-            [IntPtr]::Zero, 0,
-            [ref]$bytesReturned,
-            [IntPtr]::Zero
-        )
-        if ($result) {
-            Write-OK "PREPARE_UNLOAD sent to $DevicePath"
-        } else {
-            $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
-            Write-Info "PREPARE_UNLOAD failed on $DevicePath (Win32 error $err)"
-        }
-    } finally {
-        $handle.Close()
-        $handle.Dispose()
+    # Send IOCTL
+    $bytesReturned = [uint32]0
+    $result = [AoNative]::DeviceIoControl(
+        $hDevice,
+        $IOCTL_AO_PREPARE_UNLOAD,
+        [IntPtr]::Zero, 0,
+        [IntPtr]::Zero, 0,
+        [ref]$bytesReturned,
+        [IntPtr]::Zero
+    )
+
+    if ($result) {
+        Write-OK "PREPARE_UNLOAD sent to $DevicePath"
+    } else {
+        $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        Write-Info "PREPARE_UNLOAD failed on $DevicePath (Win32 error $err)"
     }
+
+    # Close handle - this triggers the driver's last-handle cleanup
+    # (control device deletion if refcount reaches 0 during quiesce)
+    [AoNative]::CloseHandle($hDevice) | Out-Null
 
     return $result
 }
@@ -568,16 +575,18 @@ function Invoke-PreUpgradeQuiesce {
     Start-Sleep -Seconds 1
 
     # 3. Verify control devices are gone (reopen should fail)
+    $GENERIC_READ = 0x80000000
+    $OPEN_EXISTING = 3
+    $FILE_SHARE_RW = 3
     foreach ($devPath in @('\\.\AOCableA', '\\.\AOCableB')) {
-        try {
-            $h = [System.IO.File]::Open($devPath, [System.IO.FileMode]::Open,
-                [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
-            $h.Close()
+        $hCheck = [AoNative]::CreateFileW($devPath, $GENERIC_READ, $FILE_SHARE_RW,
+            [IntPtr]::Zero, $OPEN_EXISTING, 0, [IntPtr]::Zero)
+        if ($hCheck -ne [AoNative]::INVALID_HANDLE) {
+            [AoNative]::CloseHandle($hCheck) | Out-Null
             Write-Info "WARNING: $devPath is still reachable after PREPARE_UNLOAD"
             return $false
-        } catch {
-            Write-OK "$devPath is closed"
         }
+        Write-OK "$devPath is closed"
     }
 
     # 4. Remove PnP devices
@@ -623,12 +632,24 @@ function Invoke-PreUpgradeQuiesce {
     return $true
 }
 
-# P/Invoke for DeviceIoControl
+# P/Invoke for CreateFile, DeviceIoControl, CloseHandle
 if (-not ([System.Management.Automation.PSTypeName]'AoNative').Type) {
     Add-Type -TypeDefinition @"
 using System;
 using System.Runtime.InteropServices;
 public class AoNative {
+    public static readonly IntPtr INVALID_HANDLE = new IntPtr(-1);
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern IntPtr CreateFileW(
+        string lpFileName,
+        uint dwDesiredAccess,
+        uint dwShareMode,
+        IntPtr lpSecurityAttributes,
+        uint dwCreationDisposition,
+        uint dwFlagsAndAttributes,
+        IntPtr hTemplateFile);
+
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool DeviceIoControl(
         IntPtr hDevice, uint dwIoControlCode,
@@ -636,6 +657,9 @@ public class AoNative {
         IntPtr lpOutBuffer, uint nOutBufferSize,
         ref uint lpBytesReturned,
         IntPtr lpOverlapped);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool CloseHandle(IntPtr hObject);
 }
 "@
 }
