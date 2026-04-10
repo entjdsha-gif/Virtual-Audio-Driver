@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     AO Virtual Cable - Installer Core (no WDK/SDK dependency)
 
@@ -72,6 +72,18 @@ function Get-AoOemPackages {
     return ($pkgs | Select-Object -Unique)
 }
 
+function Test-DriverPackagePresent {
+    param([Parameter(Mandatory)][string]$OriginalInfName)
+
+    $present = $false
+    pnputil /enum-drivers 2>$null | ForEach-Object {
+        if ($_ -match ('Original Name\s*:\s*' + [regex]::Escape($OriginalInfName))) {
+            $present = $true
+        }
+    }
+    return $present
+}
+
 function Wait-ServiceStop([string]$Name, [int]$TimeoutSec = 10) {
     for ($i = 0; $i -lt ($TimeoutSec * 2); $i++) {
         $svc = Get-Service $Name -ErrorAction SilentlyContinue
@@ -89,6 +101,26 @@ function Test-FileUnlocked([string]$Path) {
         $fs.Close()
         return $true
     } catch { return $false }
+}
+
+function Sync-System32DriverBinary {
+    param(
+        [string]$Label,
+        [string]$SourcePath,
+        [string]$TargetFileName
+    )
+
+    $targetPath = Join-Path "$env:SystemRoot\System32\drivers" $TargetFileName
+    Write-Host "   Syncing $Label into System32\\drivers..."
+    Copy-Item $SourcePath $targetPath -Force -ErrorAction Stop
+
+    $sourceHash = (Get-FileHash $SourcePath -Algorithm SHA256).Hash
+    $targetHash = (Get-FileHash $targetPath -Algorithm SHA256).Hash
+    if ($sourceHash -ne $targetHash) {
+        throw "$Label sync failed: System32 copy hash mismatch"
+    }
+
+    Write-OK "$Label synced to $targetPath"
 }
 
 # P/Invoke
@@ -117,7 +149,7 @@ $IOCTL_AO_PREPARE_UNLOAD = [uint32]0x0022A014
 
 function Send-PrepareUnload([string]$DevicePath) {
     $hDevice = [AoNative]::CreateFileW($DevicePath,
-        [uint32]0xC0000000, [uint32]3, [IntPtr]::Zero,
+        [uint32]3221225472, [uint32]3, [IntPtr]::Zero,
         [uint32]3, [uint32]0, [IntPtr]::Zero)
     if ($hDevice -eq [AoNative]::INVALID_HANDLE) {
         return $true  # device already gone
@@ -131,7 +163,7 @@ function Send-PrepareUnload([string]$DevicePath) {
 
 function Test-ControlDeviceGone([string]$DevicePath) {
     $h = [AoNative]::CreateFileW($DevicePath,
-        [uint32]0x80000000, [uint32]3, [IntPtr]::Zero,
+        [uint32]2147483648, [uint32]3, [IntPtr]::Zero,
         [uint32]3, [uint32]0, [IntPtr]::Zero)
     if ($h -ne [AoNative]::INVALID_HANDLE) {
         [AoNative]::CloseHandle($h) | Out-Null
@@ -219,13 +251,42 @@ function Invoke-Quiesce {
 
 # --- Install Control Panel ---
 function Install-ControlPanel {
-    if (-not (Test-Path $cpExe)) { return }
+    if (-not (Test-Path $cpExe)) {
+        Write-Warn "AOControlPanel.exe not found in package - skipping"
+        return
+    }
     $destDir = "$env:ProgramFiles\AOAudio"
+    $destPath = Join-Path $destDir "AOControlPanel.exe"
     New-Item -ItemType Directory -Path $destDir -Force | Out-Null
-    Copy-Item $cpExe (Join-Path $destDir "AOControlPanel.exe") -Force
-    # Auto-start on login
-    reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v "AOControlPanel" /t REG_SZ /d "`"$destDir\AOControlPanel.exe`"" /f 2>$null | Out-Null
-    Write-OK "Control Panel installed"
+
+    # Kill any running instance first
+    Stop-Process -Name AOControlPanel -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 500
+
+    # Retry copy up to 3 times (process may take a moment to release the file)
+    $copied = $false
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try {
+            Copy-Item $cpExe $destPath -Force -ErrorAction Stop
+            $copied = $true
+            break
+        } catch {
+            if ($attempt -lt 3) {
+                Write-Warn "Control Panel copy attempt $attempt failed, retrying..."
+                Stop-Process -Name AOControlPanel -Force -ErrorAction SilentlyContinue
+                Start-Sleep -Seconds 1
+            }
+        }
+    }
+
+    if ($copied) {
+        # Auto-start on login
+        reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v "AOControlPanel" /t REG_SZ /d "`"$destPath`"" /f 2>$null | Out-Null
+        Write-OK "Control Panel installed"
+    } else {
+        # Driver is already installed successfully - don't fail the whole installer
+        Write-Warn "Could not copy AOControlPanel.exe (file in use). Control Panel can be updated manually."
+    }
 }
 
 function Remove-ControlPanel {
@@ -321,12 +382,28 @@ foreach ($dir in @($driverDirA, $driverDirB)) {
     }
 }
 
-# Check existing installation
-$existing = @(Get-AoMediaDevices | Where-Object { $_.Status -eq 'OK' })
+# Check existing installation / stale residue
+$allDevices = @(Get-AoMediaDevices)
+$existing = @($allDevices | Where-Object { $_.Status -eq 'OK' })
 $isInstalled = $existing.Count -gt 0
+$hasResidualAo = ($allDevices.Count -gt 0) -or (@(Get-AoOemPackages).Count -gt 0)
+foreach ($dev in @('\\.\AOCableA', '\\.\AOCableB')) {
+    if (-not (Test-ControlDeviceGone $dev)) {
+        $hasResidualAo = $true
+        break
+    }
+}
+foreach ($name in @('aocablea.sys', 'aocableb.sys', 'virtualaudiodriver.sys')) {
+    $path = Join-Path "$env:SystemRoot\System32\drivers" $name
+    if (Test-Path $path) {
+        $hasResidualAo = $true
+        break
+    }
+}
+$existingRemoved = $false
 
-if ($Action -eq 'install' -and $isInstalled) {
-    Write-Warn "AO Virtual Cable is already installed. Switching to upgrade."
+if ($Action -eq 'install' -and $hasResidualAo) {
+    Write-Warn "AO Virtual Cable residue detected. Switching to upgrade cleanup."
     $Action = 'upgrade'
 }
 
@@ -358,9 +435,20 @@ if ($driverLive -and $Action -eq 'upgrade') {
         shutdown.exe /r /t 5 /c "AO Virtual Cable upgrade will resume after sign-in."
         exit 3010
     }
+    $existingRemoved = $true
 } elseif ($driverLive) {
     # Fresh install but something is loaded (shouldn't happen normally)
     Remove-AllAO
+    $existingRemoved = $true
+}
+
+# Upgrade must always remove the previous installation first, even if the driver
+# is no longer live in this session. Otherwise pnputil can report "already latest"
+# against stale/broken device instances and never rebind cleanly.
+if ($Action -eq 'upgrade' -and -not $existingRemoved) {
+    Write-Step "Removing existing installation..."
+    Remove-AllAO
+    $existingRemoved = $true
 }
 
 # Enable test signing
@@ -371,50 +459,44 @@ if (-not $signingReady) {
     exit 1
 }
 
+# Sync service binaries into System32\drivers so service ImagePath resolves
+Write-Step "Syncing service binaries into System32\\drivers..."
+Sync-System32DriverBinary -Label "Cable A" -SourcePath (Join-Path $driverDirA "aocablea.sys") -TargetFileName "aocablea.sys"
+Sync-System32DriverBinary -Label "Cable B" -SourcePath (Join-Path $driverDirB "aocableb.sys") -TargetFileName "aocableb.sys"
+
 # Install drivers
 Write-Step "Installing driver packages..."
-$installFailed = $false
 foreach ($pkg in @(
     @{Name="Cable A"; Dir=$driverDirA; HwId="ROOT\AOCableA"},
     @{Name="Cable B"; Dir=$driverDirB; HwId="ROOT\AOCableB"}
 )) {
     $inf = (Get-ChildItem (Join-Path $pkg.Dir "*.inf") | Select-Object -First 1).FullName
+    $infName = [System.IO.Path]::GetFileName($inf)
     Write-Host "   Staging $($pkg.Name) from $inf"
     $output = pnputil /add-driver $inf /install 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        Write-Err "Failed to stage $($pkg.Name)"
+    $pnputilExit = $LASTEXITCODE
+    $alreadyPresent = Test-DriverPackagePresent -OriginalInfName $infName
+    if ($pnputilExit -ne 0 -and $alreadyPresent) {
+        Write-Warn "$($pkg.Name) package already present - continuing with driver rebind"
         Write-Host $output
-        $installFailed = $true
-        break
+    } elseif ($pnputilExit -ne 0) {
+        Write-Warn "$($pkg.Name) staging returned exit $pnputilExit - continuing to explicit device bind/verify"
+        Write-Host $output
     }
     Write-OK "$($pkg.Name) staged"
 }
 
-if ($installFailed) {
-    # Post-commit install failure: driver is removed, must reboot to retry
-    Write-Err "Driver installation failed after quiesce."
-    Write-Err "Scheduling automatic retry after reboot..."
-    Register-Resume
-    if ($Silent) {
-        shutdown.exe /r /t 10 /c "AO Virtual Cable install will retry after reboot."
-    } else {
-        Write-Err "A reboot is required to complete installation."
-        $reply = Read-Host "Reboot now? (Y/n)"
-        if ($reply -ne 'n') {
-            shutdown.exe /r /t 5 /c "AO Virtual Cable install will retry after sign-in."
-        }
-    }
-    exit 3010
-}
-
 # Ensure root-enumerated device instances exist.
 # On a clean PC, pnputil /add-driver stages the package but does NOT create
-# device instances. devgen.exe is required to create ROOT\AOCableA/B instances.
+# device instances. devgen.exe creates the ROOT instance and devcon.exe
+# explicitly binds/updates the matching driver.
 Write-Step "Ensuring device instances..."
 
-# Locate devgen.exe: bundled in package, or from WDK on build machine
+# Locate devgen.exe / devcon.exe: bundled in package, or from WDK on build machine
 $devgen = $null
+$devcon = $null
 $bundledDevgen = Join-Path $scriptDir "devgen.exe"
+$bundledDevcon = Join-Path $scriptDir "devcon.exe"
 if (Test-Path $bundledDevgen) {
     $devgen = $bundledDevgen
 } else {
@@ -425,6 +507,17 @@ if (Test-Path $bundledDevgen) {
     )
     foreach ($p in $wdkPaths) {
         if (Test-Path $p) { $devgen = $p; break }
+    }
+}
+if (Test-Path $bundledDevcon) {
+    $devcon = $bundledDevcon
+} else {
+    $wdkPaths = @(
+        "C:\Program Files (x86)\Windows Kits\10\Tools\10.0.26100.0\x64\devcon.exe",
+        "C:\Program Files (x86)\Windows Kits\10\Tools\10.0.22621.0\x64\devcon.exe"
+    )
+    foreach ($p in $wdkPaths) {
+        if (Test-Path $p) { $devcon = $p; break }
     }
 }
 
@@ -444,6 +537,12 @@ foreach ($hwid in @('ROOT\AOCableA', 'ROOT\AOCableB')) {
         continue
     }
 
+    $infPath = if ($svcName -eq 'AOCableA') {
+        (Get-ChildItem (Join-Path $driverDirA "*.inf") | Select-Object -First 1).FullName
+    } else {
+        (Get-ChildItem (Join-Path $driverDirB "*.inf") | Select-Object -First 1).FullName
+    }
+
     if ($devgen) {
         $output = & $devgen /add /bus ROOT /hardwareid $hwid 2>&1
         if ($LASTEXITCODE -eq 0) {
@@ -456,6 +555,21 @@ foreach ($hwid in @('ROOT\AOCableA', 'ROOT\AOCableB')) {
         Write-Err "devgen.exe not found - cannot create root device instance"
         Write-Err "Bundle devgen.exe with the installer package or install WDK"
         $deviceCreationOk = $false
+    }
+
+    if ($devcon) {
+        $devconCmd = '"' + $devcon + '" update "' + $infPath + '" "' + $hwid + '" 2>&1'
+        $devconOutput = (& cmd.exe /d /c $devconCmd | Out-String).Trim()
+        $devconExit = $LASTEXITCODE
+        if ($devconExit -eq 0) {
+            Write-OK "$hwid driver binding refreshed"
+        } elseif ($devconOutput) {
+            Write-Warn "$hwid devcon update did not fully succeed: $devconOutput"
+        } else {
+            Write-Warn "$hwid devcon update did not fully succeed (exit $devconExit)"
+        }
+    } else {
+        Write-Warn "devcon.exe not found - relying on scan/restart only"
     }
 }
 
