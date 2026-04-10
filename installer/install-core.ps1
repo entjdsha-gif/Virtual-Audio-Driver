@@ -75,6 +75,187 @@ $cpExe = Join-Path $scriptDir "AOControlPanel.exe"
 
 $resumeTaskName = "AOAudioVirtualCableResume"
 
+# --- Default audio device preservation ---
+# Uses Windows COM API (IPolicyConfig) via registry snapshot — no external modules needed.
+
+function Save-DefaultDevices {
+    <#
+    .SYNOPSIS
+        Save current default playback and recording device IDs before install.
+        Returns hashtable with Render and Capture device info.
+    #>
+    $result = @{ Render = $null; Capture = $null }
+
+    try {
+        # Method 1: AudioDeviceCmdlets (if available)
+        $module = Get-Module -ListAvailable AudioDeviceCmdlets 2>$null
+        if ($module) {
+            Import-Module AudioDeviceCmdlets -ErrorAction SilentlyContinue
+            $playback = Get-AudioDevice -Playback 2>$null
+            $recording = Get-AudioDevice -Recording 2>$null
+            if ($playback) { $result.Render = @{ Name = $playback.Name; ID = $playback.ID } }
+            if ($recording) { $result.Capture = @{ Name = $recording.Name; ID = $recording.ID } }
+            return $result
+        }
+    } catch {}
+
+    try {
+        # Method 2: PowerShell + MMDevice COM (works without external modules)
+        Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+
+[Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+internal interface IMMDeviceEnumerator {
+    int EnumAudioEndpoints(int dataFlow, int stateMask, out IntPtr devices);
+    int GetDefaultAudioEndpoint(int dataFlow, int role, out IntPtr device);
+}
+
+[Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+internal interface IMMDevice {
+    int Activate(ref Guid iid, int clsCtx, IntPtr activationParams, out IntPtr iface);
+    int OpenPropertyStore(int access, out IntPtr props);
+    int GetId([MarshalAs(UnmanagedType.LPWStr)] out string id);
+    int GetState(out int state);
+}
+
+[ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")]
+internal class MMDeviceEnumerator {}
+
+public class AudioDefaults {
+    public static string GetDefaultDeviceId(int dataFlow) {
+        try {
+            var e = (IMMDeviceEnumerator)new MMDeviceEnumerator();
+            IntPtr devPtr;
+            int hr = e.GetDefaultAudioEndpoint(dataFlow, 0, out devPtr);
+            if (hr != 0 || devPtr == IntPtr.Zero) return null;
+            var dev = (IMMDevice)Marshal.GetObjectForIUnknown(devPtr);
+            string id;
+            dev.GetId(out id);
+            Marshal.Release(devPtr);
+            return id;
+        } catch { return null; }
+    }
+}
+"@ -ErrorAction SilentlyContinue
+
+        $renderId = [AudioDefaults]::GetDefaultDeviceId(0)  # eRender=0
+        $captureId = [AudioDefaults]::GetDefaultDeviceId(1) # eCapture=1
+
+        if ($renderId) { $result.Render = @{ Name = $null; ID = $renderId } }
+        if ($captureId) { $result.Capture = @{ Name = $null; ID = $captureId } }
+    } catch {}
+
+    return $result
+}
+
+function Restore-DefaultDevices {
+    param($Saved)
+
+    if (-not $Saved) { return }
+
+    Start-Sleep -Seconds 3  # wait for new devices to settle
+
+    try {
+        # Try AudioDeviceCmdlets first
+        $module = Get-Module -ListAvailable AudioDeviceCmdlets 2>$null
+        if ($module) {
+            Import-Module AudioDeviceCmdlets -ErrorAction SilentlyContinue
+
+            if ($Saved.Render) {
+                $target = $null
+                if ($Saved.Render.ID) {
+                    $target = Get-AudioDevice -List 2>$null | Where-Object {
+                        $_.Type -eq 'Playback' -and $_.ID -eq $Saved.Render.ID
+                    } | Select-Object -First 1
+                }
+                if (-not $target -and $Saved.Render.Name) {
+                    $target = Get-AudioDevice -List 2>$null | Where-Object {
+                        $_.Type -eq 'Playback' -and $_.Name -like "*$($Saved.Render.Name)*"
+                    } | Select-Object -First 1
+                }
+                if ($target) {
+                    Set-AudioDevice -ID $target.ID 2>$null | Out-Null
+                    Write-OK "Playback restored: $($target.Name)"
+                }
+            }
+
+            if ($Saved.Capture) {
+                $target = $null
+                if ($Saved.Capture.ID) {
+                    $target = Get-AudioDevice -List 2>$null | Where-Object {
+                        $_.Type -eq 'Recording' -and $_.ID -eq $Saved.Capture.ID
+                    } | Select-Object -First 1
+                }
+                if (-not $target -and $Saved.Capture.Name) {
+                    $target = Get-AudioDevice -List 2>$null | Where-Object {
+                        $_.Type -eq 'Recording' -and $_.Name -like "*$($Saved.Capture.Name)*"
+                    } | Select-Object -First 1
+                }
+                if ($target) {
+                    Set-AudioDevice -ID $target.ID 2>$null | Out-Null
+                    Write-OK "Recording restored: $($target.Name)"
+                }
+            }
+            return
+        }
+    } catch {}
+
+    # Fallback: use SndVol/nircmd if available, or log warning
+    try {
+        # IPolicyConfig COM for setting default (requires the compiled type from Save)
+        Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+
+[Guid("F8679F50-850A-41CF-9C72-430F290290C8"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+internal interface IPolicyConfig {
+    int GetMixFormat(string id, IntPtr fmt);
+    int GetDeviceFormat(string id, int def, IntPtr fmt);
+    int ResetDeviceFormat(string id);
+    int SetDeviceFormat(string id, IntPtr fmt, IntPtr mix);
+    int GetProcessingPeriod(string id, int def, out long period, out long min);
+    int SetProcessingPeriod(string id, long period);
+    int GetShareMode(string id, out int mode);
+    int SetShareMode(string id, int mode);
+    int GetPropertyValue(string id, ref Guid key, out IntPtr val);
+    int SetPropertyValue(string id, ref Guid key, ref IntPtr val);
+    int SetDefaultEndpoint(string id, int role);
+    int SetEndpointVisibility(string id, int vis);
+}
+
+[ComImport, Guid("870AF99C-171D-4F9E-AF0D-E63DF40C2BC9")]
+internal class PolicyConfigClient {}
+
+public class AudioDefaultSetter {
+    public static bool SetDefault(string deviceId, int role) {
+        try {
+            var policy = (IPolicyConfig)new PolicyConfigClient();
+            int hr = policy.SetDefaultEndpoint(deviceId, role);
+            return hr == 0;
+        } catch { return false; }
+    }
+}
+"@ -ErrorAction SilentlyContinue
+
+        if ($Saved.Render -and $Saved.Render.ID) {
+            # eConsole=0, eMultimedia=1, eCommunications=2
+            foreach ($role in @(0, 1, 2)) {
+                [AudioDefaultSetter]::SetDefault($Saved.Render.ID, $role) | Out-Null
+            }
+            Write-OK "Playback restored via COM: $($Saved.Render.ID)"
+        }
+        if ($Saved.Capture -and $Saved.Capture.ID) {
+            foreach ($role in @(0, 1, 2)) {
+                [AudioDefaultSetter]::SetDefault($Saved.Capture.ID, $role) | Out-Null
+            }
+            Write-OK "Recording restored via COM: $($Saved.Capture.ID)"
+        }
+    } catch {
+        Write-Warn "Could not restore default audio devices: $_"
+    }
+}
+
 # --- Helpers ---
 function Write-Step($msg) { Write-Host "`n>> $msg" -ForegroundColor Cyan }
 function Write-OK($msg)   { Write-Host "   $msg" -ForegroundColor Green }
@@ -576,6 +757,12 @@ if ($Action -eq 'repair') {
 
 # --- INSTALL / UPGRADE ---
 
+# Save current default audio devices before any modifications
+Write-Step "Saving default audio devices..."
+$savedDevices = Save-DefaultDevices
+if ($savedDevices.Render) { Write-OK "Playback: $($savedDevices.Render.Name ?? $savedDevices.Render.ID)" }
+if ($savedDevices.Capture) { Write-OK "Recording: $($savedDevices.Capture.Name ?? $savedDevices.Capture.ID)" }
+
 # Validate package files.
 # install/upgrade/repair require driver files under scriptDir/drivers/.
 # If not found, check if we're in a source tree and guide the user.
@@ -935,6 +1122,10 @@ if ($stalePkgs.Count -eq 0) {
         Write-OK "All stale packages removed"
     }
 }
+
+# Restore default audio devices (before Control Panel launch)
+Write-Step "Restoring default audio devices..."
+Restore-DefaultDevices $savedDevices
 
 # Install Control Panel
 Install-ControlPanel
