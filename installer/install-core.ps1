@@ -790,8 +790,8 @@ if ($Action -eq 'repair') {
 # Save current default audio devices before any modifications
 Write-Step "Saving default audio devices..."
 $savedDevices = Save-DefaultDevices
-if ($savedDevices.Render) { Write-OK "Playback: $($savedDevices.Render.Name ?? $savedDevices.Render.ID)" }
-if ($savedDevices.Capture) { Write-OK "Recording: $($savedDevices.Capture.Name ?? $savedDevices.Capture.ID)" }
+if ($savedDevices.Render) { Write-OK "Playback: $(if ($savedDevices.Render.Name) { $savedDevices.Render.Name } else { $savedDevices.Render.ID })" }
+if ($savedDevices.Capture) { Write-OK "Recording: $(if ($savedDevices.Capture.Name) { $savedDevices.Capture.Name } else { $savedDevices.Capture.ID })" }
 
 # Validate package files.
 # install/upgrade/repair require driver files under scriptDir/drivers/.
