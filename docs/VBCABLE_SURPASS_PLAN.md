@@ -149,7 +149,7 @@
 - M4-SRC: Multi-rate SRC quality (Q06) - deferred to post-M5
 - 1-hour extended dropout/drift runs - deferred to stability phase
 
-### M5: "Surpass" Declaration
+### M5: "Surpass" Declaration - COMPLETE
 
 **Criteria (all required with evidence):**
 1. Feature superset: 16ch + SRC + multi-client + float32, backed by automated tests
@@ -158,23 +158,46 @@
 4. Management tools: live status, self-test, channel mode control
 5. No known regressions in `VALIDATION_MATRIX.md`
 
-### Post-M2 Required Work: No-Reboot Upgrade Path
+### M6: Productization
 
-**Problem observed repeatedly**
-- `install.ps1 -Action upgrade` removes AO PnP device instances, but `AOCableA/B` can remain `RUNNING + NOT_STOPPABLE`
-- `\\.\AOCableA` / `\\.\AOCableB` control devices remain reachable even after PnP removal
-- This keeps `System32\drivers\aocable*.sys` locked and forces reboot-assisted resume
+**Goal**
+- Move from "validated engineering release" to "VB-Cable-style product experience"
+- User should be able to install and upgrade from a single EXE with reboot as fallback-only
 
-**Product goal**
-- Upgrades should complete without reboot whenever the driver can be cleanly quiesced
-- Reboot should be fallback-only, not the normal development or user upgrade path
+#### M6a: No-Reboot Upgrade Path - COMPLETE
 
-**Investigation / implementation goals**
-1. Identify what keeps the kernel driver loaded after AO MEDIA device removal
-2. Ensure Control Panel and other user-mode clients release control-device handles before upgrade
-3. Rework control-device lifecycle so upgrade/uninstall can fully quiesce the driver in-session
-4. Add an explicit pre-upgrade quiesce path and verify service unload before touching `System32\drivers`
-5. Keep reboot-resume only as last-resort fallback when unload verification fails
+**Root cause identified:** Control device (`\\.\AOCableA`) created at DriverEntry, deleted only at DriverUnload. PnP REMOVE_DEVICE did not touch it. Control Panel held open handles, keeping driver module loaded.
+
+**Solution implemented:**
+- `IOCTL_AO_PREPARE_UNLOAD` (kernel): deletes symlink immediately (blocks new opens), sets quiesce flag, deletes device object when last handle closes
+- `Invoke-PreUpgradeQuiesce` (install.ps1): kills Control Panel process, sends PREPARE_UNLOAD, verifies control device closed, broad PnP/root/OEM removal, waits for service stop, verifies .sys unlocked
+- Commit-point semantics: after PREPARE_UNLOAD, no rollback possible; failures go to reboot-resume
+- Legacy `virtualaudiodriver.sys` downgraded from fatal blocker to warning (stale file without live service)
+
+**Smoke test verified:** In-session upgrade completed without reboot. PREPARE_UNLOAD sent, control devices closed, driver fully unloaded, fresh package installed and verified in one session.
+
+#### M6b: One-Click EXE Installer
+
+**Goal**
+- Replace script-first install flow with a user-facing EXE installer
+- Support install / upgrade / uninstall from a single entry point
+
+**Implementation goals**
+1. Package driver files, manifests, and helper scripts into one installer
+2. Detect existing AO installation and route to install vs upgrade automatically
+3. Reuse existing verification logic after install/upgrade
+4. Preserve reboot-resume only as fallback when M6a quiesce fails
+
+#### M6c: Production Signing + Release Flow
+
+**Goal**
+- Remove test-signing dependency for normal users
+- Produce a release artifact that can be installed without development setup
+
+**Implementation goals**
+1. Define release packaging flow for signed binaries
+2. Prepare installer flow for production certificate usage
+3. Document release checklist and rollback path
 
 ---
 
