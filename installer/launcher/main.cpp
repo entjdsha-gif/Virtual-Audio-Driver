@@ -90,6 +90,16 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int)
     }
     LocalFree(argv);
 
+    // Auto-detect uninstall from executable name (Uninstall.exe)
+    if (!isUninstall) {
+        wchar_t exeName[MAX_PATH];
+        GetModuleFileNameW(NULL, exeName, MAX_PATH);
+        wchar_t* baseName = PathFindFileNameW(exeName);
+        if (_wcsnicmp(baseName, L"Uninstall", 9) == 0) {
+            isUninstall = TRUE;
+        }
+    }
+
     if (!action) {
         action = isUninstall ? L"uninstall" : DetectAction();
     }

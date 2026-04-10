@@ -145,21 +145,27 @@ if ($devconSrc) {
 $launcherBuild = Join-Path $root "installer\launcher\x64\$Config\Setup.exe"
 if (Test-Path $launcherBuild) {
     Copy-Item $launcherBuild $pkgDir -Force
-    Write-Host "  Setup.exe: bundled (native launcher)"
-    # When Setup.exe is present, Setup.bat/install-core.ps1 are internal-only
-    # Move them to a subdirectory so users see only Setup.exe
+    # Create Uninstall.exe as a copy (launcher detects /uninstall flag)
+    Copy-Item $launcherBuild (Join-Path $pkgDir "Uninstall.exe") -Force
+    Write-Host "  Setup.exe + Uninstall.exe: bundled (native launcher)"
+
+    # Hide internal files from user view
+    # install-core.ps1 is embedded in Setup.exe; keep copy for launcher contract (health-check)
+    # but move scripts and batch files out of root
     $internalDir = Join-Path $pkgDir "_internal"
     New-Item -ItemType Directory -Path $internalDir -Force | Out-Null
-    Move-Item (Join-Path $pkgDir "install-core.ps1") (Join-Path $internalDir "install-core.ps1") -Force
-    Move-Item (Join-Path $pkgDir "Setup.bat") (Join-Path $internalDir "Setup.bat") -Force
-    Move-Item (Join-Path $pkgDir "Uninstall.bat") (Join-Path $internalDir "Uninstall.bat") -Force
-    Write-Host "  .ps1/.bat moved to _internal/"
+    Move-Item (Join-Path $pkgDir "Setup.bat") (Join-Path $internalDir "Setup.bat") -Force -ErrorAction SilentlyContinue
+    Move-Item (Join-Path $pkgDir "Uninstall.bat") (Join-Path $internalDir "Uninstall.bat") -Force -ErrorAction SilentlyContinue
+    # Keep install-core.ps1 in root for launcher health-check (non-EXE path)
+    # but it's also embedded in Setup.exe so the EXE path doesn't need it
+
+    Write-Host "  Package cleaned for distribution"
 } else {
     Write-Host "  Setup.exe: not built (using Setup.bat fallback)"
     Write-Host "  To build: compile installer\launcher\launcher.vcxproj"
 }
 
-# Generate manifest
+# Generate manifest (internal: placed in _internal/ when Setup.exe present)
 $manifest = @{
     version = Get-Date -Format "yyyy.MM.dd.HHmm"
     files = @{}
@@ -169,7 +175,8 @@ Get-ChildItem $pkgDir -Recurse -File | ForEach-Object {
     $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash
     $manifest.files[$rel] = $hash
 }
-$manifest | ConvertTo-Json -Depth 3 | Set-Content (Join-Path $pkgDir "manifest.json") -Encoding UTF8
+$manifestDir = if (Test-Path (Join-Path $pkgDir "_internal")) { Join-Path $pkgDir "_internal" } else { $pkgDir }
+$manifest | ConvertTo-Json -Depth 3 | Set-Content (Join-Path $manifestDir "manifest.json") -Encoding UTF8
 
 Write-Host ""
 Write-Host "Installer package built: $pkgDir" -ForegroundColor Green
