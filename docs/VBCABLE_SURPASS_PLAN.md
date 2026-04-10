@@ -28,10 +28,11 @@
 - Stale AO Driver Store packages can be removed automatically after install or manually via cleanup.
 
 ### Remaining Gaps
-- No quantitative quality harness yet for bit-exact, latency, dropout, or drift
-- No automated AO vs VB-Cable baseline comparison yet
-- Some legacy/manual test scripts still need cleanup
-- Upgrade still often requires reboot because the standalone control device and kernel service can remain loaded after PnP removal
+- Q01 bit-exact loopback is still experimental because the current `sd.playrec()` WDM-KS harness shows periodic sample drops unrelated to the driver
+- No one-click EXE installer yet; install/upgrade/uninstall still use `install.ps1`
+- No production signing yet; normal-user installation still depends on test-signing/development setup
+- Reboot-resume remains as fallback, but M6a verified that upgrade can now complete fully in-session when quiesce succeeds
+- Some long-run compatibility and stability follow-up work still remains (1-hour runs, app matrix)
 
 ---
 
@@ -176,17 +177,23 @@
 
 **Smoke test verified:** In-session upgrade completed without reboot. PREPARE_UNLOAD sent, control devices closed, driver fully unloaded, fresh package installed and verified in one session.
 
-#### M6b: One-Click EXE Installer
+#### M6b: One-Click Installer Package - COMPLETE
 
-**Goal**
-- Replace script-first install flow with a user-facing EXE installer
-- Support install / upgrade / uninstall from a single entry point
+**Deliverables:**
+- `installer/install-core.ps1`: Self-contained installer, no WDK/SDK dependency
+- `installer/Setup.bat`: Double-click entry point (auto-detects install vs upgrade)
+- `installer/Uninstall.bat`: Double-click removal
+- `installer/build-installer.ps1`: Builds distributable package with bundled devgen/devcon
 
-**Implementation goals**
-1. Package driver files, manifests, and helper scripts into one installer
-2. Detect existing AO installation and route to install vs upgrade automatically
-3. Reuse existing verification logic after install/upgrade
-4. Preserve reboot-resume only as fallback when M6a quiesce fails
+**Verified:**
+- Same-session upgrade via Setup.bat: PASS
+- verify-install.ps1: 17 PASS / 0 FAIL / 0 WARN
+- test_ioctl_diag.py: ALL PASSED
+- Stale driver store cleanup: working (locale-independent pnputil parsing)
+- install-manifest.json written to correct repo root
+- Control Panel: kill + 3x retry copy + non-fatal on failure
+- Success: auto-close after 3s; failure: interactive reboot prompt
+- Post-commit failures: unified reboot-resume with exit 3010
 
 #### M6c: Production Signing + Release Flow
 
