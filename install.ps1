@@ -641,13 +641,26 @@ function Invoke-PreUpgradeQuiesce {
 
     Start-Sleep -Milliseconds 500
 
-    # 7. Verify .sys files are unlocked (including legacy binary)
-    foreach ($name in @('aocablea.sys', 'aocableb.sys', 'virtualaudiodriver.sys')) {
+    # 7. Verify AO .sys files are unlocked
+    foreach ($name in @('aocablea.sys', 'aocableb.sys')) {
         $path = Join-Path "$env:SystemRoot\System32\drivers" $name
         if (-not (Test-FileUnlocked $path)) {
             Write-Info "$name is still locked"
             return $false
         }
+    }
+
+    # Legacy virtualaudiodriver.sys: only block if it has a live service/PnP instance.
+    # A stale TrustedInstaller-owned file without a running service is not a blocker.
+    $legacyPath = Join-Path "$env:SystemRoot\System32\drivers" 'virtualaudiodriver.sys'
+    if ((Test-Path $legacyPath) -and -not (Test-FileUnlocked $legacyPath)) {
+        $legacySvc = Get-Service 'VirtualAudioDriver' -ErrorAction SilentlyContinue
+        $legacyLive = $legacySvc -and $legacySvc.Status -ne 'Stopped'
+        if ($legacyLive) {
+            Write-Info "virtualaudiodriver.sys is locked by live VirtualAudioDriver service"
+            return $false
+        }
+        Write-Info "virtualaudiodriver.sys is locked but no live service - treating as stale (non-blocking)"
     }
 
     Write-OK "In-session quiesce succeeded - driver fully unloaded"
@@ -978,13 +991,24 @@ if (-not $driverIsLive -and $Action -eq 'upgrade') {
 }
 
 if (-not $driverIsLive -and $Action -eq 'upgrade') {
-    # Check if legacy .sys files are locked
-    foreach ($name in @('aocablea.sys', 'aocableb.sys', 'virtualaudiodriver.sys')) {
+    # Check if AO .sys files are locked
+    foreach ($name in @('aocablea.sys', 'aocableb.sys')) {
         $path = Join-Path "$env:SystemRoot\System32\drivers" $name
         if ((Test-Path $path) -and -not (Test-FileUnlocked $path)) {
             Write-Info "$name is locked - driver is live"
             $driverIsLive = $true
             break
+        }
+    }
+    # Legacy: only treat as live if service actually exists
+    if (-not $driverIsLive) {
+        $legacySvc = Get-Service 'VirtualAudioDriver' -ErrorAction SilentlyContinue
+        if ($legacySvc -and $legacySvc.Status -ne 'Stopped') {
+            $legacyPath = Join-Path "$env:SystemRoot\System32\drivers" 'virtualaudiodriver.sys'
+            if ((Test-Path $legacyPath) -and -not (Test-FileUnlocked $legacyPath)) {
+                Write-Info "virtualaudiodriver.sys is locked by live service"
+                $driverIsLive = $true
+            }
         }
     }
 }
