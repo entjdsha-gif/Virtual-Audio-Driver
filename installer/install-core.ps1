@@ -398,9 +398,20 @@ function Invoke-HealthCheck {
         secureBoot = $false
     }
 
-    # Test signing
+    # Test signing (bcdedit requires admin; fall back to registry check)
     $bcd = bcdedit 2>$null | Out-String
-    $result.testSigning = ($bcd -match 'testsigning\s+Yes')
+    if ($bcd -match 'testsigning\s+Yes') {
+        $result.testSigning = $true
+    } else {
+        # Non-admin fallback: check BCD registry element
+        try {
+            $bcdVal = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\CI' -Name 'TestSigning' -ErrorAction SilentlyContinue).TestSigning
+            $result.testSigning = ($bcdVal -eq 1)
+        } catch {
+            # Registry key may not exist; check if watermark is visible
+            $result.testSigning = $false
+        }
+    }
 
     # Secure Boot
     try { $result.secureBoot = [bool](Confirm-SecureBootUEFI -ErrorAction SilentlyContinue) }
