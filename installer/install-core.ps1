@@ -7,23 +7,44 @@
     driver files. Designed to run on any Windows 10/11 x64 PC without
     development tools.
 
-    This script is called by Setup.bat or can be run directly.
+    Called by Setup.bat, external launchers, or directly.
+    See docs/LAUNCHER_CONTRACT.md for integration spec.
 
 .PARAMETER Action
-    install   - Fresh install
-    upgrade   - Remove existing + install new (with in-session quiesce)
-    uninstall - Remove all AO Virtual Cable components
+    install      - Fresh install (auto-upgrades if already installed)
+    upgrade      - Remove existing + install new (with in-session quiesce)
+    uninstall    - Remove all AO Virtual Cable components
+    repair       - Reinstall over existing (preserves registry settings)
+    health-check - Report installation status (no admin required, no modifications)
 
 .PARAMETER Silent
-    Suppress interactive prompts (for automated/EXE wrapper usage)
+    Suppress interactive prompts. Auto-reboot on failure paths.
+
+.PARAMETER JsonOutput
+    Emit a JSON summary as the last line of stdout (machine-readable).
+    For health-check, this is the primary output.
 #>
 param(
     [Parameter(Mandatory)]
-    [ValidateSet('install','upgrade','uninstall')]
+    [ValidateSet('install','upgrade','uninstall','repair','health-check')]
     [string]$Action,
 
-    [switch]$Silent
+    [switch]$Silent,
+
+    [switch]$JsonOutput
 )
+
+# --- Exit code constants ---
+$EXIT_SUCCESS          = 0
+$EXIT_FAILURE          = 1
+$EXIT_HEALTHY          = 10
+$EXIT_NOT_INSTALLED    = 20
+$EXIT_UPGRADE_AVAIL    = 21
+$EXIT_DEGRADED         = 22
+$EXIT_REBOOT_REQUIRED  = 30
+$EXIT_ADMIN_REQUIRED   = 40
+$EXIT_BLOCKED          = 41
+$EXIT_INSTALL_FAILED   = 50
 
 $ErrorActionPreference = "Stop"
 
@@ -31,14 +52,15 @@ $ErrorActionPreference = "Stop"
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
     [Security.Principal.WindowsBuiltInRole]::Administrator
 )
-if (-not $isAdmin) {
+if (-not $isAdmin -and $Action -ne 'health-check') {
     if ($Silent) {
         Write-Host "[ERROR] Administrator privileges required." -ForegroundColor Red
-        exit 1
+        exit $EXIT_ADMIN_REQUIRED
     }
     # Re-launch elevated, capture exit code via -PassThru
     $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $MyInvocation.MyCommand.Path, '-Action', $Action)
     if ($Silent) { $argList += '-Silent' }
+    if ($JsonOutput) { $argList += '-JsonOutput' }
     $proc = Start-Process powershell -ArgumentList $argList -Verb RunAs -PassThru -Wait
     exit $proc.ExitCode
 }
@@ -354,9 +376,157 @@ function Ensure-TestSigning {
     return $false
 }
 
+# --- JSON output helper ---
+function Write-JsonResult($obj) {
+    if ($JsonOutput) {
+        $obj | ConvertTo-Json -Depth 4 -Compress | Write-Host
+    }
+}
+
+# --- Health check ---
+function Invoke-HealthCheck {
+    $result = @{
+        status = "unknown"
+        exitCode = $EXIT_FAILURE
+        devices = @{}
+        controlDevices = @{}
+        driverStore = @{ activePackages = @(); stalePackages = @() }
+        installedVersion = @{}
+        bundledVersion = @{}
+        versionMatch = $false
+        testSigning = $false
+        secureBoot = $false
+    }
+
+    # Test signing
+    $bcd = bcdedit 2>$null | Out-String
+    $result.testSigning = ($bcd -match 'testsigning\s+Yes')
+
+    # Secure Boot
+    try { $result.secureBoot = [bool](Confirm-SecureBootUEFI -ErrorAction SilentlyContinue) }
+    catch { $result.secureBoot = $false }
+
+    # Devices
+    foreach ($svcName in @('AOCableA', 'AOCableB')) {
+        $dev = Get-PnpDevice -Class MEDIA -ErrorAction SilentlyContinue |
+            Where-Object { $_.Service -eq $svcName -and $_.Status -eq 'OK' } |
+            Select-Object -First 1
+        $svc = Get-Service $svcName -ErrorAction SilentlyContinue
+        $result.devices[$svcName] = @{
+            present = ($null -ne $dev)
+            status  = if ($dev) { $dev.Status.ToString() } else { "NotFound" }
+            service = if ($svc) { $svc.Status.ToString() } else { "NotFound" }
+        }
+    }
+
+    # Control devices
+    foreach ($devPath in @('AOCableA', 'AOCableB')) {
+        $h = [AoNative]::CreateFileW("\\.\$devPath",
+            [uint32]0x80000000, [uint32]3, [IntPtr]::Zero,
+            [uint32]3, [uint32]0, [IntPtr]::Zero)
+        $reachable = ($h -ne [AoNative]::INVALID_HANDLE)
+        if ($reachable) { [AoNative]::CloseHandle($h) | Out-Null }
+        $result.controlDevices[$devPath] = $reachable
+    }
+
+    # Driver store packages
+    $activeOem = @()
+    foreach ($device in @(Get-AoMediaDevices | Where-Object { $_.Status -eq 'OK' })) {
+        try {
+            $infPath = (Get-PnpDeviceProperty -InstanceId $device.InstanceId `
+                -KeyName 'DEVPKEY_Device_DriverInfPath' -ErrorAction Stop).Data
+            if ($infPath) { $activeOem += $infPath.ToLowerInvariant() }
+        } catch {}
+    }
+    $activeOem = @($activeOem | Select-Object -Unique)
+    $allAo = @(Get-AoOemPackages | ForEach-Object { $_.ToLowerInvariant() })
+    $staleOem = @($allAo | Where-Object { $_ -notin $activeOem })
+    $result.driverStore.activePackages = $activeOem
+    $result.driverStore.stalePackages = $staleOem
+
+    # Installed version
+    foreach ($name in @('aocablea.sys', 'aocableb.sys')) {
+        $path = Join-Path "$env:SystemRoot\System32\drivers" $name
+        if (Test-Path $path) {
+            $item = Get-Item $path
+            $result.installedVersion[$name] = @{
+                sha256   = (Get-FileHash $path -Algorithm SHA256).Hash
+                size     = $item.Length
+                modified = $item.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss")
+            }
+        }
+    }
+
+    # Bundled version
+    $bundledPaths = @{
+        'aocablea.sys' = Join-Path $driverDirA 'aocablea.sys'
+        'aocableb.sys' = Join-Path $driverDirB 'aocableb.sys'
+    }
+    foreach ($name in $bundledPaths.Keys) {
+        $bpath = $bundledPaths[$name]
+        if (Test-Path $bpath) {
+            $item = Get-Item $bpath
+            $result.bundledVersion[$name] = @{
+                sha256 = (Get-FileHash $bpath -Algorithm SHA256).Hash
+                size   = $item.Length
+            }
+        }
+    }
+
+    # Version match
+    $hasInstalled = $result.installedVersion.Count -gt 0
+    $hasBundled = $result.bundledVersion.Count -gt 0
+    if ($hasInstalled -and $hasBundled) {
+        $result.versionMatch = ($result.installedVersion.'aocablea.sys'.sha256 -eq $result.bundledVersion.'aocablea.sys'.sha256)
+    }
+
+    # Determine status
+    $devicesOk = ($result.devices.AOCableA.present -and $result.devices.AOCableB.present)
+    $servicesOk = ($result.devices.AOCableA.service -eq 'Running' -and $result.devices.AOCableB.service -eq 'Running')
+    $controlOk = ($result.controlDevices.AOCableA -and $result.controlDevices.AOCableB)
+
+    if ($devicesOk -and $servicesOk -and $controlOk) {
+        if ($hasBundled -and -not $result.versionMatch) {
+            $result.status = "upgrade_available"
+            $result.exitCode = $EXIT_UPGRADE_AVAIL
+        } else {
+            $result.status = "healthy"
+            $result.exitCode = $EXIT_HEALTHY
+        }
+    } elseif ($hasInstalled -or $devicesOk) {
+        $result.status = "degraded"
+        $result.exitCode = $EXIT_DEGRADED
+    } else {
+        $result.status = "not_installed"
+        $result.exitCode = $EXIT_NOT_INSTALLED
+    }
+
+    return $result
+}
+
 # =========================================================================
 # Main
 # =========================================================================
+
+# --- HEALTH CHECK (no admin, no modifications) ---
+if ($Action -eq 'health-check') {
+    $hc = Invoke-HealthCheck
+    if (-not $JsonOutput) {
+        Write-Host ""
+        Write-Host "AO Virtual Cable Health Check" -ForegroundColor Cyan
+        Write-Host "  Status:     $($hc.status)" -ForegroundColor $(
+            switch ($hc.status) { 'healthy' {'Green'} 'upgrade_available' {'Yellow'} 'degraded' {'Red'} default {'Red'} })
+        Write-Host "  Devices:    A=$($hc.devices.AOCableA.present) B=$($hc.devices.AOCableB.present)"
+        Write-Host "  Services:   A=$($hc.devices.AOCableA.service) B=$($hc.devices.AOCableB.service)"
+        Write-Host "  Control:    A=$($hc.controlDevices.AOCableA) B=$($hc.controlDevices.AOCableB)"
+        Write-Host "  Version:    match=$($hc.versionMatch)"
+        Write-Host "  TestSign:   $($hc.testSigning)"
+        Write-Host "  SecureBoot: $($hc.secureBoot)"
+        Write-Host "  Store:      active=$($hc.driverStore.activePackages -join ',') stale=$($hc.driverStore.stalePackages -join ',')"
+    }
+    Write-JsonResult $hc
+    exit $hc.exitCode
+}
 
 Clear-Resume
 
@@ -377,6 +547,12 @@ if ($Action -eq 'uninstall') {
     Write-OK "AO Virtual Cable removed"
     Start-Sleep -Seconds 3
     exit 0
+}
+
+# --- REPAIR maps to upgrade internally ---
+if ($Action -eq 'repair') {
+    Write-Host "   Repair mode: reinstalling over existing (settings preserved)"
+    $Action = 'upgrade'
 }
 
 # --- INSTALL / UPGRADE ---
@@ -443,7 +619,7 @@ if ($driverLive -and $Action -eq 'upgrade') {
         Write-Err "Reboot required. Install will resume automatically after sign-in."
         if (-not $Silent) { Read-Host "Press Enter to reboot" }
         shutdown.exe /r /t 5 /c "AO Virtual Cable upgrade will resume after sign-in."
-        exit 3010
+        exit $EXIT_REBOOT_REQUIRED
     }
     $existingRemoved = $true
 } elseif ($driverLive) {
@@ -466,7 +642,7 @@ Write-Step "Checking test signing..."
 $signingReady = Ensure-TestSigning
 if (-not $signingReady) {
     if (-not $Silent) { Read-Host "Press Enter to close" }
-    exit 1
+    exit $EXIT_BLOCKED
 }
 
 # Sync service binaries into System32\drivers so service ImagePath resolves
@@ -595,7 +771,7 @@ if (-not $deviceCreationOk) {
             shutdown.exe /r /t 5 /c "AO Virtual Cable install will retry after sign-in."
         }
     }
-    exit 3010
+    exit $EXIT_REBOOT_REQUIRED
 }
 
 # Trigger driver load by scanning for new hardware
@@ -625,7 +801,7 @@ if ($devices.Count -ge 2) {
             shutdown.exe /r /t 5 /c "AO Virtual Cable install will retry after sign-in."
         }
     }
-    exit 3010
+    exit $EXIT_REBOOT_REQUIRED
 }
 
 # Write install-manifest.json with actually installed hashes
