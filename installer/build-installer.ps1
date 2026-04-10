@@ -123,8 +123,9 @@ if ($devgenSrc) {
     Copy-Item $devgenSrc $pkgDir -Force
     Write-Host "  devgen.exe: bundled from WDK ($devgenSrc)"
 } else {
-    Write-Host "  WARNING: devgen.exe not found - fresh install on clean PCs will fail" -ForegroundColor Yellow
-    Write-Host "  Install Windows Driver Kit to include devgen.exe in the package"
+    Write-Error "devgen.exe not found in WDK. Fresh install requires it for root device creation."
+    Write-Error "Install Windows Driver Kit or copy devgen.exe manually to: $pkgDir"
+    exit 1
 }
 
 # Generate manifest

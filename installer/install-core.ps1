@@ -391,12 +391,20 @@ foreach ($pkg in @(
 }
 
 if ($installFailed) {
-    # Post-commit install failure: register resume so user isn't left without driver
-    Write-Warn "Driver installation failed after quiesce. Registering reboot-resume..."
+    # Post-commit install failure: driver is removed, must reboot to retry
+    Write-Err "Driver installation failed after quiesce."
+    Write-Err "Scheduling automatic retry after reboot..."
     Register-Resume
-    Write-Err "Reboot and sign in to retry installation automatically."
-    if (-not $Silent) { Read-Host "Press Enter to close" }
-    exit 1
+    if ($Silent) {
+        shutdown.exe /r /t 10 /c "AO Virtual Cable install will retry after reboot."
+    } else {
+        Write-Err "A reboot is required to complete installation."
+        $reply = Read-Host "Reboot now? (Y/n)"
+        if ($reply -ne 'n') {
+            shutdown.exe /r /t 5 /c "AO Virtual Cable install will retry after sign-in."
+        }
+    }
+    exit 3010
 }
 
 # Ensure root-enumerated device instances exist.
@@ -420,14 +428,19 @@ if (Test-Path $bundledDevgen) {
     }
 }
 
+# Map hardware ID to service name for existing-device detection
+$hwIdToService = @{
+    'ROOT\AOCableA' = 'AOCableA'
+    'ROOT\AOCableB' = 'AOCableB'
+}
+
 $deviceCreationOk = $true
 foreach ($hwid in @('ROOT\AOCableA', 'ROOT\AOCableB')) {
-    # Check if any instance with matching service already exists
-    $existing = @(Get-AoMediaDevices | Where-Object {
-        $_.InstanceId -match ($hwid -replace '\\','\\')
-    })
+    # Check if a device using this service already exists (any instance ID form)
+    $svcName = $hwIdToService[$hwid]
+    $existing = @(Get-AoMediaDevices | Where-Object { $_.Service -eq $svcName })
     if ($existing.Count -gt 0) {
-        Write-OK "$hwid already present"
+        Write-OK "$hwid already present (service $svcName, instance $($existing[0].InstanceId))"
         continue
     }
 
