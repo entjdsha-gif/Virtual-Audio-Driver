@@ -422,7 +422,7 @@ function Invoke-HealthCheck {
     # Control devices
     foreach ($devPath in @('AOCableA', 'AOCableB')) {
         $h = [AoNative]::CreateFileW("\\.\$devPath",
-            [uint32]0x80000000, [uint32]3, [IntPtr]::Zero,
+            2147483648, [uint32]3, [IntPtr]::Zero,
             [uint32]3, [uint32]0, [IntPtr]::Zero)
         $reachable = ($h -ne [AoNative]::INVALID_HANDLE)
         if ($reachable) { [AoNative]::CloseHandle($h) | Out-Null }
