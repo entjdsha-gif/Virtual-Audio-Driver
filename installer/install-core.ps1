@@ -460,10 +460,18 @@ foreach ($hwid in @('ROOT\AOCableA', 'ROOT\AOCableB')) {
 }
 
 if (-not $deviceCreationOk) {
-    Write-Err "Device instance creation failed. Registering reboot-resume..."
+    Write-Err "Device instance creation failed."
+    Write-Err "Scheduling automatic retry after reboot..."
     Register-Resume
-    if (-not $Silent) { Read-Host "Press Enter to close" }
-    exit 1
+    if ($Silent) {
+        shutdown.exe /r /t 10 /c "AO Virtual Cable install will retry after reboot."
+    } else {
+        $reply = Read-Host "Reboot now? (Y/n)"
+        if ($reply -ne 'n') {
+            shutdown.exe /r /t 5 /c "AO Virtual Cable install will retry after sign-in."
+        }
+    }
+    exit 3010
 }
 
 # Trigger driver load by scanning for new hardware
@@ -483,10 +491,17 @@ if ($devices.Count -ge 2) {
     Write-OK "$($devices.Count) AO devices active"
 } else {
     Write-Err "Expected 2 active devices, found $($devices.Count)"
-    Write-Err "Installation may be incomplete. Try rebooting."
+    Write-Err "Scheduling automatic retry after reboot..."
     Register-Resume
-    if (-not $Silent) { Read-Host "Press Enter to close" }
-    exit 1
+    if ($Silent) {
+        shutdown.exe /r /t 10 /c "AO Virtual Cable install will retry after reboot."
+    } else {
+        $reply = Read-Host "Reboot now? (Y/n)"
+        if ($reply -ne 'n') {
+            shutdown.exe /r /t 5 /c "AO Virtual Cable install will retry after sign-in."
+        }
+    }
+    exit 3010
 }
 
 # Install Control Panel
