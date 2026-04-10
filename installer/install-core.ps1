@@ -36,11 +36,11 @@ if (-not $isAdmin) {
         Write-Host "[ERROR] Administrator privileges required." -ForegroundColor Red
         exit 1
     }
-    # Re-launch elevated
+    # Re-launch elevated, capture exit code via -PassThru
     $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $MyInvocation.MyCommand.Path, '-Action', $Action)
     if ($Silent) { $argList += '-Silent' }
-    Start-Process powershell -ArgumentList $argList -Verb RunAs -Wait
-    exit $LASTEXITCODE
+    $proc = Start-Process powershell -ArgumentList $argList -Verb RunAs -PassThru -Wait
+    exit $proc.ExitCode
 }
 
 # --- Paths ---
@@ -400,50 +400,80 @@ if ($installFailed) {
 }
 
 # Ensure root-enumerated device instances exist.
-# On a clean PC, pnputil /add-driver stages the package but may not create
-# device instances. Use pnputil /add-device to create them explicitly.
+# On a clean PC, pnputil /add-driver stages the package but does NOT create
+# device instances. devgen.exe is required to create ROOT\AOCableA/B instances.
 Write-Step "Ensuring device instances..."
+
+# Locate devgen.exe: bundled in package, or from WDK on build machine
+$devgen = $null
+$bundledDevgen = Join-Path $scriptDir "devgen.exe"
+if (Test-Path $bundledDevgen) {
+    $devgen = $bundledDevgen
+} else {
+    # Search WDK paths
+    $wdkPaths = @(
+        "C:\Program Files (x86)\Windows Kits\10\Tools\10.0.26100.0\x64\devgen.exe",
+        "C:\Program Files (x86)\Windows Kits\10\Tools\10.0.22621.0\x64\devgen.exe"
+    )
+    foreach ($p in $wdkPaths) {
+        if (Test-Path $p) { $devgen = $p; break }
+    }
+}
+
+$deviceCreationOk = $true
 foreach ($hwid in @('ROOT\AOCableA', 'ROOT\AOCableB')) {
-    # Check if instance already exists
-    $exists = Get-PnpDevice -InstanceId "$hwid\*" -ErrorAction SilentlyContinue
-    if ($exists) {
+    # Check if any instance with matching service already exists
+    $existing = @(Get-AoMediaDevices | Where-Object {
+        $_.InstanceId -match ($hwid -replace '\\','\\')
+    })
+    if ($existing.Count -gt 0) {
         Write-OK "$hwid already present"
         continue
     }
-    # Try pnputil --add-device (Win10 1903+)
-    $output = pnputil /add-device /instanceid "$hwid\0000" /deviceids $hwid 2>&1
-    if ($LASTEXITCODE -eq 0) {
-        Write-OK "$hwid device instance created"
-    } else {
-        # Fallback: devgen if available, otherwise warn
-        $devgen = Get-Command devgen.exe -ErrorAction SilentlyContinue
-        if ($devgen) {
-            & devgen.exe /add /bus ROOT /hardwareid $hwid 2>$null | Out-Null
-            Write-OK "$hwid created via devgen"
+
+    if ($devgen) {
+        $output = & $devgen /add /bus ROOT /hardwareid $hwid 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            Write-OK "$hwid device instance created"
         } else {
-            Write-Warn "$hwid: device instance not created (pnputil /add-device unavailable)"
-            Write-Warn "Device may need manual creation or a newer Windows version"
+            Write-Err "$hwid creation failed: $output"
+            $deviceCreationOk = $false
         }
+    } else {
+        Write-Err "devgen.exe not found - cannot create root device instance"
+        Write-Err "Bundle devgen.exe with the installer package or install WDK"
+        $deviceCreationOk = $false
     }
 }
 
-# Restart devices to trigger driver load
+if (-not $deviceCreationOk) {
+    Write-Err "Device instance creation failed. Registering reboot-resume..."
+    Register-Resume
+    if (-not $Silent) { Read-Host "Press Enter to close" }
+    exit 1
+}
+
+# Trigger driver load by scanning for new hardware
+pnputil /scan-devices 2>$null | Out-Null
+Start-Sleep -Seconds 3
+
+# Restart any AO devices that appeared
 foreach ($dev in @(Get-AoMediaDevices)) {
     pnputil /restart-device "$($dev.InstanceId)" 2>$null | Out-Null
 }
-
-# Wait for devices to appear
-Start-Sleep -Seconds 3
+Start-Sleep -Seconds 2
 
 # Verify
 Write-Step "Verifying installation..."
 $devices = @(Get-AoMediaDevices | Where-Object { $_.Status -eq 'OK' })
 if ($devices.Count -ge 2) {
     Write-OK "$($devices.Count) AO devices active"
-} elseif ($devices.Count -gt 0) {
-    Write-Warn "Only $($devices.Count) device(s) active (expected 2)"
 } else {
-    Write-Warn "No active AO devices found. Driver may need a reboot to activate."
+    Write-Err "Expected 2 active devices, found $($devices.Count)"
+    Write-Err "Installation may be incomplete. Try rebooting."
+    Register-Resume
+    if (-not $Silent) { Read-Host "Press Enter to close" }
+    exit 1
 }
 
 # Install Control Panel

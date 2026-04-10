@@ -110,6 +110,23 @@ Copy-Item (Join-Path $PSScriptRoot "install-core.ps1") $pkgDir -Force
 Copy-Item (Join-Path $PSScriptRoot "Setup.bat") $pkgDir -Force
 Copy-Item (Join-Path $PSScriptRoot "Uninstall.bat") $pkgDir -Force
 
+# Bundle devgen.exe (required for root device creation on clean PCs)
+$devgenSrc = $null
+$wdkPaths = @(
+    "C:\Program Files (x86)\Windows Kits\10\Tools\10.0.26100.0\x64\devgen.exe",
+    "C:\Program Files (x86)\Windows Kits\10\Tools\10.0.22621.0\x64\devgen.exe"
+)
+foreach ($p in $wdkPaths) {
+    if (Test-Path $p) { $devgenSrc = $p; break }
+}
+if ($devgenSrc) {
+    Copy-Item $devgenSrc $pkgDir -Force
+    Write-Host "  devgen.exe: bundled from WDK ($devgenSrc)"
+} else {
+    Write-Host "  WARNING: devgen.exe not found - fresh install on clean PCs will fail" -ForegroundColor Yellow
+    Write-Host "  Install Windows Driver Kit to include devgen.exe in the package"
+}
+
 # Generate manifest
 $manifest = @{
     version = Get-Date -Format "yyyy.MM.dd.HHmm"
