@@ -82,6 +82,15 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File install-core.ps1 -Action
 }
 ```
 
+### Field notes
+
+- **testSigning**: `true` | `false` | `null`
+  - `true`: confirmed via bcdedit (admin) or indirect signal (AO services running with test-signed driver)
+  - `false`: confirmed off via bcdedit
+  - `null`: could not determine (non-admin, no AO services running). Launcher should treat as unknown and re-check elevated if needed.
+- **bundledVersion**: may be `{}` when health-check is executed outside the packaged installer directory (e.g., from repo root or a non-package path). Launcher should always execute health-check from the packaged installer root so bundled hashes are available for version comparison. When empty, `versionMatch` is always `false`.
+- **versionMatch**: `true` only when both installed and bundled hashes are available and match. `false` when either is missing or hashes differ.
+
 ---
 
 ## Launcher Call Sequence

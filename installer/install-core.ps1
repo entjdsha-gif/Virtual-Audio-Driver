@@ -398,18 +398,24 @@ function Invoke-HealthCheck {
         secureBoot = $false
     }
 
-    # Test signing (bcdedit requires admin; fall back to registry check)
+    # Test signing detection:
+    #   1. bcdedit (requires admin) - authoritative
+    #   2. Loaded AO driver presence as indirect signal (if AO services are
+    #      running, test signing must be enabled since AO is test-signed)
+    #   3. null = could not determine (non-admin, no indirect signal)
     $bcd = bcdedit 2>$null | Out-String
     if ($bcd -match 'testsigning\s+Yes') {
         $result.testSigning = $true
+    } elseif ($bcd -match 'testsigning\s+No') {
+        $result.testSigning = $false
     } else {
-        # Non-admin fallback: check BCD registry element
-        try {
-            $bcdVal = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\CI' -Name 'TestSigning' -ErrorAction SilentlyContinue).TestSigning
-            $result.testSigning = ($bcdVal -eq 1)
-        } catch {
-            # Registry key may not exist; check if watermark is visible
-            $result.testSigning = $false
+        # bcdedit failed (non-admin). Use indirect signal:
+        # If AO services are running with test-signed drivers, test signing is on.
+        $aoRunning = (Get-Service 'AOCableA' -ErrorAction SilentlyContinue)
+        if ($aoRunning -and $aoRunning.Status -eq 'Running') {
+            $result.testSigning = $true
+        } else {
+            $result.testSigning = $null  # unknown
         }
     }
 
