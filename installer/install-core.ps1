@@ -639,18 +639,33 @@ foreach ($pair in @(
 }
 # Write to script directory (packaged installer root)
 $manifestPath = Join-Path $scriptDir "install-manifest.json"
-$installManifest | ConvertTo-Json -Depth 4 | Set-Content -Path $manifestPath -Encoding UTF8
-# Also write to repo root if this is a dev machine
-$repoManifest = Join-Path (Split-Path -Parent $scriptDir) "install-manifest.json"
-if (Test-Path (Split-Path -Parent $repoManifest)) {
-    $installManifest | ConvertTo-Json -Depth 4 | Set-Content -Path $repoManifest -Encoding UTF8
+$manifestJson = $installManifest | ConvertTo-Json -Depth 4
+Set-Content -Path $manifestPath -Value $manifestJson -Encoding UTF8
+
+# Find repo root by walking upward looking for verify-install.ps1
+$searchDir = $scriptDir
+$repoRoot = $null
+for ($i = 0; $i -lt 5; $i++) {
+    $candidate = Split-Path -Parent $searchDir
+    if (-not $candidate -or $candidate -eq $searchDir) { break }
+    if (Test-Path (Join-Path $candidate "verify-install.ps1")) {
+        $repoRoot = $candidate
+        break
+    }
+    $searchDir = $candidate
 }
-Write-OK "Install manifest written"
+if ($repoRoot) {
+    $repoManifest = Join-Path $repoRoot "install-manifest.json"
+    Set-Content -Path $repoManifest -Value $manifestJson -Encoding UTF8
+    Write-OK "Install manifest written (package + repo root)"
+} else {
+    Write-OK "Install manifest written (package only)"
+}
 
 # Clean stale AO driver store packages
 Write-Step "Cleaning stale driver packages..."
 $activeOemPkgs = @()
-foreach ($device in @(Get-AoMediaDevices)) {
+foreach ($device in @(Get-AoMediaDevices | Where-Object { $_.Status -eq 'OK' })) {
     try {
         $infPath = (Get-PnpDeviceProperty -InstanceId $device.InstanceId `
             -KeyName 'DEVPKEY_Device_DriverInfPath' -ErrorAction Stop).Data
@@ -658,6 +673,7 @@ foreach ($device in @(Get-AoMediaDevices)) {
     } catch {}
 }
 $activeOemPkgs = @($activeOemPkgs | Select-Object -Unique)
+Write-Host "   Active: $($activeOemPkgs -join ', ')"
 
 $allAoPkgs = @(Get-AoOemPackages | ForEach-Object { $_.ToLowerInvariant() })
 $stalePkgs = @($allAoPkgs | Where-Object { $_ -notin $activeOemPkgs })
