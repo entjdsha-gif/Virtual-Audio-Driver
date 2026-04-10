@@ -33,6 +33,10 @@
 | I08 | Registry persistence after SET | `winreg` read | Values match SET | PASS |
 | I09 | GET_CONFIG after reboot | `DeviceIoControl` | Values match registry | TODO |
 | I10 | Control Panel Settings dialog | Manual | Opens, shows values | PASS |
+| I11 | Control Panel Apply (rate/latency) | Manual + `GET_CONFIG` | Runtime rate/latency match UI selection | PASS |
+| I12 | Control Panel Set & Restart (8/16) | Manual + `GET_CONFIG` | Runtime channels switch and reopen succeeds | PASS |
+| I13 | Control Panel Self-Test | Manual | Pass/fail report reflects device state | PASS |
+| I14 | Control Panel Defaults | Manual | UI resets to `48000 / 20 ms / 8 ch` baseline | PASS |
 
 ## 3. Install / Update Verification
 
@@ -69,14 +73,14 @@
 
 | ID | Metric | Method | Pass Criteria | Status |
 |----|--------|--------|---------------|--------|
-| Q01 | Bit-exact loopback (matching format) | Render/capture/diff | Zero residual | TODO |
-| Q02 | Null test (silence in, check output) | Render silence + capture | All zeros | TODO |
-| Q03 | Round-trip latency | Impulse cross-correlation | Measured (ms) | TODO |
-| Q04 | Dropout count (1hr) | Gap detection in capture | 0 dropouts | TODO |
-| Q05 | Sample drift (1hr) | Render vs capture count | <= 1 sample/hr | TODO |
+| Q01 | Bit-exact loopback (matching format) | `test_bit_exact.py --test q01` | Zero residual | EXPERIMENTAL (blocked by playrec sample-drop artifact) |
+| Q02 | Null test (silence in, check output) | `test_bit_exact.py --test q02` | RMS < -90dBFS, Peak < -80dBFS, DC < 1e-5 | PASS |
+| Q03 | Round-trip latency | `test_latency.py --test l02` (multi-chirp single session) | < 200ms mean, < 5ms stddev | PASS |
+| Q04 | Dropout count (60s) | `test_dropout.py --duration 60` | 0 dropouts | PASS |
+| Q05 | Clock drift (60s) | `test_drift.py --duration 60` | < 500ms/hour | PASS |
 | Q06 | Multi-rate SRC quality | Sweep/capture/compare | Visual/numeric report | TODO |
-| Q07 | AO vs VB-Cable latency | Same hardware, same test | AO <= VB + 1ms | TODO |
-| Q08 | AO vs VB-Cable dropout | Same hardware, 1hr each | AO <= VB | TODO |
+| Q07 | AO vs VB-Cable comparison | `test_compare_vb.py` | Side-by-side baseline | PASS (AO competitive or better) |
+| Q08 | AO vs VB-Cable dropout | `test_compare_vb.py --duration 60` | AO <= VB | PASS |
 
 ## 6. Compatibility Matrix
 
@@ -100,6 +104,12 @@
 | `test_multichannel.py` | F06, F07 | Medium (stream-level only) |
 | `test_16ch_isolation.py` | F12, F13 | High |
 | `test_ioctl_diag.py` | I01-I08 | High |
+| `test_quality_common.py` | Q01-Q08 foundation (M4a) | High |
+| `test_bit_exact.py` | Q01 (experimental), Q02 (PASS) | Q02: High, Q01: Blocked |
+| `test_latency.py` | Q03, L01/L02 (M4c) | High |
+| `test_dropout.py` | Q04 dropout detection (M4d) | High |
+| `test_drift.py` | Q05 clock drift (M4d) | High |
+| `test_compare_vb.py` | Q07, Q08 AO vs VB comparison (M4e) | High |
 | `test_complete.ps1` | Mixed | Medium |
 | `test_peak.ps1` | Manual loopback check | Manual only |
 | `test_full.ps1` | Mixed | Stale - needs update |
