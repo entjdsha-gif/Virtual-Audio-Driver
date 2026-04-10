@@ -50,6 +50,12 @@ static HANDLE g_hParametersKey = NULL;
 // Standalone control device (separate from PortCls device stack)
 static PDEVICE_OBJECT g_ControlDevice = NULL;
 
+// Pre-upgrade quiesce state: when TRUE, new opens are rejected and
+// control device is deleted once all existing handles drain.
+static volatile LONG g_PrepareUnload = FALSE;
+static volatile LONG g_ControlOpenCount = 0;     // open handle refcount
+static volatile LONG g_SymlinkDeleted = FALSE;    // symlink already removed
+
 //=============================================================================
 // Dynamic 16ch format block -- single allocation holds all PortCls tables.
 // Built at StartDevice for 16ch mode; static 16ch tables removed from binary
@@ -1654,6 +1660,38 @@ AoDeviceControlHandler(
         break;
     }
 
+    case IOCTL_AO_PREPARE_UNLOAD:
+    {
+        //
+        // Pre-upgrade quiesce sequence:
+        //   1. Delete symbolic link immediately (prevents new user-mode opens)
+        //   2. Set g_PrepareUnload flag (rejects any CREATE that races past symlink removal)
+        //   3. If refcount is already 0, delete the device object now
+        //   4. Otherwise, AoControlClose will delete it when the last handle closes
+        //
+        if (!InterlockedExchange(&g_SymlinkDeleted, TRUE))
+        {
+            UNICODE_STRING symLink = RTL_CONSTANT_STRING(AO_CONTROL_SYMLINK_NAME);
+            IoDeleteSymbolicLink(&symLink);
+            DPF(D_TERSE, ("[IOCTL_AO_PREPARE_UNLOAD] Symbolic link deleted"));
+        }
+
+        InterlockedExchange(&g_PrepareUnload, TRUE);
+
+        LONG current = InterlockedCompareExchange(&g_ControlOpenCount, 0, 0);
+        DPF(D_TERSE, ("[IOCTL_AO_PREPARE_UNLOAD] Quiesce armed, open handles: %ld", current));
+
+        if (current <= 1)
+        {
+            // Only the caller's own handle remains (the one sending this IOCTL).
+            // The device will be deleted when this handle closes via AoControlClose.
+            DPF(D_TERSE, ("[IOCTL_AO_PREPARE_UNLOAD] Only caller handle remains - will delete on close"));
+        }
+
+        status = STATUS_SUCCESS;
+        break;
+    }
+
     default:
         // Not our IOCTL - pass to PortCls (only for PortCls devices, not control device)
         if (DeviceObject != g_ControlDevice && g_OriginalDeviceControl)
@@ -1684,6 +1722,15 @@ AoControlCreate(
     PAGED_CODE();
     if (DeviceObject == g_ControlDevice)
     {
+        // Reject new opens during pre-upgrade quiesce
+        if (InterlockedCompareExchange(&g_PrepareUnload, FALSE, FALSE))
+        {
+            Irp->IoStatus.Status = STATUS_DEVICE_NOT_READY;
+            Irp->IoStatus.Information = 0;
+            IoCompleteRequest(Irp, IO_NO_INCREMENT);
+            return STATUS_DEVICE_NOT_READY;
+        }
+        InterlockedIncrement(&g_ControlOpenCount);
         Irp->IoStatus.Status = STATUS_SUCCESS;
         Irp->IoStatus.Information = 0;
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
@@ -1707,6 +1754,21 @@ AoControlClose(
     PAGED_CODE();
     if (DeviceObject == g_ControlDevice)
     {
+        LONG remaining = InterlockedDecrement(&g_ControlOpenCount);
+        DPF(D_TERSE, ("[AoControlClose] open count -> %ld", remaining));
+
+        // If quiesce is active and all handles drained, delete control device
+        if (remaining <= 0 && InterlockedCompareExchange(&g_PrepareUnload, FALSE, FALSE))
+        {
+            DPF(D_TERSE, ("[AoControlClose] All handles closed during quiesce - deleting control device"));
+            // Symlink already deleted in PREPARE_UNLOAD; just delete the device
+            if (g_ControlDevice)
+            {
+                IoDeleteDevice(g_ControlDevice);
+                g_ControlDevice = NULL;
+            }
+        }
+
         Irp->IoStatus.Status = STATUS_SUCCESS;
         Irp->IoStatus.Information = 0;
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
@@ -1789,8 +1851,12 @@ AoDeleteControlDevice(VOID)
 
     if (g_ControlDevice)
     {
-        UNICODE_STRING symLink = RTL_CONSTANT_STRING(AO_CONTROL_SYMLINK_NAME);
-        IoDeleteSymbolicLink(&symLink);
+        // Delete symlink only if not already removed by PREPARE_UNLOAD
+        if (!InterlockedExchange(&g_SymlinkDeleted, TRUE))
+        {
+            UNICODE_STRING symLink = RTL_CONSTANT_STRING(AO_CONTROL_SYMLINK_NAME);
+            IoDeleteSymbolicLink(&symLink);
+        }
         IoDeleteDevice(g_ControlDevice);
         g_ControlDevice = NULL;
     }

@@ -27,6 +27,11 @@ DEFINE_GUID(GUID_DEVINTERFACE_AO_VIRTUAL_CABLE,
 // SET_MAX_CHANNELS: writes to registry only. Takes effect after device restart.
 #define IOCTL_AO_SET_MAX_CHANNELS   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x804, METHOD_BUFFERED, FILE_WRITE_ACCESS)
 
+// PREPARE_UNLOAD: signals driver to reject new opens, delete symlink,
+// and delete control device once all existing handles are closed.
+// Used by install.ps1 to enable in-session upgrade without reboot.
+#define IOCTL_AO_PREPARE_UNLOAD     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x805, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+
 // Stream status for a single cable endpoint
 typedef struct _AO_ENDPOINT_STATUS {
     BOOLEAN Active;
