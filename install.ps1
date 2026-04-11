@@ -456,7 +456,10 @@ function Remove-AllAODevices {
                 Write-OK "Removed stale $name from System32\\drivers"
             } catch {
                 Write-Info "Could not remove $name immediately: $($_.Exception.Message)"
-                $lockedFiles += $path
+                # Legacy virtualaudiodriver.sys is non-blocking (stale TrustedInstaller-owned file)
+                if ($name -ne 'virtualaudiodriver.sys') {
+                    $lockedFiles += $path
+                }
             }
         }
     }
@@ -468,6 +471,8 @@ function Remove-AllAODevices {
 
 function Stop-ControlPanelProcess {
     Stop-Process -Name AOControlPanel -Force -ErrorAction SilentlyContinue
+    # V2: Kill python processes that may hold AO device handles (e.g. test_stream_monitor.py)
+    Stop-Process -Name python -Force -ErrorAction SilentlyContinue
 }
 
 function Remove-ControlPanel {
