@@ -1,0 +1,12 @@
+﻿
+Test                Status ExitCode Seconds
+----                ------ -------- -------
+Q02 Silence (AO)    PASS          0     3.5
+L02 Latency (AO)    PASS          0     6.8
+Dropout (AO)        PASS          0    61.5
+Drift (AO)          PASS          0    63.5
+AO vs VB Comparison PASS          0   258.6
+
+
+
+Run: 20260410_143156  Duration: 60s  Trials: 10  API: wdmks  Result: 5/5 PASS

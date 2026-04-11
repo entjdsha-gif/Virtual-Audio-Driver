@@ -1,0 +1,140 @@
+{
+  "timestamp": "20260410_143830",
+  "format": "48000Hz/float32/2ch",
+  "ao": {
+    "silence": {
+      "passed": true,
+      "extra": {
+        "max_dc_offset": 0.0,
+        "per_channel_rms_db": [
+          -200.0,
+          -200.0
+        ]
+      }
+    },
+    "latency": {
+      "passed": true,
+      "extra": {
+        "trials": 10,
+        "steady_trials": 9,
+        "mean_ms": 121.19,
+        "std_ms": 0.736,
+        "min_ms": 120.12,
+        "max_ms": 121.98,
+        "first_trial_ms": 120.33,
+        "mean_sidelobe_db": 17.5,
+        "per_trial_ms": [
+          120.33,
+          120.12,
+          121.98,
+          121.98,
+          121.0,
+          121.98,
+          121.98,
+          120.62,
+          120.54,
+          120.5
+        ]
+      }
+    },
+    "dropout": {
+      "passed": true,
+      "extra": {
+        "total_dropout_ms": 0.0,
+        "longest_dropout_ms": 0.0,
+        "window_ms": 5.0,
+        "threshold_db": -40.0,
+        "settle_seconds": 0.5
+      }
+    },
+    "drift": {
+      "passed": true,
+      "extra": {
+        "n_markers": 5,
+        "steady_markers_used": 4,
+        "drift_rate_ppm": -46.15,
+        "drift_samples_per_hour": -7974.6,
+        "drift_ms_per_hour": -166.14,
+        "total_drift_samples": -95,
+        "total_drift_ms": -1.98,
+        "jitter_samples": 13.06,
+        "jitter_ms": 0.272,
+        "marker_lags_ms": [
+          121.98,
+          121.98,
+          121.98,
+          121.0,
+          120.0
+        ]
+      }
+    }
+  },
+  "vb": {
+    "silence": {
+      "passed": true,
+      "extra": {
+        "max_dc_offset": 0.0,
+        "per_channel_rms_db": [
+          -200.0,
+          -200.0
+        ]
+      }
+    },
+    "latency": {
+      "passed": false,
+      "extra": {
+        "trials": 10,
+        "steady_trials": 9,
+        "mean_ms": 200.0,
+        "std_ms": 0.0,
+        "min_ms": 200.0,
+        "max_ms": 200.0,
+        "first_trial_ms": 200.0,
+        "mean_sidelobe_db": 30.3,
+        "per_trial_ms": [
+          200.0,
+          200.0,
+          200.0,
+          200.0,
+          200.0,
+          200.0,
+          200.0,
+          200.0,
+          200.0,
+          200.0
+        ]
+      }
+    },
+    "dropout": {
+      "passed": true,
+      "extra": {
+        "total_dropout_ms": 0.0,
+        "longest_dropout_ms": 0.0,
+        "window_ms": 5.0,
+        "threshold_db": -40.0,
+        "settle_seconds": 0.5
+      }
+    },
+    "drift": {
+      "passed": true,
+      "extra": {
+        "n_markers": 5,
+        "steady_markers_used": 4,
+        "drift_rate_ppm": -0.0,
+        "drift_samples_per_hour": -0.0,
+        "drift_ms_per_hour": -0.0,
+        "total_drift_samples": 0,
+        "total_drift_ms": 0.0,
+        "jitter_samples": 0.0,
+        "jitter_ms": 0.0,
+        "marker_lags_ms": [
+          200.0,
+          200.0,
+          200.0,
+          200.0,
+          200.0
+        ]
+      }
+    }
+  }
+}

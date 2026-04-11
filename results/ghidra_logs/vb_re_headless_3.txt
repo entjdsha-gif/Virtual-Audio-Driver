@@ -1,0 +1,200 @@
+﻿INFO  Using log config file: jar:file:/D:/tools/ghidra_12.0.4_PUBLIC/Ghidra/Framework/Generic/lib/Generic.jar!/generic.log4j.xml (LoggingInitialization)  
+INFO  Using log file: C:\Users\jongw\AppData\Roaming\ghidra\ghidra_12.0.4_PUBLIC\application.log (LoggingInitialization)  
+INFO  Loading user preferences: C:\Users\jongw\AppData\Roaming\ghidra\ghidra_12.0.4_PUBLIC\preferences (Preferences)  
+INFO  Searching for classes... (ClassSearcher)  
+INFO  Class search complete (1451 ms) (ClassSearcher)  
+INFO  Initializing SSL Context (DefaultSSLContextInitializer)  
+INFO  Initializing Random Number Generator... (SecureRandomFactory)  
+INFO  Random Number Generator initialization complete: SHA1PRNG (SecureRandomFactory)  
+INFO  Trust manager disabled, cacerts have not been set (DefaultTrustManagerFactory)  
+INFO  Headless startup complete (3133 ms) (AnalyzeHeadless)  
+INFO  Class searcher loaded 58 extension points (18 false positives) (ClassSearcher)  
+INFO  HEADLESS Script Paths:
+    D:\tools\ghidra_12.0.4_PUBLIC\Ghidra\Processors\PIC\ghidra_scripts
+    D:\tools\ghidra_12.0.4_PUBLIC\Ghidra\Features\Base\ghidra_scripts
+    D:\tools\ghidra_12.0.4_PUBLIC\Ghidra\Processors\8051\ghidra_scripts
+    D:\tools\ghidra_12.0.4_PUBLIC\Ghidra\Features\SystemEmulation\ghidra_scripts
+    D:\tools\ghidra_12.0.4_PUBLIC\Ghidra\Processors\Atmel\ghidra_scripts
+    D:\tools\ghidra_12.0.4_PUBLIC\Ghidra\Features\Decompiler\ghidra_scripts
+    D:\tools\ghidra_12.0.4_PUBLIC\Ghidra\Features\BSim\ghidra_scripts
+    D:\tools\ghidra_12.0.4_PUBLIC\Ghidra\Features\FileFormats\ghidra_scripts
+    D:\tools\ghidra_12.0.4_PUBLIC\Ghidra\Features\FunctionID\ghidra_scripts
+    D:\tools\ghidra_12.0.4_PUBLIC\Ghidra\Features\Jython\ghidra_scripts
+    D:\tools\ghidra_12.0.4_PUBLIC\Ghidra\Processors\JVM\ghidra_scripts
+    D:\tools\ghidra_12.0.4_PUBLIC\Ghidra\Features\VersionTracking\ghidra_scripts
+    D:\tools\ghidra_12.0.4_PUBLIC\Ghidra\Debug\Debugger-rmi-trace\ghidra_scripts
+    D:\tools\ghidra_12.0.4_PUBLIC\Ghidra\Features\WildcardAssembler\ghidra_scripts
+    D:\tools\ghidra_12.0.4_PUBLIC\Ghidra\Features\BytePatterns\ghidra_scripts
+    D:\tools\ghidra_12.0.4_PUBLIC\Ghidra\Features\MicrosoftCodeAnalyzer\ghidra_scripts
+    D:\tools\ghidra_12.0.4_PUBLIC\Ghidra\Features\PyGhidra\ghidra_scripts
+    D:\mywork\Virtual-Audio-Driver\tools\ghidra_scripts
+    D:\tools\ghidra_12.0.4_PUBLIC\Ghidra\Processors\DATA\ghidra_scripts
+    D:\tools\ghidra_12.0.4_PUBLIC\Ghidra\Features\DecompilerDependent\ghidra_scripts
+    D:\tools\ghidra_12.0.4_PUBLIC\Ghidra\Features\GnuDemangler\ghidra_scripts
+    D:\tools\ghidra_12.0.4_PUBLIC\Ghidra\Debug\Debugger\ghidra_scripts
+    D:\tools\ghidra_12.0.4_PUBLIC\Ghidra\Features\SwiftDemangler\ghidra_scripts
+    D:\tools\ghidra_12.0.4_PUBLIC\Ghidra\Features\PDB\ghidra_scripts (HeadlessAnalyzer)  
+INFO  HEADLESS: execution starts (HeadlessAnalyzer)  
+INFO  Opening existing project: D:\tools\ghidra_projects\vb_re (HeadlessAnalyzer)  
+INFO  Opening project: D:\tools\ghidra_projects\vb_re (HeadlessProject)  
+INFO  REPORT: Processing project file: /vb_cableb64_win10.sys (HeadlessAnalyzer)  
+INFO  ANALYZING all memory and code: /vb_cableb64_win10.sys (HeadlessAnalyzer)  
+WARN  Ignoring leading '_' chars on no-return name '___raise_securityfailure' specified in file: D:\tools\ghidra_12.0.4_PUBLIC\Ghidra\Features\Base\data\PEFunctionsThatDoNotReturn (NoReturnFunctionAnalyzer)  
+WARN  Ignoring leading '_' chars on no-return name '___report_rangecheckfailure' specified in file: D:\tools\ghidra_12.0.4_PUBLIC\Ghidra\Features\Base\data\PEFunctionsThatDoNotReturn (NoReturnFunctionAnalyzer)  
+INFO  Skipping PDB processing: failed to locate PDB file in configured locations (PdbUniversalAnalyzer)  
+INFO  Use a script to set the PDB file location. I.e.,
+    PdbAnalyzer.setPdbFileOption(currentProgram, new File("/path/to/pdb/file.pdb")); or
+    PdbUniversalAnalyzer.setPdbFileOption(currentProgram, new File("/path/to/pdb/file.pdb"));
+Or set the symbol server search configuration using:    PdbPlugin.saveSymbolServerServiceConfig(...);
+ This must be done using a pre-script (prior to analysis). (PdbUniversalAnalyzer)  
+INFO  Packed database cache: C:\Users\jongw\AppData\Local\ghidra\packed-db-cache (PackedDatabaseCache)  
+INFO  Applied data type archive: windows_vs12_64 (ApplyDataArchiveAnalyzer)  
+INFO  -----------------------------------------------------
+    ASCII Strings                              0.381 secs
+    Apply Data Archives                        0.728 secs
+    Call Convention ID                         0.005 secs
+    Call-Fixup Installer                       0.005 secs
+    Create Address Tables                      0.084 secs
+    Create Function                            0.000 secs
+    Data Reference                             0.030 secs
+    Decompiler Parameter ID                    4.206 secs
+    Decompiler Switch Analysis                 2.343 secs
+    Demangler Microsoft                        0.022 secs
+    Disassemble Entry Points                   0.139 secs
+    Embedded Media                             0.020 secs
+    External Entry References                  0.000 secs
+    Function ID                                0.396 secs
+    Function Start Search                      0.019 secs
+    Non-Returning Functions - Discovered       0.098 secs
+    Non-Returning Functions - Known            0.020 secs
+    PDB Universal                              0.020 secs
+    Reference                                  0.061 secs
+    Scalar Operand References                  0.226 secs
+    Shared Return Calls                        0.068 secs
+    Stack                                      0.144 secs
+    Subroutine References                      0.074 secs
+    Windows x86 PE Exception Handling          0.020 secs
+    Windows x86 PE RTTI Analyzer               0.000 secs
+    Windows x86 Thread Environment Block (TEB) Analyzer     0.000 secs
+    WindowsResourceReference                   0.473 secs
+    x86 Constant Reference Analyzer            0.964 secs
+-----------------------------------------------------
+     Total Time   10 secs
+-----------------------------------------------------
+ (AutoAnalysisManager)  
+INFO  REPORT: Analysis succeeded for file: /vb_cableb64_win10.sys (HeadlessAnalyzer)  
+INFO  REPORT: Execute script: FindVbLatency.java  (HeadlessAnalyzer)  
+INFO  SCRIPT: D:\mywork\Virtual-Audio-Driver\tools\ghidra_scripts\FindVbLatency.java (HeadlessAnalyzer)  
+INFO  FindVbLatency.java>  (GhidraScript)  
+INFO  FindVbLatency.java> === Scalar 7168 === (GhidraScript)  
+INFO  FindVbLatency.java> 0x1400163d8 RVA=0x163d8 in FUN_140016380 (GhidraScript)  
+INFO  FindVbLatency.java>   MOV EDI,0x1c00 (GhidraScript)  
+INFO  FindVbLatency.java>  (GhidraScript)  
+INFO  FindVbLatency.java> === Scalar 48000 === (GhidraScript)  
+INFO  FindVbLatency.java> 0x140003f42 RVA=0x3f42 in FUN_140003aa0 (GhidraScript)  
+INFO  FindVbLatency.java>   CMP EBX,0xbb80 (GhidraScript)  
+INFO  FindVbLatency.java> 0x140016586 RVA=0x16586 in FUN_140016380 (GhidraScript)  
+INFO  FindVbLatency.java>   CMP EAX,0xbb80 (GhidraScript)  
+INFO  FindVbLatency.java> 0x140019822 RVA=0x19822 in FUN_140019590 (GhidraScript)  
+INFO  FindVbLatency.java>   MOV dword ptr [RAX + 0x44],0xbb80 (GhidraScript)  
+INFO  FindVbLatency.java> 0x14001a828 RVA=0x1a828 in FUN_14001a6c0 (GhidraScript)  
+INFO  FindVbLatency.java>   MOV R8D,0xbb80 (GhidraScript)  
+INFO  FindVbLatency.java>  (GhidraScript)  
+INFO  FindVbLatency.java> === Scalar 96000 === (GhidraScript)  
+INFO  FindVbLatency.java> 0x140003f60 RVA=0x3f60 in FUN_140003aa0 (GhidraScript)  
+INFO  FindVbLatency.java>   MOV EAX,0x17700 (GhidraScript)  
+INFO  FindVbLatency.java> 0x1400163f2 RVA=0x163f2 in FUN_140016380 (GhidraScript)  
+INFO  FindVbLatency.java>   MOV R15D,0x17700 (GhidraScript)  
+INFO  FindVbLatency.java> 0x1400165a0 RVA=0x165a0 in FUN_140016380 (GhidraScript)  
+INFO  FindVbLatency.java>   MOV EAX,0x17700 (GhidraScript)  
+INFO  FindVbLatency.java>  (GhidraScript)  
+INFO  FindVbLatency.java> === Disasm around RVA 0x163d9 === (GhidraScript)  
+INFO  FindVbLatency.java> 0x1400163b8 MOV R14,RDX (GhidraScript)  
+INFO  FindVbLatency.java> 0x1400163bb MOV qword ptr [RCX + 0x28],RAX (GhidraScript)  
+INFO  FindVbLatency.java> 0x1400163bf LEA RDX,[RCX + 0x38] (GhidraScript)  
+INFO  FindVbLatency.java> 0x1400163c3 MOV qword ptr [RCX + 0x58],RAX (GhidraScript)  
+INFO  FindVbLatency.java> 0x1400163c7 MOV qword ptr [RDX],RAX (GhidraScript)  
+INFO  FindVbLatency.java> 0x1400163ca MOV R13D,EAX (GhidraScript)  
+INFO  FindVbLatency.java> 0x1400163cd MOV dword ptr [RSP + 0x44],EAX (GhidraScript)  
+INFO  FindVbLatency.java> 0x1400163d1 MOV RBX,RCX (GhidraScript)  
+INFO  FindVbLatency.java> 0x1400163d4 MOV qword ptr [R12],RAX (GhidraScript)  
+INFO  FindVbLatency.java> 0x1400163d8 MOV EDI,0x1c00 (GhidraScript)  
+INFO  FindVbLatency.java> 0x1400163dd LEA RAX,[RCX + 0x68] (GhidraScript)  
+INFO  FindVbLatency.java> 0x1400163e1 MOV dword ptr [RCX + 0x48],0x1 (GhidraScript)  
+INFO  FindVbLatency.java> 0x1400163e8 MOV RCX,R14 (GhidraScript)  
+INFO  FindVbLatency.java> 0x1400163eb MOV qword ptr [RAX + 0x8],RAX (GhidraScript)  
+INFO  FindVbLatency.java> 0x1400163ef MOV qword ptr [RAX],RAX (GhidraScript)  
+INFO  FindVbLatency.java> 0x1400163f2 MOV R15D,0x17700 (GhidraScript)  
+INFO  FindVbLatency.java> 0x1400163f8 CALL qword ptr [0x140008158] (GhidraScript)  
+INFO  FindVbLatency.java> 0x1400163fe MOV ESI,EAX (GhidraScript)  
+INFO  FindVbLatency.java> 0x140016400 TEST EAX,EAX (GhidraScript)  
+INFO  FindVbLatency.java> 0x140016402 JS 0x1400167f4 (GhidraScript)  
+INFO  FindVbLatency.java> 0x140016408 MOV RCX,qword ptr [0x140013210] (GhidraScript)  
+INFO  FindVbLatency.java> 0x14001640f MOV R9,R14 (GhidraScript)  
+INFO  FindVbLatency.java> 0x140016412 MOV RAX,qword ptr [0x140013208] (GhidraScript)  
+INFO  FindVbLatency.java> 0x140016419 XOR R8D,R8D (GhidraScript)  
+INFO  FindVbLatency.java>  (GhidraScript)  
+INFO  FindVbLatency.java> === Decompile around 7168 function === (GhidraScript)  
+INFO  FindVbLatency.java>  (GhidraScript)  
+INFO  FindVbLatency.java> /* WARNING: Function: __security_check_cookie replaced with injection: security_check_cookie */ (GhidraScript)  
+INFO  FindVbLatency.java> /* WARNING: Globals starting with '_' overlap smaller symbols at the same address */ (GhidraScript)  
+INFO  FindVbLatency.java>  (GhidraScript)  
+INFO  FindVbLatency.java> int FUN_140016380(longlong param_1,undefined8 param_2) (GhidraScript)  
+INFO  FindVbLatency.java>  (GhidraScript)  
+INFO  FindVbLatency.java> { (GhidraScript)  
+INFO  FindVbLatency.java>   longlong lVar1; (GhidraScript)  
+INFO  FindVbLatency.java>   int iVar2; (GhidraScript)  
+INFO  FindVbLatency.java>   uint uVar3; (GhidraScript)  
+INFO  FindVbLatency.java>   longlong *plVar4; (GhidraScript)  
+INFO  FindVbLatency.java>   undefined8 uVar5; (GhidraScript)  
+INFO  FindVbLatency.java>   uint uVar6; (GhidraScript)  
+INFO  FindVbLatency.java>   uint uVar7; (GhidraScript)  
+INFO  FindVbLatency.java>   uint uVar8; (GhidraScript)  
+INFO  FindVbLatency.java>   uint uVar9; (GhidraScript)  
+INFO  FindVbLatency.java>   undefined1 auStackY_198 [32]; (GhidraScript)  
+INFO  FindVbLatency.java>   uint local_158; (GhidraScript)  
+INFO  FindVbLatency.java>   uint local_154; (GhidraScript)  
+INFO  FindVbLatency.java>   wchar_t local_148 [128]; (GhidraScript)  
+INFO  FindVbLatency.java>   ulonglong local_48; (GhidraScript)  
+INFO  FindVbLatency.java>    (GhidraScript)  
+INFO  FindVbLatency.java>   local_48 = DAT_140012be0 ^ (ulonglong)auStackY_198; (GhidraScript)  
+INFO  FindVbLatency.java>   *(undefined8 *)(param_1 + 0x30) = param_2; (GhidraScript)  
+INFO  FindVbLatency.java>   *(undefined8 *)(param_1 + 0x50) = 0; (GhidraScript)  
+INFO  FindVbLatency.java>   *(undefined8 *)(param_1 + 0x28) = 0; (GhidraScript)  
+INFO  FindVbLatency.java>   *(undefined8 *)(param_1 + 0x58) = 0; (GhidraScript)  
+INFO  FindVbLatency.java>   *(undefined8 *)(param_1 + 0x38) = 0; (GhidraScript)  
+INFO  FindVbLatency.java>   local_154 = 0; (GhidraScript)  
+INFO  FindVbLatency.java>   *(undefined8 *)(param_1 + 0x40) = 0; (GhidraScript)  
+INFO  FindVbLatency.java>   lVar1 = param_1 + 0x68; (GhidraScript)  
+INFO  FindVbLatency.java>   *(undefined4 *)(param_1 + 0x48) = 1; (GhidraScript)  
+INFO  FindVbLatency.java>   *(longlong *)(param_1 + 0x70) = lVar1; (GhidraScript)  
+INFO  FindVbLatency.java>   *(longlong *)lVar1 = lVar1; (GhidraScript)  
+INFO  FindVbLatency.java>   iVar2 = PcGetPhysicalDeviceObject(param_2); (GhidraScript)  
+INFO  FindVbLatency.java>   if (iVar2 < 0) { (GhidraScript)  
+INFO  FindVbLatency.java>     return iVar2; (GhidraScript)  
+INFO  FindVbLatency.java>   } (GhidraScript)  
+INFO  FindVbLatency.java>   iVar2 = (*(code *)PTR__guard_dispatch_icall_140008188)(DAT_140013210,*DAT_140013210,0,param_2); (GhidraScript)  
+INFO  FindVbLatency.java>   if (-1 < iVar2) { (GhidraScript)  
+INFO  FindVbLatency.java>     plVar4 = (longlong *)FUN_1400048a8((undefined1 *)0x100,0x40); (GhidraScript)  
+INFO  FindVbLatency.java>     if (plVar4 == (longlong *)0x0) { (GhidraScript)  
+INFO  FindVbLatency.java>       *(undefined8 *)(param_1 + 0x50) = 0; (GhidraScript)  
+INFO  FindVbLatency.java>     } (GhidraScript)  
+INFO  FindVbLatency.java>     else { (GhidraScript)  
+INFO  FindVbLatency.java>       plVar4 = FUN_140017844(plVar4); (GhidraScript)  
+INFO  FindVbLatency.java>       *(longlong **)(param_1 + 0x50) = plVar4; (GhidraScript)  
+INFO  FindVbLatency.java>       if (plVar4 != (longlong *)0x0) { (GhidraScript)  
+INFO  FindVbLatency.java>         FUN_1400178ac(plVar4); (GhidraScript)  
+INFO  FindVbLatency.java>         local_158 = 0; (GhidraScript)  
+INFO  FindVbLatency.java>         uVar5 = FUN_14000436c(0,0x14001b2b0,0x14001b290,&local_158); (GhidraScript)  
+INFO  FindVbLatency.java>         uVar7 = 0x1c00; (GhidraScript)  
+INFO  FindVbLatency.java>         if (((((int)uVar5 == 0) || (GhidraScript)  
+INFO  FindVbLatency.java>              (uVar5 = FUN_14000436c(0,0x14001b310,0x14001b290,&local_158), (int)uVar5 == 0)) && (GhidraScript)  
+INFO  FindVbLatency.java>             (0x3ff < local_158)) && (uVar7 = local_158, 0x8000 < local_158)) { (GhidraScript)  
+INFO  FindVbLatency.java>           uVar7 = 0x8000; (GhidraScript)  
+INFO  FindVbLatency.java>         } (GhidraScript)  
+INFO  FindVbLatency.java>         local_158 = 0; (GhidraScript)  
+INFO  FindVbLatency.java>         uVar5 = FUN_14000436c(0,0x14001b2b0,0x14001b390,&local_158); (GhidraScript)  
+INFO  FindVbLatency.java>         uVar6 = uVar7; (GhidraScript)  
+INFO  ANALYZING changes made by post scripts: /vb_cableb64_win10.sys (HeadlessAnalyzer)  
+INFO  REPORT: Post-analysis succeeded for file: /vb_cableb64_win10.sys (HeadlessAnalyzer)  
+INFO  REPORT: Save succeeded for processed file: /vb_cableb64_win10.sys (HeadlessAnalyzer)  

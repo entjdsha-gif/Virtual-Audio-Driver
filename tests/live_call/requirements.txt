@@ -1,0 +1,7 @@
+python-dotenv>=1.0
+pyaudio>=0.2.14
+numpy>=1.26
+openai>=1.50
+pycaw>=20230407
+comtypes>=1.4
+pywinauto>=0.6.9
