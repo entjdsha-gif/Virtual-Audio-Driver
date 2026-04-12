@@ -1,4 +1,4 @@
-#include "definitions.h"
+﻿#include "definitions.h"
 #include <limits.h>
 #include <ks.h>
 #include "endpoints.h"
@@ -1188,6 +1188,14 @@ NTSTATUS CMiniportWaveRTStream::SetState
 
     // Spew an event for a pin state change request from portcls
     //Event type: eMINIPORT_PIN_STATE
+    // Log all state transitions for FRAME_PIPE diagnostics
+    if (m_pMiniport)
+    {
+        DbgPrint("AO_STATE: DevType=%d capture=%d %d->%d\n",
+            (int)m_pMiniport->m_DeviceType, (int)m_bCapture,
+            (int)m_KsState, (int)State_);
+    }
+
     switch (State_)
     {
         case KSSTATE_STOP:
@@ -1196,58 +1204,31 @@ NTSTATUS CMiniportWaveRTStream::SetState
                 // Acquire stream resources
             }
 
-            // Ensure Mic sink, format, and DMA stash are cleared on stop.
-            if (m_bCapture && m_pMiniport)
-            {
-                PLOOPBACK_BUFFER pLB = NULL;
-                if (m_pMiniport->m_DeviceType == eCableAMic)
-                    pLB = &g_CableALoopback;
-                else if (m_pMiniport->m_DeviceType == eCableBMic)
-                    pLB = &g_CableBLoopback;
-                if (pLB)
-                {
-                    LoopbackUnregisterMicSink(pLB);
-                    LoopbackUnregisterFormat(pLB, FALSE);
-                    KIRQL irql;
-                    KeAcquireSpinLock(&pLB->SpinLock, &irql);
-                    pLB->MicDmaStash = NULL;
-                    pLB->MicDmaStashSize = 0;
-                    KeReleaseSpinLock(&pLB->SpinLock, irql);
-                }
-            }
+            // [OLD PATH DISABLED — FRAME_PIPE handles Mic stop via FramePipeUnregisterFormat below]
 
-            // Phase 4: Speaker stop - unregister format and reset loopback ring buffer.
-            if (!m_bCapture && m_pMiniport)
+            // [OLD PATH DISABLED — FRAME_PIPE handles Speaker stop via FramePipeUnregisterFormat below]
+
+            // FRAME_PIPE: unregister format on stop
+            if (m_pMiniport)
             {
-                PLOOPBACK_BUFFER pLB = NULL;
-                if (m_pMiniport->m_DeviceType == eCableASpeaker)
-                    pLB = &g_CableALoopback;
-                else if (m_pMiniport->m_DeviceType == eCableBSpeaker)
-                    pLB = &g_CableBLoopback;
-                if (pLB)
+                PFRAME_PIPE pFP = NULL;
+                BOOLEAN fpIsSpeaker = !m_bCapture;
+                if (m_bCapture)
                 {
-                    LoopbackUnregisterFormat(pLB, TRUE);
-                    LoopbackReset(pLB);
-                    // Keep MicSink registered if Mic is still running,
-                    // so Speaker restart resumes direct-push immediately.
-                    // MicSink.TotalBytesWritten is reset so the new session
-                    // starts with correct position tracking.
-                    KIRQL lbIrql;
-                    KeAcquireSpinLock(&pLB->SpinLock, &lbIrql);
-                    if (!pLB->MicSink.Active)
-                    {
-                        // Mic already stopped - safe to fully unregister
-                        KeReleaseSpinLock(&pLB->SpinLock, lbIrql);
-                        LoopbackUnregisterMicSink(pLB);
-                    }
-                    else
-                    {
-                        // Mic still active - reset counters but keep sink registered
-                        pLB->MicSink.WritePos = 0;
-                        pLB->MicSink.TotalBytesWritten = 0;
-                        KeReleaseSpinLock(&pLB->SpinLock, lbIrql);
-                    }
+                    if (m_pMiniport->m_DeviceType == eCableAMic)
+                        pFP = &g_CableAPipe;
+                    else if (m_pMiniport->m_DeviceType == eCableBMic)
+                        pFP = &g_CableBPipe;
                 }
+                else
+                {
+                    if (m_pMiniport->m_DeviceType == eCableASpeaker)
+                        pFP = &g_CableAPipe;
+                    else if (m_pMiniport->m_DeviceType == eCableBSpeaker)
+                        pFP = &g_CableBPipe;
+                }
+                if (pFP)
+                    FramePipeUnregisterFormat(pFP, fpIsSpeaker);
             }
 
             KeAcquireSpinLock(&m_PositionSpinLock, &oldIrql);
@@ -1291,25 +1272,10 @@ NTSTATUS CMiniportWaveRTStream::SetState
                 // Run -> Pause
                 //
 
-                // Unregister Mic DMA sink, format, and stash before stopping timer.
-                if (m_bCapture && m_pMiniport)
-                {
-                    PLOOPBACK_BUFFER pLB = NULL;
-                    if (m_pMiniport->m_DeviceType == eCableAMic)
-                        pLB = &g_CableALoopback;
-                    else if (m_pMiniport->m_DeviceType == eCableBMic)
-                        pLB = &g_CableBLoopback;
-                    if (pLB)
-                    {
-                        LoopbackUnregisterMicSink(pLB);
-                        LoopbackUnregisterFormat(pLB, FALSE);
-                        KIRQL irql;
-                        KeAcquireSpinLock(&pLB->SpinLock, &irql);
-                        pLB->MicDmaStash = NULL;
-                        pLB->MicDmaStashSize = 0;
-                        KeReleaseSpinLock(&pLB->SpinLock, irql);
-                    }
-                }
+                // FRAME_PIPE: do NOT unregister on Pause.
+                // Windows audio engine pauses/resumes streams frequently between audio chunks.
+                // Unregistering on Pause causes pipe drain → massive underrun.
+                // Only STOP should unregister.
 
                 // Pause DMA
                 if (m_ulNotificationIntervalMs > 0)
@@ -1338,67 +1304,40 @@ NTSTATUS CMiniportWaveRTStream::SetState
             break;
 
         case KSSTATE_RUN:
-            // Register stream format and Mic DMA sink for loopback.
+            // FRAME_PIPE: register stream format on RUN
             if (m_pMiniport && m_pWfExt)
             {
-                PLOOPBACK_BUFFER pLB = NULL;
-                BOOLEAN isSpeaker = FALSE;
+                PFRAME_PIPE pFP = NULL;
+                BOOLEAN fpIsSpeaker = !m_bCapture;
                 if (m_bCapture)
                 {
                     if (m_pMiniport->m_DeviceType == eCableAMic)
-                        pLB = &g_CableALoopback;
+                        pFP = &g_CableAPipe;
                     else if (m_pMiniport->m_DeviceType == eCableBMic)
-                        pLB = &g_CableBLoopback;
-                    isSpeaker = FALSE;
+                        pFP = &g_CableBPipe;
                 }
                 else
                 {
                     if (m_pMiniport->m_DeviceType == eCableASpeaker)
-                        pLB = &g_CableALoopback;
+                        pFP = &g_CableAPipe;
                     else if (m_pMiniport->m_DeviceType == eCableBSpeaker)
-                        pLB = &g_CableBLoopback;
-                    isSpeaker = TRUE;
+                        pFP = &g_CableBPipe;
                 }
-                if (pLB)
+                if (pFP)
                 {
                     BOOLEAN isFloat = (BOOLEAN)IsEqualGUIDAligned(
                         m_pWfExt->SubFormat, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT);
-                    LoopbackRegisterFormat(pLB, isSpeaker,
+                    FramePipeRegisterFormat(pFP, fpIsSpeaker,
                         m_pWfExt->Format.nSamplesPerSec,
                         m_pWfExt->Format.wBitsPerSample,
                         m_pWfExt->Format.nChannels,
                         m_pWfExt->Format.nBlockAlign,
                         isFloat);
-                    // LoopbackRegisterFormat auto-activates MicSink if
-                    // FormatMatch transitions FALSE->TRUE and DMA is stashed.
                 }
             }
+            // [OLD PATH DISABLED — LoopbackRegisterFormat, MicSink stash/register removed]
 
-            // Mic RUN: stash DMA info and register MicSink if formats match.
-            if (m_bCapture && m_pMiniport && m_pDmaBuffer)
-            {
-                PLOOPBACK_BUFFER pLB = NULL;
-                if (m_pMiniport->m_DeviceType == eCableAMic)
-                    pLB = &g_CableALoopback;
-                else if (m_pMiniport->m_DeviceType == eCableBMic)
-                    pLB = &g_CableBLoopback;
-                if (pLB)
-                {
-                    // Always stash Mic DMA info for deferred MicSink activation.
-                    KIRQL irql;
-                    KeAcquireSpinLock(&pLB->SpinLock, &irql);
-                    pLB->MicDmaStash = m_pDmaBuffer;
-                    pLB->MicDmaStashSize = m_ulDmaBufferSize;
-                    KeReleaseSpinLock(&pLB->SpinLock, irql);
-
-                    if (pLB->FormatMatch)
-                    {
-                        LoopbackRegisterMicSink(pLB, m_pDmaBuffer, m_ulDmaBufferSize);
-                    }
-                }
-            }
-
-            // Phase 2: Zero-fill DMA buffer to prevent garbage data at stream start
+            // Zero-fill DMA buffer to prevent garbage data at stream start
             if (m_pDmaBuffer && m_ulDmaBufferSize > 0)
             {
                 RtlZeroMemory(m_pDmaBuffer, m_ulDmaBufferSize);
@@ -1503,55 +1442,8 @@ VOID CMiniportWaveRTStream::UpdatePosition
         m_ulBlockAlignCarryForward = totalBytes - ByteDisplacement;
     }
 
-    // Phase 3+8: For Cable Mic with active MicSink, ensure position always
-    // advances at normal rate (glitch-free). When Mic is ahead of Speaker,
-    // zero-fill the DMA gap to replace stale data with silence.
-    if (m_bCapture && m_pMiniport && m_pDmaBuffer)
-    {
-        PLOOPBACK_BUFFER pLB = NULL;
-        eDeviceType dt = m_pMiniport->GetDeviceType();
-        if (dt == eCableAMic)
-            pLB = &g_CableALoopback;
-        else if (dt == eCableBMic)
-            pLB = &g_CableBLoopback;
-
-        if (pLB)
-        {
-            KIRQL lbIrql;
-            KeAcquireSpinLock(&pLB->SpinLock, &lbIrql);
-
-            if (pLB->MicSink.Active)
-            {
-                // Use monotonic counters to avoid circular buffer math ambiguity
-                ULONGLONG spkWritten = pLB->MicSink.TotalBytesWritten;
-                ULONGLONG micPos = m_ullLinearPosition;
-                ULONGLONG micEnd = micPos + ByteDisplacement;
-
-                if (micEnd > spkWritten)
-                {
-                    // Mic is ahead of Speaker - zero-fill gap in DMA
-                    ULONG availBytes = (spkWritten > micPos) ?
-                        (ULONG)(spkWritten - micPos) : 0;
-                    ULONG gapBytes = ByteDisplacement - availBytes;
-                    ULONG gapStart = (ULONG)((micPos + availBytes) % m_ulDmaBufferSize);
-
-                    // Zero-fill to replace stale data with silence
-                    ULONG rem = gapBytes;
-                    ULONG pos = gapStart;
-                    while (rem > 0)
-                    {
-                        ULONG chunk = min(rem, m_ulDmaBufferSize - pos);
-                        RtlZeroMemory(m_pDmaBuffer + pos, chunk);
-                        pos = (pos + chunk) % m_ulDmaBufferSize;
-                        rem -= chunk;
-                    }
-                    // Position advances normally - no clamping
-                }
-            }
-
-            KeReleaseSpinLock(&pLB->SpinLock, lbIrql);
-        }
-    }
+    // [OLD PATH DISABLED — MicSink gap zero-fill removed.
+    //  FRAME_PIPE handles underrun silence via FramePipeReadFrames zero-fill.]
 
     // Increment presentation position even after last buffer is rendered.
     m_ullPresentationPosition += ByteDisplacement;
@@ -1638,43 +1530,29 @@ For other devices: output silence (original behavior).
     ULONG fadeStartOffset = bufferOffset;
     ULONG totalBytes = ByteDisplacement;
 
-    // WriteBytes = capture device. Cable MIC reads from loopback ring.
-    PLOOPBACK_BUFFER pLoopback = NULL;
+    // WriteBytes = capture device. Cable MIC reads from pipe.
+    PFRAME_PIPE pPipe = NULL;
     CMiniportWaveRT* pMiniport = m_pMiniport;
     eDeviceType devType = eMaxDeviceType;
     if (pMiniport)
     {
         devType = pMiniport->m_DeviceType;
         if (devType == eCableAMic)
-            pLoopback = &g_CableALoopback;
+            pPipe = &g_CableAPipe;
         else if (devType == eCableBMic)
-            pLoopback = &g_CableBLoopback;
+            pPipe = &g_CableBPipe;
     }
 
-    if (pLoopback && pLoopback->MicSink.Active && pLoopback->FormatMatch)
+    // FRAME_PIPE: always pull from pipe (no MicSink direct-push path)
     {
-        // Speaker DPC already pushed data directly into our DMA buffer (passthrough).
-        // Gap regions were zero-filled by UpdatePosition (Phase 8).
-        // No copy needed here.
-    }
-    else
-    {
-        // Phase 5: MicSink not active, or format mismatch requires conversion.
-        // Pull from loopback ring with format conversion if needed.
         while (ByteDisplacement > 0)
         {
             ULONG runWrite = min(ByteDisplacement, m_ulDmaBufferSize - bufferOffset);
 
-            if (pLoopback)
+            if (pPipe)
             {
-                if (pLoopback->FormatMatch)
-                {
-                    LoopbackRead(pLoopback, m_pDmaBuffer + bufferOffset, runWrite);
-                }
-                else
-                {
-                    LoopbackReadConverted(pLoopback, m_pDmaBuffer + bufferOffset, runWrite);
-                }
+                // Pipe read → channel map → denormalize → DMA
+                FramePipeReadToDma(pPipe, m_pDmaBuffer + bufferOffset, runWrite);
             }
             else
             {
@@ -1797,39 +1675,32 @@ For other devices: save data to file (original behavior).
 {
     ULONG bufferOffset = m_ullLinearPosition % m_ulDmaBufferSize;
 
-    // ReadBytes = render device. Cable SPEAKER writes to loopback ring.
-    PLOOPBACK_BUFFER pLoopback = NULL;
+    // ReadBytes = render device. Cable SPEAKER writes to loopback.
+    PFRAME_PIPE pPipe = NULL;
     CMiniportWaveRT* pMiniport = m_pMiniport;
     eDeviceType devType = eMaxDeviceType;
     if (pMiniport)
     {
         devType = pMiniport->m_DeviceType;
         if (devType == eCableASpeaker)
-            pLoopback = &g_CableALoopback;
+            pPipe = &g_CableAPipe;
         else if (devType == eCableBSpeaker)
-            pLoopback = &g_CableBLoopback;
+            pPipe = &g_CableBPipe;
     }
 
 #if DBG
-    DbgPrint("AO_DBG ReadBytes: DeviceType=%d, ByteDisp=%lu, pLoopback=%p\n",
-        (int)devType, ByteDisplacement, pLoopback);
+    DbgPrint("AO_DBG ReadBytes: DeviceType=%d, ByteDisp=%lu, pPipe=%p\n",
+        (int)devType, ByteDisplacement, pPipe);
 #endif
 
     while (ByteDisplacement > 0)
     {
         ULONG runWrite = min(ByteDisplacement, m_ulDmaBufferSize - bufferOffset);
 
-        if (pLoopback)
+        if (pPipe)
         {
-            // Cable speaker: push app audio into loopback ring buffer
-            if (pLoopback->FormatMatch)
-            {
-                LoopbackWrite(pLoopback, m_pDmaBuffer + bufferOffset, runWrite);
-            }
-            else
-            {
-                LoopbackWriteConverted(pLoopback, m_pDmaBuffer + bufferOffset, runWrite);
-            }
+            // FRAME_PIPE: normalize + channel map + pipe write
+            FramePipeWriteFromDma(pPipe, m_pDmaBuffer + bufferOffset, runWrite);
         }
 #if !defined(CABLE_A) && !defined(CABLE_B)
         else

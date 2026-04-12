@@ -1,6 +1,64 @@
 # Pipeline V2 Changelog
 
-## 2026-04-12
+## 2026-04-12 — Fixed Pipe Rewrite
+
+### Phase 2 fix: Old path disable + rate mismatch fail-closed
+
+**Files changed:**
+- `Source/Main/minwavertstream.cpp` — Disabled: LoopbackRegisterFormat/UnregisterFormat/MicSink stash/register in RUN/STOP/PAUSE, MicSink gap zero-fill in UpdatePosition. Added: Speaker PAUSE → FramePipeUnregisterFormat (fixes ActiveRenderCount drift).
+- `Source/Utilities/loopback.cpp` — WriteFromDma: !SpeakerSameRate → drop entire batch + DropCount. ReadToDma: !MicSameRate || !MicActive → silence fill.
+
+**What:** Old LOOPBACK_BUFFER control path fully disabled in state transitions — no more LoopbackRegisterFormat, MicSink, MicDmaStash calls. Rate mismatch is fail-closed: data dropped (speaker) or silence (mic) until Phase 3 SRC. Speaker Pause now properly unregisters from FRAME_PIPE.
+
+**Why:** Old and new paths were both active, risking MicSink interference and stale state. Rate guard prevents garbled output from unimplemented SRC path.
+
+**Build:** 17 PASS / 0 FAIL
+
+---
+
+### Phase 2: Stream Integration — DPC Path Rewrite
+
+**Files changed:**
+- `Source/Utilities/loopback.h` — +IsFloat fields (SpeakerIsFloat, MicIsFloat), +Phase 2 API declarations (RegisterFormat, UnregisterFormat, WriteFromDma, ReadToDma)
+- `Source/Utilities/loopback.cpp` — +INT32 ~19-bit normalization helpers (FpNorm16/24/32i/Float, FpDenorm*), +FramePipeRegisterFormat/UnregisterFormat (format state machine with both-stopped reset), +FramePipeWriteFromDma (batch: DMA→normalize→channel map→pipe write), +FramePipeReadToDma (batch: pipe read→channel map→denormalize→DMA)
+- `Source/Main/adapter.cpp` — +FramePipeInit in DriverEntry (ms→targetFillFrames conversion), +FramePipeCleanup in unload and error paths
+- `Source/Main/minwavertstream.cpp` — ReadBytes: g_CableALoopback→g_CableAPipe, LoopbackWrite/WriteConverted→FramePipeWriteFromDma. WriteBytes: MicSink direct-push path removed, LoopbackRead/ReadConverted→FramePipeReadToDma. SetState RUN: +FramePipeRegisterFormat. SetState STOP/PAUSE: +FramePipeUnregisterFormat.
+
+**What:** DPC data path now flows through FRAME_PIPE instead of LOOPBACK_BUFFER. Speaker DPC normalizes DMA bytes to INT32 ~19-bit, channel-maps to pipe width, writes via FramePipeWriteFrames (all-or-nothing). Mic DPC reads from pipe, channel-maps, denormalizes to native format, writes to DMA. MicSink direct-push path eliminated — pipe is the sole transport. Old LOOPBACK_BUFFER code still compiled but no longer called from DPC paths.
+
+**Why:** Core transport switch from byte-ring (packed 24-bit, overwrite-oldest) to frame-indexed INT32 pipe (hard reject, explicit fill tracking). This is the functional activation of Phase 1 infrastructure.
+
+**Normalization ranges:**
+- 16-bit: `s16 << 3` (lossless round-trip)
+- 24-bit: `s24 >> 5` (loses lower 5 bits, same as VB-Cable)
+- 32-bit int: `s32 >> 13`
+- 32-bit float: `FloatBitsToInt24(bits) >> 5` (integer-only, DISPATCH safe)
+
+**Build:** 17 PASS / 0 FAIL (build-verify.ps1 Release)
+
+---
+
+### Phase 1: FRAME_PIPE Core Struct + API (feature/ao-fixed-pipe-rewrite)
+
+**Files changed:**
+- `Source/Utilities/loopback.h` — +FRAME_PIPE struct (with FillFrames explicit counter), +constants, +core API declarations, +g_CableAPipe/g_CableBPipe externs
+- `Source/Utilities/loopback.cpp` — +FRAME_PIPE implementation: Init (with re-init guard), Cleanup, WriteFrames (entire-write hard reject), ReadFrames (startup silence + underrun zero-fill), Reset, GetFillFrames, +global instances
+
+**What:** VB-style fixed frame pipe core. INT32 ring buffer indexed by frames with explicit FillFrames counter (no full/empty ambiguity). Hard reject on overflow = entire write rejected (all-or-nothing, DropCount += frameCount). Silence fill on underrun (UnderrunCount++). StartThreshold gate prevents thin-fill at startup. Min gate (FP_MIN_GATE_FRAMES) defined as constant but NOT enforced in core API — DPC layer responsibility. Re-init safe (cleanup-before-init guard). Coexists with existing LOOPBACK_BUFFER — no existing code modified.
+
+**Why:** Replaces byte-ring transport (packed 24-bit, overwrite-oldest) with frame-indexed INT32 pipe per VB-Cable RE findings. This is the foundation for Phase 2 (stream integration) and Phase 3 (format conversion).
+
+**Review fixes (same session):**
+1. Full/empty ambiguity → added `FillFrames` explicit counter (was WriteFrame-ReadFrame diff only)
+2. Overflow partial write → entire write reject (all-or-nothing per architecture plan)
+3. MIN_GATE removed from core WriteFrames → DPC policy layer
+4. Re-init memory leak → cleanup-before-init guard in FramePipeInit
+
+**Build:** 17 PASS / 0 FAIL (build-verify.ps1 Release)
+
+---
+
+## 2026-04-12 — V2 Research (feature/ao-pipeline-v2, frozen)
 
 ### Phase 2: V2 Diagnostics IOCTL + PipeFillFrames + RESET_COUNTERS
 

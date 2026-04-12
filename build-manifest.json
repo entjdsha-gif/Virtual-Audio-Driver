@@ -1,48 +1,48 @@
 ﻿{
-    "config":  "Debug",
-    "timestamp":  "2026-04-10 05:00:18",
+    "config":  "Release",
+    "timestamp":  "2026-04-12 15:19:54",
     "artifacts":  {
                       "aocableb.inf":  {
-                                           "path":  "D:\\mywork\\Virtual-Audio-Driver\\Source\\Main\\x64\\Debug\\CableB\\aocableb.inf",
-                                           "sha256":  "29BAAFE5A396979F599EB08E619B0B86DD1C53189EA2881020DDD655F67A5726",
-                                           "size":  13292,
-                                           "modified":  "2026-04-10 04:59:42"
+                                           "path":  "D:\\mywork\\Virtual-Audio-Driver\\Source\\Main\\x64\\Release\\CableB\\aocableb.inf",
+                                           "sha256":  "5670735A513C51C34963BD676261FAE79427B38FEE4464A97CD3ED5902510C3C",
+                                           "size":  13296,
+                                           "modified":  "2026-04-12 15:19:49"
                                        },
                       "aocableb.sys":  {
-                                           "path":  "D:\\mywork\\Virtual-Audio-Driver\\Source\\Main\\x64\\Debug\\CableB\\aocableb.sys",
-                                           "sha256":  "1CBA5B8987EA690DED29ECE1FE1E44D9861472C8D431607F552431B662DEA786",
-                                           "size":  155616,
-                                           "modified":  "2026-04-10 04:59:43"
+                                           "path":  "D:\\mywork\\Virtual-Audio-Driver\\Source\\Main\\x64\\Release\\CableB\\aocableb.sys",
+                                           "sha256":  "DC1A76EB3FB3FCCEBE244A22046ACCC5DF5AE63CFD8C1D758CBBE9A6AF542837",
+                                           "size":  96784,
+                                           "modified":  "2026-04-12 15:19:53"
                                        },
                       "Utilities.lib":  {
-                                            "path":  "D:\\mywork\\Virtual-Audio-Driver\\Source\\Utilities\\x64\\Debug\\Utilities.lib",
-                                            "sha256":  "DBE69722306CBFFBAD113B9F129FF25D8762FD865DBCAC2E16BEF599459FA9F3",
-                                            "size":  372334,
-                                            "modified":  "2026-04-10 04:53:10"
+                                            "path":  "D:\\mywork\\Virtual-Audio-Driver\\Source\\Utilities\\x64\\Release\\Utilities.lib",
+                                            "sha256":  "87C7C4937163EE8C30E592577CFFEFDAACED7BA017A51ACB80DD7113C8E997CD",
+                                            "size":  362572,
+                                            "modified":  "2026-04-12 15:19:48"
                                         },
                       "aocablea.sys":  {
-                                           "path":  "D:\\mywork\\Virtual-Audio-Driver\\Source\\Main\\x64\\Debug\\CableA\\aocablea.sys",
-                                           "sha256":  "7129BD4EAD1667CC9896E96E84296983D284FC7FBE59E30BEDB0A6E6A38E41DF",
-                                           "size":  155616,
-                                           "modified":  "2026-04-10 04:59:39"
+                                           "path":  "D:\\mywork\\Virtual-Audio-Driver\\Source\\Main\\x64\\Release\\CableA\\aocablea.sys",
+                                           "sha256":  "8318D6CAFEED811D4302867B054F0EE3A40697C6DC9AF8312F98D480E26800E5",
+                                           "size":  96784,
+                                           "modified":  "2026-04-12 15:19:44"
                                        },
                       "aocablea.inf":  {
-                                           "path":  "D:\\mywork\\Virtual-Audio-Driver\\Source\\Main\\x64\\Debug\\CableA\\aocablea.inf",
-                                           "sha256":  "FE082183D33E1CD52C609A0707921B000FB3E3166222DF8A5DAF9CCB240E5176",
-                                           "size":  12942,
-                                           "modified":  "2026-04-10 04:59:37"
+                                           "path":  "D:\\mywork\\Virtual-Audio-Driver\\Source\\Main\\x64\\Release\\CableA\\aocablea.inf",
+                                           "sha256":  "75FAFA4CDE435183FD47E482A4E45D8E8A75CAC58FAC4EF6B6D9156617D2D62E",
+                                           "size":  12944,
+                                           "modified":  "2026-04-12 15:19:40"
                                        },
                       "AOControlPanel.exe":  {
-                                                 "path":  "D:\\mywork\\Virtual-Audio-Driver\\Source\\ControlPanel\\x64\\Debug\\AOControlPanel.exe",
-                                                 "sha256":  "D614C8501B749584FF5231F9CDEA13D3A20218CE395033662B721031BB8D419A",
-                                                 "size":  1255424,
-                                                 "modified":  "2026-04-10 01:57:02"
+                                                 "path":  "D:\\mywork\\Virtual-Audio-Driver\\Source\\ControlPanel\\x64\\Release\\AOControlPanel.exe",
+                                                 "sha256":  "91B5196163F8FA28F453C4DCF6C8CFA8C6E66839A93AE8D42520AB9D3325964A",
+                                                 "size":  152576,
+                                                 "modified":  "2026-04-12 03:29:17"
                                              },
                       "Filters.lib":  {
-                                          "path":  "D:\\mywork\\Virtual-Audio-Driver\\Source\\Filters\\x64\\Debug\\Filters.lib",
-                                          "sha256":  "D348FC1FA9AFEFCD254B9A8EBD6136F1DD7088B4C79DBB405D6DB8CEA2FF4AE6",
-                                          "size":  174498,
-                                          "modified":  "2026-04-10 04:53:11"
+                                          "path":  "D:\\mywork\\Virtual-Audio-Driver\\Source\\Filters\\x64\\Release\\Filters.lib",
+                                          "sha256":  "33D49C59CC1456F236489704F2C4A6FF03CA9A1645A82975088EC837790918DE",
+                                          "size":  151614,
+                                          "modified":  "2026-04-12 15:19:49"
                                       }
                   },
     "platform":  "x64"

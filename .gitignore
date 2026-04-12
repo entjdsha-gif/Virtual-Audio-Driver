@@ -400,3 +400,45 @@ FodyWeavers.xsd
 *.sln.iml
 CLAUDE.md
 nul
+
+# Local AI tooling / scratch
+.claude/
+.tmp-stage-*/
+
+# Local install / restart notes
+audio_restart.txt
+install_log.txt
+install_resume_log.txt
+
+# Generated doc/image artifacts
+docs/VBCABLE_ReferenceManual_pages/
+docs/vbcable2_screenshot.png
+
+# Local installer output staging
+installer/out/
+installer/out*/
+
+# Generated benchmark and call-test artifacts kept out of product branches
+results/AO Cable A/
+results/VB-Cable A/
+results/benchmark_20260410_143156/ao_*/
+results/benchmark_20260410_143156/compare/AO Cable A/
+results/benchmark_20260410_143156/compare/VB-Cable A/
+results/compare_*.json
+results/l02_*.json
+results/q01_*.json
+results/q01_*.wav
+results/q01_*.npy
+results/*_diag.txt
+results/*_install.txt
+results/*diag*.txt
+results/*install*.txt
+results/fresh_install.txt
+results/results.csv
+results/revert*.txt
+results/stream_monitor_call.txt
+results/stream_v2diag.txt
+results/testsign.txt
+results/timing_diag.txt
+results/upgrade_*.txt
+results/verify_v2.txt

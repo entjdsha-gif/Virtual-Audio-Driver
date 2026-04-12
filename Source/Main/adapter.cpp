@@ -236,11 +236,15 @@ Environment:
     //
 #if defined(CABLE_A)
     LoopbackCleanup(&g_CableALoopback);
+    FramePipeCleanup(&g_CableAPipe);
 #elif defined(CABLE_B)
     LoopbackCleanup(&g_CableBLoopback);
+    FramePipeCleanup(&g_CableBPipe);
 #else
     LoopbackCleanup(&g_CableALoopback);
     LoopbackCleanup(&g_CableBLoopback);
+    FramePipeCleanup(&g_CableAPipe);
+    FramePipeCleanup(&g_CableBPipe);
 #endif
 
 Done:
@@ -568,6 +572,43 @@ Return Value:
 #endif
 
     //
+    // Initialize FRAME_PIPE (Phase 2: coexists with LOOPBACK_BUFFER).
+    // TargetFillFrames = (latencyMs * rate) / 1000
+    //
+    {
+        // Large capacity to survive Speaker STOP/RUN gaps (2-3 seconds typical).
+        // TargetFill=96000 (~2s @ 48kHz), Capacity=192000 (~4s).
+        // Memory: 192000 * 8ch * 4bytes = ~6MB per pipe. Acceptable for audio driver.
+        ULONG targetFill = 96000;
+
+#if defined(CABLE_A)
+        ntStatus = FramePipeInit(&g_CableAPipe, savedRate, savedChannels, targetFill);
+        IF_FAILED_ACTION_JUMP(
+            ntStatus,
+            DPF(D_ERROR, ("FramePipeInit CableA failed, 0x%x", ntStatus)),
+            Done);
+#elif defined(CABLE_B)
+        ntStatus = FramePipeInit(&g_CableBPipe, savedRate, savedChannels, targetFill);
+        IF_FAILED_ACTION_JUMP(
+            ntStatus,
+            DPF(D_ERROR, ("FramePipeInit CableB failed, 0x%x", ntStatus)),
+            Done);
+#else
+        ntStatus = FramePipeInit(&g_CableAPipe, savedRate, savedChannels, targetFill);
+        IF_FAILED_ACTION_JUMP(
+            ntStatus,
+            DPF(D_ERROR, ("FramePipeInit CableA failed, 0x%x", ntStatus)),
+            Done);
+
+        ntStatus = FramePipeInit(&g_CableBPipe, savedRate, savedChannels, targetFill);
+        IF_FAILED_ACTION_JUMP(
+            ntStatus,
+            DPF(D_ERROR, ("FramePipeInit CableB failed, 0x%x", ntStatus)),
+            Done);
+#endif
+    }
+
+    //
     // All done.
     //
     ntStatus = STATUS_SUCCESS;
@@ -585,11 +626,15 @@ Done:
 
 #if defined(CABLE_A)
         LoopbackCleanup(&g_CableALoopback);
+        FramePipeCleanup(&g_CableAPipe);
 #elif defined(CABLE_B)
         LoopbackCleanup(&g_CableBLoopback);
+        FramePipeCleanup(&g_CableBPipe);
 #else
         LoopbackCleanup(&g_CableALoopback);
         LoopbackCleanup(&g_CableBLoopback);
+        FramePipeCleanup(&g_CableAPipe);
+        FramePipeCleanup(&g_CableBPipe);
 #endif
 
         if (WdfGetDriver() != NULL)

@@ -1,4 +1,4 @@
-/*++
+﻿/*++
 Module Name:
     loopback.cpp
 Abstract:
@@ -1230,4 +1230,783 @@ NTSTATUS LoopbackSetInternalRate(PLOOPBACK_BUFFER pLoopback, ULONG newRate)
         ExFreePoolWithTag(oldBuf, 'pooL');
 
     return STATUS_SUCCESS;
+}
+
+
+//=============================================================================
+//=============================================================================
+//
+//  FRAME_PIPE Implementation — Fixed Frame Pipe (VB-style transport)
+//  Phase 1: Core ring + write/read + diagnostics
+//
+//=============================================================================
+//=============================================================================
+
+// Pool tag for Frame Pipe allocations
+#define FP_POOL_TAG  'ePpF'     // "FpPe"
+
+// Global instances
+FRAME_PIPE g_CableAPipe = { 0 };
+FRAME_PIPE g_CableBPipe = { 0 };
+
+//=============================================================================
+// FramePipeInit — Allocate ring and scratch buffers (PASSIVE_LEVEL)
+//=============================================================================
+#pragma code_seg("PAGE")
+NTSTATUS FramePipeInit(
+    PFRAME_PIPE     pPipe,
+    ULONG           pipeSampleRate,
+    ULONG           pipeChannels,
+    ULONG           targetFillFrames)
+{
+    PAGED_CODE();
+
+    if (!pPipe || pipeChannels == 0 || pipeChannels > FP_MAX_CHANNELS ||
+        pipeSampleRate == 0)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    // Guard against re-init: clean up existing allocations first
+    if (pPipe->Initialized)
+        FramePipeCleanup(pPipe);
+
+    // Clamp target fill
+    if (targetFillFrames < FP_MIN_TARGET_FILL)
+        targetFillFrames = FP_MIN_TARGET_FILL;
+    if (targetFillFrames > FP_MAX_TARGET_FILL)
+        targetFillFrames = FP_MAX_TARGET_FILL;
+
+    ULONG capacityFrames = targetFillFrames * FP_CAPACITY_MULTIPLIER;
+    ULONG ringBytes = capacityFrames * pipeChannels * sizeof(INT32);
+    ULONG scratchBytes = targetFillFrames * pipeChannels * sizeof(INT32);
+
+    // Allocate ring buffer (NonPagedPoolNx — used at DISPATCH_LEVEL)
+    INT32* ringBuf = (INT32*)ExAllocatePool2(POOL_FLAG_NON_PAGED, ringBytes, FP_POOL_TAG);
+    if (!ringBuf)
+        return STATUS_INSUFFICIENT_RESOURCES;
+
+    // Allocate scratch DMA buffer
+    BYTE* scratchDma = (BYTE*)ExAllocatePool2(POOL_FLAG_NON_PAGED, scratchBytes, FP_POOL_TAG);
+    if (!scratchDma)
+    {
+        ExFreePoolWithTag(ringBuf, FP_POOL_TAG);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    // Allocate speaker scratch buffer
+    INT32* scratchSpk = (INT32*)ExAllocatePool2(POOL_FLAG_NON_PAGED, scratchBytes, FP_POOL_TAG);
+    if (!scratchSpk)
+    {
+        ExFreePoolWithTag(scratchDma, FP_POOL_TAG);
+        ExFreePoolWithTag(ringBuf, FP_POOL_TAG);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    // Allocate mic scratch buffer
+    INT32* scratchMic = (INT32*)ExAllocatePool2(POOL_FLAG_NON_PAGED, scratchBytes, FP_POOL_TAG);
+    if (!scratchMic)
+    {
+        ExFreePoolWithTag(scratchSpk, FP_POOL_TAG);
+        ExFreePoolWithTag(scratchDma, FP_POOL_TAG);
+        ExFreePoolWithTag(ringBuf, FP_POOL_TAG);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    // Zero all buffers
+    RtlZeroMemory(ringBuf, ringBytes);
+    RtlZeroMemory(scratchDma, scratchBytes);
+    RtlZeroMemory(scratchSpk, scratchBytes);
+    RtlZeroMemory(scratchMic, scratchBytes);
+
+    // Zero the pipe struct, then fill fields
+    RtlZeroMemory(pPipe, sizeof(FRAME_PIPE));
+
+    pPipe->RingBuffer           = ringBuf;
+    pPipe->PipeChannels         = pipeChannels;
+    pPipe->WriteFrame           = 0;
+    pPipe->ReadFrame            = 0;
+    pPipe->FillFrames           = 0;
+    KeInitializeSpinLock(&pPipe->PipeLock);
+
+    pPipe->PipeSampleRate       = pipeSampleRate;
+    pPipe->PipeBitsPerSample    = 32;
+    pPipe->PipeBlockAlign       = pipeChannels * sizeof(INT32);
+
+    pPipe->TargetFillFrames     = targetFillFrames;
+    pPipe->CapacityFrames       = capacityFrames;
+    // No startup threshold — Mic reads immediately.
+    // This maximizes buffer available during Speaker STOP gaps.
+    // Steady-state fill will be near capacity (VB-Cable behavior).
+    pPipe->StartThresholdFrames = 0;
+    pPipe->StartPhaseComplete   = TRUE;
+
+    pPipe->DropCount            = 0;
+    pPipe->UnderrunCount        = 0;
+    pPipe->ActiveRenderCount    = 0;
+
+    pPipe->ScratchDma           = scratchDma;
+    pPipe->ScratchSpk           = scratchSpk;
+    pPipe->ScratchMic           = scratchMic;
+    pPipe->ScratchSizeBytes     = scratchBytes;
+
+    pPipe->Initialized          = TRUE;
+
+    return STATUS_SUCCESS;
+}
+#pragma code_seg()
+
+//=============================================================================
+// FramePipeCleanup — Free all buffers (PASSIVE_LEVEL)
+//=============================================================================
+#pragma code_seg("PAGE")
+VOID FramePipeCleanup(PFRAME_PIPE pPipe)
+{
+    PAGED_CODE();
+
+    if (!pPipe)
+        return;
+
+    if (pPipe->ScratchSpk)
+    {
+        ExFreePoolWithTag(pPipe->ScratchSpk, FP_POOL_TAG);
+        pPipe->ScratchSpk = NULL;
+    }
+    if (pPipe->ScratchMic)
+    {
+        ExFreePoolWithTag(pPipe->ScratchMic, FP_POOL_TAG);
+        pPipe->ScratchMic = NULL;
+    }
+    if (pPipe->ScratchDma)
+    {
+        ExFreePoolWithTag(pPipe->ScratchDma, FP_POOL_TAG);
+        pPipe->ScratchDma = NULL;
+    }
+    if (pPipe->RingBuffer)
+    {
+        ExFreePoolWithTag(pPipe->RingBuffer, FP_POOL_TAG);
+        pPipe->RingBuffer = NULL;
+    }
+
+    pPipe->Initialized = FALSE;
+}
+#pragma code_seg()
+
+//=============================================================================
+// FramePipeWriteFrames — Speaker DPC writes INT32 frames into pipe
+//
+// Returns: frameCount on success, 0 on reject.
+// Overflow: entire write is rejected (all-or-nothing), DropCount incremented.
+// Min gate (FP_MIN_GATE_FRAMES) is NOT enforced here — that's DPC policy.
+// Called at DISPATCH_LEVEL.
+//=============================================================================
+ULONG FramePipeWriteFrames(
+    PFRAME_PIPE     pPipe,
+    const INT32*    srcFrames,
+    ULONG           frameCount)
+{
+    if (!pPipe || !pPipe->Initialized || !srcFrames || frameCount == 0)
+        return 0;
+
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&pPipe->PipeLock, &oldIrql);
+
+    ULONG capacity = pPipe->CapacityFrames;
+    ULONG channels = pPipe->PipeChannels;
+    ULONG writeIdx = pPipe->WriteFrame;
+    ULONG fill     = pPipe->FillFrames;
+
+    ULONG freeFrames = capacity - fill;
+
+    // Hard reject: entire write rejected if not enough space.
+    if (frameCount > freeFrames)
+    {
+        pPipe->DropCount += frameCount;
+        KeReleaseSpinLock(&pPipe->PipeLock, oldIrql);
+        return 0;
+    }
+
+    ULONG samplesPerFrame = channels;
+    ULONG framesBeforeWrap = capacity - writeIdx;
+
+    if (frameCount <= framesBeforeWrap)
+    {
+        RtlCopyMemory(
+            &pPipe->RingBuffer[writeIdx * samplesPerFrame],
+            srcFrames,
+            frameCount * samplesPerFrame * sizeof(INT32));
+    }
+    else
+    {
+        ULONG firstFrames = framesBeforeWrap;
+        ULONG secondFrames = frameCount - firstFrames;
+
+        RtlCopyMemory(
+            &pPipe->RingBuffer[writeIdx * samplesPerFrame],
+            srcFrames,
+            firstFrames * samplesPerFrame * sizeof(INT32));
+
+        RtlCopyMemory(
+            &pPipe->RingBuffer[0],
+            &srcFrames[firstFrames * samplesPerFrame],
+            secondFrames * samplesPerFrame * sizeof(INT32));
+    }
+
+    pPipe->WriteFrame = (writeIdx + frameCount) % capacity;
+    pPipe->FillFrames = fill + frameCount;
+
+    KeReleaseSpinLock(&pPipe->PipeLock, oldIrql);
+
+    return frameCount;
+}
+
+//=============================================================================
+// FramePipeReadFrames — Mic DPC reads INT32 frames from pipe
+//
+// Returns: number of frames read from ring (0 if silence-filled).
+// Underrun: output is zero-filled, UnderrunCount incremented (frames).
+// Startup: silence until FillFrames reaches StartThresholdFrames.
+// Called at DISPATCH_LEVEL.
+//=============================================================================
+ULONG FramePipeReadFrames(
+    PFRAME_PIPE     pPipe,
+    INT32*          dstFrames,
+    ULONG           frameCount)
+{
+    if (!pPipe || !pPipe->Initialized || !dstFrames || frameCount == 0)
+        return 0;
+
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&pPipe->PipeLock, &oldIrql);
+
+    ULONG capacity = pPipe->CapacityFrames;
+    ULONG channels = pPipe->PipeChannels;
+    ULONG readIdx  = pPipe->ReadFrame;
+    ULONG fill     = pPipe->FillFrames;
+    ULONG samplesPerFrame = channels;
+    ULONG outputSamples = frameCount * samplesPerFrame;
+
+    // Case 1: Startup phase — not yet filled to threshold
+    if (!pPipe->StartPhaseComplete && fill < pPipe->StartThresholdFrames)
+    {
+        RtlZeroMemory(dstFrames, outputSamples * sizeof(INT32));
+        KeReleaseSpinLock(&pPipe->PipeLock, oldIrql);
+        return 0;  // startup silence, not counted as underrun
+    }
+
+    // We've reached threshold at least once
+    pPipe->StartPhaseComplete = TRUE;
+
+    // Case 2: Empty (post-startup)
+    if (fill == 0)
+    {
+        RtlZeroMemory(dstFrames, outputSamples * sizeof(INT32));
+        pPipe->UnderrunCount += frameCount;
+        KeReleaseSpinLock(&pPipe->PipeLock, oldIrql);
+        return 0;
+    }
+
+    // Case 3 & 4: Partial or full read
+    ULONG framesToRead = (fill < frameCount) ? fill : frameCount;
+    ULONG framesBeforeWrap = capacity - readIdx;
+
+    if (framesToRead <= framesBeforeWrap)
+    {
+        RtlCopyMemory(
+            dstFrames,
+            &pPipe->RingBuffer[readIdx * samplesPerFrame],
+            framesToRead * samplesPerFrame * sizeof(INT32));
+    }
+    else
+    {
+        ULONG firstFrames = framesBeforeWrap;
+        ULONG secondFrames = framesToRead - firstFrames;
+
+        RtlCopyMemory(
+            dstFrames,
+            &pPipe->RingBuffer[readIdx * samplesPerFrame],
+            firstFrames * samplesPerFrame * sizeof(INT32));
+
+        RtlCopyMemory(
+            &dstFrames[firstFrames * samplesPerFrame],
+            &pPipe->RingBuffer[0],
+            secondFrames * samplesPerFrame * sizeof(INT32));
+    }
+
+    pPipe->ReadFrame = (readIdx + framesToRead) % capacity;
+    pPipe->FillFrames = fill - framesToRead;
+
+    // Partial read: zero-fill remainder
+    if (framesToRead < frameCount)
+    {
+        ULONG remainFrames = frameCount - framesToRead;
+        RtlZeroMemory(
+            &dstFrames[framesToRead * samplesPerFrame],
+            remainFrames * samplesPerFrame * sizeof(INT32));
+        pPipe->UnderrunCount += remainFrames;
+    }
+
+    KeReleaseSpinLock(&pPipe->PipeLock, oldIrql);
+
+    return framesToRead;
+}
+
+//=============================================================================
+// FramePipeReset — Clear ring state (PASSIVE_LEVEL, after KeFlushQueuedDpcs)
+//=============================================================================
+#pragma code_seg("PAGE")
+VOID FramePipeReset(PFRAME_PIPE pPipe)
+{
+    PAGED_CODE();
+
+    if (!pPipe || !pPipe->Initialized)
+        return;
+
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&pPipe->PipeLock, &oldIrql);
+
+    pPipe->WriteFrame         = 0;
+    pPipe->ReadFrame          = 0;
+    pPipe->FillFrames         = 0;
+    pPipe->StartPhaseComplete = FALSE;
+    pPipe->DropCount          = 0;
+    pPipe->UnderrunCount      = 0;
+
+    // Zero the ring
+    if (pPipe->RingBuffer)
+    {
+        RtlZeroMemory(
+            pPipe->RingBuffer,
+            pPipe->CapacityFrames * pPipe->PipeChannels * sizeof(INT32));
+    }
+
+    KeReleaseSpinLock(&pPipe->PipeLock, oldIrql);
+}
+#pragma code_seg()
+
+//=============================================================================
+// FramePipeGetFillFrames — Query current fill level (any IRQL)
+//=============================================================================
+ULONG FramePipeGetFillFrames(PFRAME_PIPE pPipe)
+{
+    if (!pPipe || !pPipe->Initialized)
+        return 0;
+
+    return pPipe->FillFrames;
+}
+
+
+//=============================================================================
+//=============================================================================
+//
+//  FRAME_PIPE Phase 2: Format Registration + INT32 Normalization +
+//                      Channel Mapping + DMA Batch Conversion
+//
+//=============================================================================
+//=============================================================================
+
+//=============================================================================
+// INT32 ~19-bit normalization helpers (all integer-only, DISPATCH safe)
+//
+// Range: [-262144, +262143] (~18-bit + sign)
+// 16-bit round-trip is lossless: (s16 << 3) >> 3 == s16
+// 24-bit loses lower 5 bits (same trade-off as VB-Cable)
+//=============================================================================
+
+static __forceinline INT32 FpNorm16(INT16 s)
+{
+    return (INT32)s << 3;
+}
+
+static __forceinline INT16 FpDenorm16(INT32 v)
+{
+    return (INT16)(v >> 3);
+}
+
+static __forceinline INT32 FpNorm24(const BYTE* p)
+{
+    // Read 24-bit packed little-endian, sign-extend, shift right 5
+    INT32 s24 = (INT32)(p[0] | (p[1] << 8) | ((INT8)p[2] << 16));
+    return s24 >> 5;
+}
+
+static __forceinline VOID FpDenorm24(INT32 v, BYTE* p)
+{
+    INT32 s24 = v << 5;
+    p[0] = (BYTE)(s24 & 0xFF);
+    p[1] = (BYTE)((s24 >> 8) & 0xFF);
+    p[2] = (BYTE)((s24 >> 16) & 0xFF);
+}
+
+static __forceinline INT32 FpNorm32i(INT32 s)
+{
+    return s >> 13;
+}
+
+static __forceinline INT32 FpDenorm32i(INT32 v)
+{
+    return v << 13;
+}
+
+// Float uses existing FloatBitsToInt24/Int24ToFloatBits → shift by 5
+static __forceinline INT32 FpNormFloat(UINT32 bits)
+{
+    return FloatBitsToInt24(bits) >> 5;
+}
+
+static __forceinline UINT32 FpDenormFloat(INT32 v)
+{
+    return Int24ToFloatBits(v << 5);
+}
+
+//=============================================================================
+// FramePipeRegisterFormat — Stream announces its format (PASSIVE_LEVEL)
+//=============================================================================
+#pragma code_seg("PAGE")
+VOID FramePipeRegisterFormat(
+    PFRAME_PIPE     pPipe,
+    BOOLEAN         isSpeaker,
+    ULONG           sampleRate,
+    ULONG           bitsPerSample,
+    ULONG           nChannels,
+    ULONG           nBlockAlign,
+    BOOLEAN         isFloat)
+{
+    PAGED_CODE();
+
+    if (!pPipe || !pPipe->Initialized)
+        return;
+
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&pPipe->PipeLock, &oldIrql);
+
+    BOOLEAN wasActive = isSpeaker ? pPipe->SpeakerActive : pPipe->MicActive;
+
+    if (isSpeaker)
+    {
+        pPipe->SpeakerSampleRate    = sampleRate;
+        pPipe->SpeakerBitsPerSample = bitsPerSample;
+        pPipe->SpeakerChannels      = nChannels;
+        pPipe->SpeakerBlockAlign    = nBlockAlign;
+        pPipe->SpeakerIsFloat       = isFloat;
+        pPipe->SpeakerActive        = TRUE;
+        pPipe->SpeakerSameRate      = (sampleRate == pPipe->PipeSampleRate);
+        // Do NOT reset pipe or StartPhaseComplete on Speaker re-register.
+        // Ring data and state persist across STOP/RUN gaps (VB-Cable behavior).
+    }
+    else
+    {
+        pPipe->MicSampleRate        = sampleRate;
+        pPipe->MicBitsPerSample     = bitsPerSample;
+        pPipe->MicChannels          = nChannels;
+        pPipe->MicBlockAlign        = nBlockAlign;
+        pPipe->MicIsFloat           = isFloat;
+        pPipe->MicActive            = TRUE;
+        pPipe->MicSameRate          = (sampleRate == pPipe->PipeSampleRate);
+    }
+
+    // Only increment if transitioning from inactive to active
+    if (isSpeaker && !wasActive)
+        pPipe->ActiveRenderCount++;
+
+    KeReleaseSpinLock(&pPipe->PipeLock, oldIrql);
+
+    {
+        const char* id = (pPipe == &g_CableAPipe) ? "A" : (pPipe == &g_CableBPipe) ? "B" : "?";
+        DbgPrint("AO_PIPE[%s]: RegisterFormat %s rate=%u bps=%u ch=%u align=%u float=%d SameRate=%d PipeRate=%u PipeCh=%u\n",
+            id, isSpeaker ? "SPK" : "MIC", sampleRate, bitsPerSample, nChannels, nBlockAlign,
+            (int)isFloat, isSpeaker ? (int)pPipe->SpeakerSameRate : (int)pPipe->MicSameRate,
+            pPipe->PipeSampleRate, pPipe->PipeChannels);
+    }
+}
+#pragma code_seg()
+
+//=============================================================================
+// FramePipeUnregisterFormat — Stream leaving (PASSIVE_LEVEL)
+//=============================================================================
+#pragma code_seg("PAGE")
+VOID FramePipeUnregisterFormat(
+    PFRAME_PIPE     pPipe,
+    BOOLEAN         isSpeaker)
+{
+    PAGED_CODE();
+
+    if (!pPipe || !pPipe->Initialized)
+        return;
+
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&pPipe->PipeLock, &oldIrql);
+
+    if (isSpeaker)
+    {
+        pPipe->SpeakerActive = FALSE;
+        if (pPipe->ActiveRenderCount > 0)
+            pPipe->ActiveRenderCount--;
+    }
+    else
+    {
+        pPipe->MicActive = FALSE;
+    }
+
+    // Both stopped → reset pipe
+    BOOLEAN bothStopped = !pPipe->SpeakerActive && !pPipe->MicActive;
+
+    KeReleaseSpinLock(&pPipe->PipeLock, oldIrql);
+
+    {
+        const char* id = (pPipe == &g_CableAPipe) ? "A" : (pPipe == &g_CableBPipe) ? "B" : "?";
+        DbgPrint("AO_PIPE[%s]: UnregisterFormat %s bothStopped=%d Fill=%u Drop=%u Underrun=%u\n",
+            id, isSpeaker ? "SPK" : "MIC", (int)bothStopped,
+            pPipe->FillFrames, pPipe->DropCount, pPipe->UnderrunCount);
+    }
+
+    if (bothStopped)
+        FramePipeReset(pPipe);
+}
+#pragma code_seg()
+
+//=============================================================================
+// FramePipeWriteFromDma — Speaker DPC batch: DMA bytes → normalize →
+//                         channel map → pipe write (DISPATCH_LEVEL)
+//
+// Returns frames written (0 = rejected or error).
+// Caller loops over DMA wrap boundary; each call gets contiguous bytes.
+//=============================================================================
+ULONG FramePipeWriteFromDma(
+    PFRAME_PIPE     pPipe,
+    const BYTE*     dmaData,
+    ULONG           byteCount)
+{
+    if (!pPipe || !pPipe->Initialized || !pPipe->SpeakerActive ||
+        !dmaData || byteCount == 0)
+    {
+        return 0;
+    }
+
+    // Fail-closed: rate mismatch requires SRC (Phase 3). Drop until then.
+    if (!pPipe->SpeakerSameRate)
+    {
+        ULONG frameCount = byteCount / pPipe->SpeakerBlockAlign;
+        if (frameCount > 0)
+            pPipe->DropCount += frameCount;
+        {
+            const char* id = (pPipe == &g_CableAPipe) ? "A" : (pPipe == &g_CableBPipe) ? "B" : "?";
+            DbgPrint("AO_PIPE[%s] WR: DROP rate mismatch SpkRate=%u PipeRate=%u frames=%u\n",
+                id, pPipe->SpeakerSampleRate, pPipe->PipeSampleRate, frameCount);
+        }
+        return 0;
+    }
+
+    ULONG spkBlockAlign = pPipe->SpeakerBlockAlign;
+    ULONG totalFrames = byteCount / spkBlockAlign;
+    if (totalFrames == 0)
+        return 0;
+
+    ULONG pipeChannels = pPipe->PipeChannels;
+    ULONG spkChannels  = pPipe->SpeakerChannels;
+    ULONG bps          = pPipe->SpeakerBitsPerSample;
+    BOOLEAN isFloat    = pPipe->SpeakerIsFloat;
+    INT32* scratch     = pPipe->ScratchSpk;
+    ULONG maxFrames    = pPipe->ScratchSizeBytes / (pipeChannels * sizeof(INT32));
+    ULONG copyChannels = (spkChannels < pipeChannels) ? spkChannels : pipeChannels;
+
+    ULONG totalWritten = 0;
+    ULONG offset = 0;
+
+    while (offset < totalFrames)
+    {
+        ULONG chunk = totalFrames - offset;
+        if (chunk > maxFrames)
+            chunk = maxFrames;
+
+        // Normalize + channel map into scratch
+        for (ULONG f = 0; f < chunk; f++)
+        {
+            const BYTE* src = dmaData + (offset + f) * spkBlockAlign;
+            INT32* dst = scratch + f * pipeChannels;
+
+            for (ULONG ch = 0; ch < pipeChannels; ch++)
+                dst[ch] = 0;
+
+            if (bps == 16 && !isFloat)
+            {
+                const INT16* s16 = (const INT16*)src;
+                for (ULONG ch = 0; ch < copyChannels; ch++)
+                    dst[ch] = FpNorm16(s16[ch]);
+            }
+            else if (bps == 24 && !isFloat)
+            {
+                for (ULONG ch = 0; ch < copyChannels; ch++)
+                    dst[ch] = FpNorm24(src + ch * 3);
+            }
+            else if (bps == 32 && isFloat)
+            {
+                const UINT32* bits = (const UINT32*)src;
+                for (ULONG ch = 0; ch < copyChannels; ch++)
+                    dst[ch] = FpNormFloat(bits[ch]);
+            }
+            else if (bps == 32 && !isFloat)
+            {
+                const INT32* s32 = (const INT32*)src;
+                for (ULONG ch = 0; ch < copyChannels; ch++)
+                    dst[ch] = FpNorm32i(s32[ch]);
+            }
+        }
+
+        // Write chunk to pipe (all-or-nothing per chunk)
+        ULONG written = FramePipeWriteFrames(pPipe, scratch, chunk);
+        totalWritten += written;
+
+        // If pipe rejected this chunk, stop (pipe full)
+        if (written == 0)
+            break;
+
+        offset += chunk;
+    }
+
+    // Rate-limited diagnostics (~1s interval)
+    pPipe->DbgWriteFrames += totalWritten;
+    {
+        LARGE_INTEGER now;
+        now = KeQueryPerformanceCounter(NULL);
+        LONGLONG elapsed = now.QuadPart - pPipe->DbgLastPrintQpc;
+        if (elapsed > 10000000 || pPipe->DbgLastPrintQpc == 0)
+        {
+            {
+                const char* id = (pPipe == &g_CableAPipe) ? "A" : (pPipe == &g_CableBPipe) ? "B" : "?";
+                DbgPrint("AO_PIPE[%s] WR: Fill=%u/%u Drop=%u Underrun=%u Start=%d "
+                    "ReqF=%u DoneF=%u RdF=%u SpkAct=%d MicAct=%d\n",
+                    id, pPipe->FillFrames, pPipe->CapacityFrames,
+                    pPipe->DropCount, pPipe->UnderrunCount,
+                    (int)pPipe->StartPhaseComplete,
+                    totalFrames, totalWritten, pPipe->DbgReadFrames,
+                    (int)pPipe->SpeakerActive, (int)pPipe->MicActive);
+            }
+            pPipe->DbgWriteFrames = 0;
+            pPipe->DbgReadFrames = 0;
+            pPipe->DbgLastPrintQpc = now.QuadPart;
+        }
+    }
+
+    return totalWritten;
+}
+
+//=============================================================================
+// FramePipeReadToDma — Mic DPC batch: pipe read → channel map →
+//                      denormalize → DMA bytes (DISPATCH_LEVEL)
+//
+// Always fills byteCount bytes. Underrun → silence (handled by ReadFrames).
+//=============================================================================
+VOID FramePipeReadToDma(
+    PFRAME_PIPE     pPipe,
+    BYTE*           dmaData,
+    ULONG           byteCount)
+{
+    if (!pPipe || !pPipe->Initialized || !dmaData || byteCount == 0)
+    {
+        if (dmaData && byteCount > 0)
+            RtlZeroMemory(dmaData, byteCount);
+        return;
+    }
+
+    // Fail-closed: rate mismatch requires SRC (Phase 3). Output silence.
+    if (!pPipe->MicSameRate || !pPipe->MicActive)
+    {
+        // Log once per second max
+        {
+            LARGE_INTEGER now = KeQueryPerformanceCounter(NULL);
+            if (now.QuadPart - pPipe->DbgLastPrintQpc > 10000000 || pPipe->DbgLastPrintQpc == 0)
+            {
+                {
+                    const char* id = (pPipe == &g_CableAPipe) ? "A" : (pPipe == &g_CableBPipe) ? "B" : "?";
+                    DbgPrint("AO_PIPE[%s] RD: SILENCE (MicSameRate=%d MicActive=%d MicRate=%u PipeRate=%u)\n",
+                        id, (int)pPipe->MicSameRate, (int)pPipe->MicActive,
+                        pPipe->MicSampleRate, pPipe->PipeSampleRate);
+                }
+                pPipe->DbgLastPrintQpc = now.QuadPart;
+            }
+        }
+        RtlZeroMemory(dmaData, byteCount);
+        return;
+    }
+
+    ULONG micBlockAlign = pPipe->MicBlockAlign;
+    ULONG totalFrames = byteCount / micBlockAlign;
+    if (totalFrames == 0)
+        return;
+
+    ULONG pipeChannels = pPipe->PipeChannels;
+    ULONG micChannels  = pPipe->MicChannels;
+    ULONG bps          = pPipe->MicBitsPerSample;
+    BOOLEAN isFloat    = pPipe->MicIsFloat;
+    INT32* scratch     = pPipe->ScratchMic;
+    ULONG maxFrames    = pPipe->ScratchSizeBytes / (pipeChannels * sizeof(INT32));
+    ULONG copyChannels = (pipeChannels < micChannels) ? pipeChannels : micChannels;
+
+    ULONG offset = 0;
+
+    while (offset < totalFrames)
+    {
+        ULONG chunk = totalFrames - offset;
+        if (chunk > maxFrames)
+            chunk = maxFrames;
+
+        // Read chunk from pipe (zero-fills on underrun/startup)
+        FramePipeReadFrames(pPipe, scratch, chunk);
+
+        // Channel map + denormalize into DMA
+        for (ULONG f = 0; f < chunk; f++)
+        {
+            INT32* src = scratch + f * pipeChannels;
+            BYTE* dst = dmaData + (offset + f) * micBlockAlign;
+
+            if (bps == 16 && !isFloat)
+            {
+                INT16* d16 = (INT16*)dst;
+                ULONG ch;
+                for (ch = 0; ch < copyChannels; ch++)
+                    d16[ch] = FpDenorm16(src[ch]);
+                for (; ch < micChannels; ch++)
+                    d16[ch] = 0;
+            }
+            else if (bps == 24 && !isFloat)
+            {
+                ULONG ch;
+                for (ch = 0; ch < copyChannels; ch++)
+                    FpDenorm24(src[ch], dst + ch * 3);
+                for (; ch < micChannels; ch++)
+                {
+                    BYTE* p = dst + ch * 3;
+                    p[0] = p[1] = p[2] = 0;
+                }
+            }
+            else if (bps == 32 && isFloat)
+            {
+                UINT32* d32 = (UINT32*)dst;
+                ULONG ch;
+                for (ch = 0; ch < copyChannels; ch++)
+                    d32[ch] = FpDenormFloat(src[ch]);
+                for (; ch < micChannels; ch++)
+                    d32[ch] = 0;
+            }
+            else if (bps == 32 && !isFloat)
+            {
+                INT32* d32 = (INT32*)dst;
+                ULONG ch;
+                for (ch = 0; ch < copyChannels; ch++)
+                    d32[ch] = FpDenorm32i(src[ch]);
+                for (; ch < micChannels; ch++)
+                    d32[ch] = 0;
+            }
+        }
+
+        offset += chunk;
+    }
+
+    pPipe->DbgReadFrames += totalFrames;
+
+    // Handle trailing bytes that don't form a complete frame
+    ULONG usedBytes = totalFrames * micBlockAlign;
+    if (usedBytes < byteCount)
+        RtlZeroMemory(dmaData + usedBytes, byteCount - usedBytes);
 }

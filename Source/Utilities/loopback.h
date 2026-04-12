@@ -1,4 +1,4 @@
-/*++
+﻿/*++
 Module Name:
     loopback.h
 Abstract:
@@ -186,5 +186,161 @@ NTSTATUS LoopbackSetInternalRate(PLOOPBACK_BUFFER pLoopback, ULONG newRate);
 //=============================================================================
 extern LOOPBACK_BUFFER g_CableALoopback;
 extern LOOPBACK_BUFFER g_CableBLoopback;
+
+
+//=============================================================================
+//=============================================================================
+//
+//  FRAME_PIPE — Fixed Frame Pipe (VB-style transport)
+//  Phase 1: Core struct + write/read/diagnostics
+//  Coexists with LOOPBACK_BUFFER until Phase 2 integration.
+//
+//=============================================================================
+//=============================================================================
+
+//=============================================================================
+// Frame Pipe constants
+//=============================================================================
+#define FP_DEFAULT_TARGET_FILL      3584    // ~74ms @ 48kHz (actual latency)
+#define FP_MIN_TARGET_FILL          512     // ~10ms @ 48kHz
+#define FP_MAX_TARGET_FILL          192000  // ~4s @ 48kHz (survive Speaker STOP gaps)
+#define FP_CAPACITY_MULTIPLIER      2       // CapacityFrames = TargetFill * 2
+#define FP_MIN_GATE_FRAMES          8       // skip sub-sample noise (VB reference)
+#define FP_MAX_CHANNELS             16      // static array sizing for SRC state
+
+//=============================================================================
+// FRAME_PIPE structure
+//=============================================================================
+typedef struct _FRAME_PIPE {
+    // ─── INT32 Frame Ring (transport core) ───
+    INT32*              RingBuffer;         // CapacityFrames * PipeChannels INT32 samples
+    ULONG               PipeChannels;       // channels per frame
+    volatile ULONG      WriteFrame;         // producer frame index [0, CapacityFrames)
+    volatile ULONG      ReadFrame;          // consumer frame index [0, CapacityFrames)
+    volatile ULONG      FillFrames;         // explicit fill count (resolves full/empty ambiguity)
+    KSPIN_LOCK          PipeLock;
+
+    // ─── Pipe Format (configured, not dynamic) ───
+    ULONG               PipeSampleRate;     // Hz = configured InternalRate
+    ULONG               PipeBitsPerSample;  // always 32 (INT32)
+    ULONG               PipeBlockAlign;     // PipeChannels * sizeof(INT32)
+
+    // ─── Stream Format Registration ───
+    ULONG               SpeakerSampleRate;
+    ULONG               SpeakerBitsPerSample;
+    ULONG               SpeakerChannels;
+    ULONG               SpeakerBlockAlign;
+    BOOLEAN             SpeakerIsFloat;     // TRUE for IEEE_FLOAT
+    BOOLEAN             SpeakerActive;
+
+    ULONG               MicSampleRate;
+    ULONG               MicBitsPerSample;
+    ULONG               MicChannels;
+    ULONG               MicBlockAlign;
+    BOOLEAN             MicIsFloat;         // TRUE for IEEE_FLOAT
+    BOOLEAN             MicActive;
+
+    // ─── Path Selection ───
+    BOOLEAN             SpeakerSameRate;    // Speaker rate == PipeSampleRate -> no SRC
+    BOOLEAN             MicSameRate;        // Mic rate == PipeSampleRate -> no SRC
+
+    // ─── Fixed Latency (3 separate values) ───
+    ULONG               TargetFillFrames;   // steady-state fill = actual latency
+    ULONG               CapacityFrames;     // ring size = TargetFillFrames * 2
+    ULONG               StartThresholdFrames; // Mic read starts when fill >= this
+    BOOLEAN             StartPhaseComplete; // TRUE after fill >= StartThreshold reached
+
+    // ─── Overflow / Underrun / Diagnostics ───
+    volatile ULONG      DropCount;          // frames rejected on write (pipe full)
+    volatile ULONG      UnderrunCount;      // frames silence-filled on read (post-startup)
+    volatile ULONG      ActiveRenderCount;  // active render streams
+
+    // ─── Scratch Buffers (allocated at PASSIVE, used at DISPATCH) ───
+    // Speaker and Mic DPCs run on separate cores — each needs its own scratch.
+    BYTE*               ScratchDma;         // DMA linearization buffer (future use)
+    INT32*              ScratchSpk;         // Speaker DPC: normalize → pipe write
+    INT32*              ScratchMic;         // Mic DPC: pipe read → denormalize
+    ULONG               ScratchSizeBytes;   // size of each scratch buffer
+
+    // ─── Configuration ───
+    BOOLEAN             Initialized;
+
+    // ─── Debug (rate-limited DbgPrint) ───
+    LONGLONG            DbgLastPrintQpc;    // last print timestamp (QPC ticks)
+    ULONG               DbgWriteFrames;     // frames written since last print
+    ULONG               DbgReadFrames;      // frames read since last print
+} FRAME_PIPE, *PFRAME_PIPE;
+
+//=============================================================================
+// Frame Pipe — Core API (Phase 1)
+//=============================================================================
+
+// Init/Cleanup (PASSIVE_LEVEL)
+NTSTATUS FramePipeInit(
+    PFRAME_PIPE     pPipe,
+    ULONG           pipeSampleRate,     // Hz (e.g. 48000)
+    ULONG           pipeChannels,       // channels per frame (e.g. 2)
+    ULONG           targetFillFrames    // actual latency in frames
+);
+VOID FramePipeCleanup(PFRAME_PIPE pPipe);
+
+// Write/Read (DISPATCH_LEVEL, under PipeLock)
+ULONG FramePipeWriteFrames(
+    PFRAME_PIPE     pPipe,
+    const INT32*    srcFrames,          // PipeChannels INT32s per frame
+    ULONG           frameCount
+);
+ULONG FramePipeReadFrames(
+    PFRAME_PIPE     pPipe,
+    INT32*          dstFrames,          // PipeChannels INT32s per frame
+    ULONG           frameCount
+);
+
+// Reset (PASSIVE_LEVEL, after KeFlushQueuedDpcs)
+VOID FramePipeReset(PFRAME_PIPE pPipe);
+
+// Query (any IRQL)
+ULONG FramePipeGetFillFrames(PFRAME_PIPE pPipe);
+
+//=============================================================================
+// Frame Pipe — Phase 2: Format Registration + DMA Batch API
+//=============================================================================
+
+// Format registration (PASSIVE_LEVEL)
+VOID FramePipeRegisterFormat(
+    PFRAME_PIPE     pPipe,
+    BOOLEAN         isSpeaker,
+    ULONG           sampleRate,
+    ULONG           bitsPerSample,
+    ULONG           nChannels,
+    ULONG           nBlockAlign,
+    BOOLEAN         isFloat
+);
+VOID FramePipeUnregisterFormat(
+    PFRAME_PIPE     pPipe,
+    BOOLEAN         isSpeaker
+);
+
+// Batch DMA conversion (DISPATCH_LEVEL)
+// WriteFromDma: Speaker DPC — normalize + channel map + pipe write
+// Returns frames written (0 = overflow, entire batch rejected)
+ULONG FramePipeWriteFromDma(
+    PFRAME_PIPE     pPipe,
+    const BYTE*     dmaData,        // contiguous DMA bytes in Speaker format
+    ULONG           byteCount
+);
+// ReadToDma: Mic DPC — pipe read + channel map + denormalize
+// Always fills byteCount bytes in DMA (silence on underrun)
+VOID FramePipeReadToDma(
+    PFRAME_PIPE     pPipe,
+    BYTE*           dmaData,        // DMA buffer to fill in Mic format
+    ULONG           byteCount
+);
+
+//=============================================================================
+// Frame Pipe — Global instances
+//=============================================================================
+extern FRAME_PIPE g_CableAPipe;
+extern FRAME_PIPE g_CableBPipe;
 
 #endif

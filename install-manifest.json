@@ -1,16 +1,16 @@
 ﻿{
-    "config":  "Debug",
-    "timestamp":  "2026-04-10 05:01:52",
+    "config":  "Release",
+    "timestamp":  "2026-04-12 15:20:18",
     "artifacts":  {
                       "aocablea.sys":  {
-                                           "sha256":  "C8AE1705FB8FF3D9D5DF7AA785CCC9FE9EC7C9608F702511D7BC19E50CEEB5BD",
-                                           "size":  153976,
-                                           "modified":  "2026-04-10 05:01:43"
+                                           "sha256":  "9A933C7E236806330A52C40081C5CB8A08DFEE9796ABA24A20EE3E658E6D3BD5",
+                                           "size":  95608,
+                                           "modified":  "2026-04-12 15:20:09"
                                        },
                       "aocableb.sys":  {
-                                           "sha256":  "CA436F1D43AAAEF997808E203D08A32BB4227D169C17C4E15542A32588090088",
-                                           "size":  153976,
-                                           "modified":  "2026-04-10 05:01:44"
+                                           "sha256":  "97FD114E2C85EB11197656F1F5881DB7208964F185F6E4C1661CE9176715BE35",
+                                           "size":  95608,
+                                           "modified":  "2026-04-12 15:20:09"
                                        }
                   }
 }
