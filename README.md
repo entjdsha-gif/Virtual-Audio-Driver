@@ -1,6 +1,10 @@
 > [!WARNING]
 > This software is in beta and requires test signing to be enabled.
 
+> [!IMPORTANT]
+> For AO/VB reimplementation work, start with `CODEX.md`, then
+> `docs/VB_CABLE_DUAL_PLAN_OPERATING_RULES.md`.
+
 > [!NOTE]
 > Software Developers/Organizations: Looking to implement Virtual speakers/mics into your app? For advanced/custom functionality like named pipes, shared memory buffers (for no-latency audio), direct integration with your existing apps, and more; Contact us for quotes on a custom build! contact@mikethetech.com
 

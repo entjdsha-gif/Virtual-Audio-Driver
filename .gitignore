@@ -442,3 +442,26 @@ results/testsign.txt
 results/timing_diag.txt
 results/upgrade_*.txt
 results/verify_v2.txt
+
+# Local kernel-debug / reverse-engineering artifacts
+ao_audio.txt
+ao_dump.txt
+ao_dump_err.txt
+ao_events.xml
+ao_trace.etl
+bcdedit.txt
+drivers.txt
+get_drivers.py
+install_log2.txt
+kd_out.txt
+livekd_out.txt
+livekd_result.txt
+read_vbring.py
+run_kd.cmd
+run_livekd.cmd
+run_livekd.ps1
+run_livekd_py.py
+vb_trace.etl
+vbring.txt
+vbring_cmds.txt
+wpr_status.txt
