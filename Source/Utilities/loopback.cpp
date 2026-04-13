@@ -1670,25 +1670,35 @@ static __forceinline VOID FpDenorm24(INT32 v, BYTE* p)
     p[2] = (BYTE)((s24 >> 16) & 0xFF);
 }
 
+// Phase 2 (G9): direct copy matches VB-Cable's observed 32-bit PCM
+// behavior. The pipe carries the application's raw 32-bit samples.
+// Safe on cable-only single-writer / single-reader path; see the
+// Phase 2 proposal (results/phase2_edit_proposal.md §2.3) for the
+// headroom caveat if mixing is ever added in a later phase.
 static __forceinline INT32 FpNorm32i(INT32 s)
 {
-    return s >> 13;
+    return s;
 }
 
+// Phase 2 (G9 mirror): direct copy, symmetric with FpNorm32i.
 static __forceinline INT32 FpDenorm32i(INT32 v)
 {
-    return v << 13;
+    return v;
 }
 
-// Float uses existing FloatBitsToInt24/Int24ToFloatBits → shift by 5
+// Phase 2 (G10): direct bit cast matches VB-Cable's observed 32-bit
+// float behavior. The pipe carries the raw IEEE-754 bit pattern
+// reinterpreted as INT32. Consumer (FpDenormFloat) casts it back.
+// Safe on single-writer / single-reader paired cable.
 static __forceinline INT32 FpNormFloat(UINT32 bits)
 {
-    return FloatBitsToInt24(bits) >> 5;
+    return (INT32)bits;
 }
 
+// Phase 2 (G10 mirror): direct bit cast, symmetric with FpNormFloat.
 static __forceinline UINT32 FpDenormFloat(INT32 v)
 {
-    return Int24ToFloatBits(v << 5);
+    return (UINT32)v;
 }
 
 //=============================================================================

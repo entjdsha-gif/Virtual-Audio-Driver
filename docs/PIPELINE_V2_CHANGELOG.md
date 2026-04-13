@@ -1,5 +1,35 @@
 # Pipeline V2 Changelog
 
+## 2026-04-13 — Phase 2: Format parity fixes for 32-bit PCM and 32-bit float (G9, G10)
+
+**Files changed:**
+- `Source/Utilities/loopback.cpp` — `FpNorm32i`, `FpDenorm32i`, `FpNormFloat`, `FpDenormFloat` now do direct copy / direct bit cast, matching VB-Cable's observed behavior on 32-bit PCM and 32-bit float paths.
+- `docs/VB_CABLE_AO_COMPARISON.md` — §1-3 and §3-2 tables: 32-bit int and 32-bit float rows flip from `❌` to `✅`. 8-bit rows stay `❌ 미구현` and are annotated "deferred — parity-first, no new functionality before parity closure."
+
+**What:** The Phase 1 FRAME_PIPE kept AO's pre-rewrite normalization strategy where 32-bit int samples were right-shifted by 13 on the way in and 32-bit float samples went through `FloatBitsToInt24(bits) >> 5`. Phase 2 replaces both with direct copy so the cable preserves the application's original 32-bit bit pattern bit-for-bit on the cable-only single-writer / single-reader transport.
+
+**Why:** Documented in `docs/VB_CABLE_AO_COMPARISON.md` §1-3 / §3-2. VB-Cable passes 32-bit PCM and 32-bit float through unchanged. AO's pre-Phase-2 behavior truncated 13 bits of INT32 dynamic range and converted float via a 24-bit intermediate, losing ~5 bits of float mantissa precision through the round-trip. The mismatch was identified as G9 (int) and G10 (float) in the Phase 2 target list.
+
+**Parity-first principle:** Phase 2 is governed by the parity-first rule — no new functionality lands until every parity phase is closed. AO must first behave identically to VB-Cable on the paths AO already implements; only after all parity phases are closed may additions / improvements / extensions be considered.
+
+**8-bit (G11) deferred — parity-first:** Inspection during Phase 2 planning found that 8-bit format is not implemented at all in AO — neither `FpNorm8` / `FpDenorm8` nor 8-bit branches exist in `FramePipeWriteFromDma` / `FramePipeReadToDma`. The Claude plan's G11 item was written assuming 8-bit was implemented-but-wrong, which is not the current state. Implementing 8-bit is therefore a new code path, not a parity correction. **Deferred because parity-first, no new functionality before parity closure.** `docs/VB_CABLE_AO_COMPARISON.md` continues to mark the 8-bit rows as `❌ 미구현`.
+
+**32-bit headroom note:** Pipe samples on 32-bit paths now carry the application's raw bit pattern. This is safe on the cable-only single-writer / single-reader transport but eliminates the prior mixing headroom. If a future phase introduces mixing of 32-bit streams on a single pipe, the headroom strategy must be re-evaluated before or alongside that phase. 16-bit and 24-bit paths are unchanged and retain the normalized ~19-bit pipe representation that matches VB-Cable.
+
+**Which helpers stayed:** `FloatBitsToInt24` (lines 73–122) and `Int24ToFloatBits` (lines 124–167) are NOT removed because they are still used by `ReadSample` / `WriteSample` (the legacy `LOOPBACK_BUFFER` path, lines 175 and 196). Only the `FpNormFloat` / `FpDenormFloat` wrappers bypass them after Phase 2. A later phase that removes the LOOPBACK_BUFFER code entirely can re-evaluate those helpers.
+
+**Verification:**
+- `build-verify.ps1 -Config Release` — green, 17 PASS / 0 FAIL.
+- `install.ps1 -Action upgrade` — `INSTALL_EXIT=0`.
+- `test_ioctl_diag.py` — `ALL PASSED` on both cables (V1 IOCTL path intact).
+- `test_stream_monitor.py --once` — Phase 1 counters stay at 0, `StructSize == 116`, no new divergence.
+
+**Exit criteria (Codex Phase 2):** AO builds, format-focused tests stay green, no transport ownership change. All met.
+
+**Rollback:** `git revert <this commit>`, rebuild, reinstall.
+
+---
+
 ## 2026-04-13 — Phase 1: Diagnostic counters and rollout scaffolding
 
 **Files changed:**

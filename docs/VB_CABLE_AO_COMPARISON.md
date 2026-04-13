@@ -26,11 +26,11 @@
 
 | Format | VB-Cable | AO | Match |
 |--------|----------|-----|-------|
-| 8-bit | `(byte - 0x80) * 0x800` (<<11) | 미구현 | ❌ |
+| 8-bit | `(byte - 0x80) * 0x800` (<<11) | 미구현 | ❌ deferred — parity-first, no new functionality before parity closure |
 | 16-bit | `short << 3` | `FpNorm16: (INT32)s << 3` | ✅ 동일 |
 | 24-bit | `(3bytes << 8) >> 13` (net >>5) | `FpNorm24: Read24() >> 5` | ✅ 동일 결과 |
-| 32-bit int | memcpy (원본 유지) | `FpNorm32i: s >> 13` | ❌ VB: 원본 유지. AO: >>13 정규화 |
-| 32-bit float | memcpy (원본 유지) | `FpNormFloat: FloatBitsToInt24() >> 5` | ❌ VB: 원본 유지. AO: float→INT24→>>5 |
+| 32-bit int | memcpy (원본 유지) | `FpNorm32i: direct copy` (Phase 2 / G9) | ✅ 동일 |
+| 32-bit float | memcpy (원본 유지) | `FpNormFloat: (INT32)bits` 직접 캐스트 (Phase 2 / G10) | ✅ 동일 |
 
 ---
 
@@ -100,11 +100,11 @@
 
 | Format | VB-Cable | AO | Match |
 |--------|----------|-----|-------|
-| 8-bit | `(INT32 >> 11) + 0x80` | 미구현 | ❌ |
+| 8-bit | `(INT32 >> 11) + 0x80` | 미구현 | ❌ deferred — parity-first, no new functionality before parity closure |
 | 16-bit | `INT32 >> 3` | `FpDenorm16: (INT16)(v >> 3)` | ✅ 동일 |
 | 24-bit | `INT32 << 5` → 3 bytes | `FpDenorm24: (v << 5)` → 3 bytes | ✅ 동일 |
-| 32-bit int | memcpy | `FpDenorm32i: v << 13` | ❌ |
-| 32-bit float | memcpy | `FpDenormFloat: Int24ToFloatBits(v << 5)` | ❌ |
+| 32-bit int | memcpy | `FpDenorm32i: direct copy` (Phase 2 / G9 mirror) | ✅ 동일 |
+| 32-bit float | memcpy | `FpDenormFloat: (UINT32)v` 직접 캐스트 (Phase 2 / G10 mirror) | ✅ 동일 |
 
 ### 3-3. Mic DPC가 Speaker 상태를 체크하는가?
 
