@@ -1,5 +1,25 @@
 # Pipeline V2 Changelog
 
+## 2026-04-13 — Driver INF target OS widening
+
+**Files changed:**
+- `Source/Main/aocablea.inx` — `NT$ARCH$.10.0...22000` → `NT$ARCH$.10.0...14393` in both `[Manufacturer]` and the `[AOCABLEA.NT$ARCH$.14393]` Models section header.
+- `Source/Main/aocableb.inx` — same change for `[AOCABLEB...]`.
+- `Source/Main/VirtualAudioDriver.inx` — same change for `[VIRTUALAUDIODRIVER...]`.
+
+**What:** Lowered the minimum target OS build number encoded in every driver INF from 22000 (Windows 11 21H2) to 14393 (Windows 10 1607 / LTSC 2016). No C++ or H changes; only the INF sectioning used by PnP manager to decide installability.
+
+**Why:** The prior value restricted installs to Windows 11 only. Target PCs running Windows 10 22H2 (build 19045) were rejected by PnP manager with no error surfaced past `devcon update` — the symptom was `devcon.exe failed` and `Expected 2 active devices, found 0`. 14393 is the lowest value WDK 10.0.26100 `infverif` accepts with an explicit build number (it rejects 10240 and below with `ERROR(1288): must be '10.0.14310' or greater`). 14393 covers Windows 10 1607 LTSC 2016, all later Windows 10 releases (1709–22H2), all Windows 11 releases, and Windows Server 2016/2019/2022/2025.
+
+**Verification:**
+- `infverif /v /w` on the built `aocablea.inf` and `aocableb.inf`: passes (previously failed with `ERROR(1288)` when tried at 10240).
+- Host (Windows 11 26200) install via `install.ps1 -Action upgrade`: `INSTALL_EXIT=0`, `test_ioctl_diag.py` reports `ALL PASSED` for Cable A and Cable B.
+- Target PC (Windows 10 22H2 / build 19045): installer package built from this INF reaches `Installation complete!`; both AO Cable A and AO Cable B appear in sound settings. This is what unblocked the Phase 0 Step 4/5 two-box KDNET target.
+
+**Non-goal:** runtime driver behavior is unchanged. This is an installability-only fix.
+
+---
+
 ## 2026-04-12 — Fixed Pipe Rewrite
 
 ### Phase 2 fix: Old path disable + rate mismatch fail-closed
