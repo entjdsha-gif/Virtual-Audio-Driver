@@ -1345,6 +1345,22 @@ NTSTATUS FramePipeInit(
     pPipe->UnderrunCount        = 0;
     pPipe->ActiveRenderCount    = 0;
 
+    // Phase 1: per-direction pump counters — all zero at init.
+    // Phase 1 has no writer for any of these fields; Phase 3 is the first.
+    pPipe->RenderGatedSkipCount             = 0;
+    pPipe->RenderOverJumpCount              = 0;
+    pPipe->RenderFramesProcessedTotal       = 0;
+    pPipe->RenderPumpInvocationCount        = 0;
+    pPipe->RenderPumpShadowDivergenceCount  = 0;
+    pPipe->RenderPumpFeatureFlags           = 0;
+
+    pPipe->CaptureGatedSkipCount            = 0;
+    pPipe->CaptureOverJumpCount             = 0;
+    pPipe->CaptureFramesProcessedTotal      = 0;
+    pPipe->CapturePumpInvocationCount       = 0;
+    pPipe->CapturePumpShadowDivergenceCount = 0;
+    pPipe->CapturePumpFeatureFlags          = 0;
+
     pPipe->ScratchDma           = scratchDma;
     pPipe->ScratchSpk           = scratchSpk;
     pPipe->ScratchMic           = scratchMic;
@@ -1571,6 +1587,22 @@ VOID FramePipeReset(PFRAME_PIPE pPipe)
     pPipe->StartPhaseComplete = FALSE;
     pPipe->DropCount          = 0;
     pPipe->UnderrunCount      = 0;
+
+    // Phase 1: per-session pump counters reset on ring reset.
+    // Mirrors VB FUN_1400039ac — per-session fields cleared so the user
+    // sees a clean slate on each RUN, while monotonic run-totals survive
+    // so Phase 3's shadow-window divergence ratio stays measurable across
+    // RUN -> PAUSE -> RUN cycles.
+    pPipe->RenderGatedSkipCount  = 0;
+    pPipe->RenderOverJumpCount   = 0;
+    pPipe->CaptureGatedSkipCount = 0;
+    pPipe->CaptureOverJumpCount  = 0;
+
+    // Do NOT reset on session boundary (monotonic):
+    //   Render/CaptureFramesProcessedTotal
+    //   Render/CapturePumpInvocationCount
+    //   Render/CapturePumpShadowDivergenceCount
+    //   Render/CapturePumpFeatureFlags
 
     // Zero the ring
     if (pPipe->RingBuffer)

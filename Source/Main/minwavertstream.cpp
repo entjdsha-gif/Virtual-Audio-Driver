@@ -236,6 +236,24 @@ Return Value:
     m_bLastBufferRendered = FALSE;
     m_ulFadeInRemaining = 0;
 
+    // Phase 1: pump state zeros (matches new fields in minwavertstream.h).
+    // No Phase 1 code path writes any non-zero into these; Phase 3 is the
+    // first writer. Guarantees the "idle = 0" Exit Criterion.
+    m_ullPumpBaselineHns                    = 0;
+    m_ulPumpProcessedFrames                 = 0;
+    m_bPumpInitialized                      = FALSE;
+    m_ulPumpLastBufferOffset                = 0;
+    m_ulPumpInvocationCount                 = 0;
+    m_ulPumpGatedSkipCount                  = 0;
+    m_ulPumpOverJumpCount                   = 0;
+    m_ulPumpShadowDivergenceCount           = 0;
+    m_ullPumpFramesProcessed                = 0;
+    m_ulPumpFeatureFlags                    = 0;
+    m_ullPumpShadowWindowPumpFrames         = 0;
+    m_ullPumpShadowWindowLegacyBytes        = 0;
+    m_ulPumpShadowWindowCallCount           = 0;
+    m_ulLastUpdatePositionByteDisplacement  = 0;
+
 #if !defined(CABLE_A) && !defined(CABLE_B)
     m_ulHostCaptureToneFrequency = IsEqualGUID(SignalProcessingMode, AUDIO_SIGNALPROCESSINGMODE_RAW) ? 1000 : 2000;
     m_dwHostCaptureToneAmplitude = 50;

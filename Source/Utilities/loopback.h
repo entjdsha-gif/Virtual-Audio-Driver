@@ -255,6 +255,37 @@ typedef struct _FRAME_PIPE {
     volatile ULONG      UnderrunCount;      // frames silence-filled on read (post-startup)
     volatile ULONG      ActiveRenderCount;  // active render streams
 
+    // ─── Phase 1: per-direction pump counter pairs (rev 2.4 split) ───
+    // Speaker and Mic streams share one FRAME_PIPE. A single counter would
+    // race between the two DPCs. Per-direction slots remove the race because
+    // only one stream direction ever writes a given slot (Speaker's pump
+    // writes Render*, Mic's pump writes Capture*).
+    //
+    // Phase 1 contract: every field below is zero-initialized in
+    // FramePipeInit and never written by any execution path. Phase 3 is the
+    // first phase that increments these. FramePipeReset is the only place
+    // that touches per-session fields (GatedSkip/OverJump); monotonic
+    // run-totals (Frames/Invocation/ShadowDivergence) and FeatureFlags
+    // survive reset so Phase 3's shadow-window ratio stays measurable
+    // across RUN -> PAUSE -> RUN cycles.
+    volatile ULONG      RenderGatedSkipCount;            // per-session
+    volatile ULONG      RenderOverJumpCount;             // per-session
+    volatile ULONGLONG  RenderFramesProcessedTotal;      // monotonic
+    volatile ULONG      RenderPumpInvocationCount;       // monotonic
+    volatile ULONG      RenderPumpShadowDivergenceCount; // monotonic
+
+    volatile ULONG      CaptureGatedSkipCount;            // per-session
+    volatile ULONG      CaptureOverJumpCount;             // per-session
+    volatile ULONGLONG  CaptureFramesProcessedTotal;      // monotonic
+    volatile ULONG      CapturePumpInvocationCount;       // monotonic
+    volatile ULONG      CapturePumpShadowDivergenceCount; // monotonic
+
+    // Per-direction feature-flag snapshots. Stored non-volatile because they
+    // are set by a stream on SetState transition (rare) and read by the
+    // IOCTL snapshot (also rare). Phase 1 leaves both at zero.
+    ULONG               RenderPumpFeatureFlags;
+    ULONG               CapturePumpFeatureFlags;
+
     // ─── Scratch Buffers (allocated at PASSIVE, used at DISPATCH) ───
     // Speaker and Mic DPCs run on separate cores — each needs its own scratch.
     BYTE*               ScratchDma;         // DMA linearization buffer (future use)

@@ -56,6 +56,74 @@ typedef struct _AO_CONFIG {
     ULONG InternalChannels;     // Internal channel count
 } AO_CONFIG;
 
+//
+// Phase 1: AO_V2_DIAG -- extended diagnostic payload returned by
+// IOCTL_AO_GET_STREAM_STATUS after the AO_STREAM_STATUS block when the
+// caller's output buffer is large enough.
+//
+// Layout contract:
+//   IOCTL_AO_GET_STREAM_STATUS output =
+//     [ AO_STREAM_STATUS ]   // V1, always present
+//     [ AO_V2_DIAG        ]   // V2, present iff OutBufLen >= V1 + V2
+//
+// V1 clients (sizeof(AO_STREAM_STATUS) buffer) never see AO_V2_DIAG.
+// V2 clients (sizeof(AO_STREAM_STATUS) + sizeof(AO_V2_DIAG) buffer)
+// unpack both. First field is StructSize so a V2 client can detect the
+// exact layout it is talking to even if AO_V2_DIAG grows in later phases.
+//
+// Phase 1 contract: every counter is zero-initialized at FramePipeInit
+// and never written by any execution path. Phase 3 is the first phase
+// that increments these. Feature flag slots are declared now, stored as
+// zero, and not read by any Phase 1 code path.
+//
+// Field naming: <Cable>_<Direction>_<Field>
+//   A = Cable A, B = Cable B
+//   R = Render (Speaker stream), C = Capture (Mic stream)
+//
+typedef struct _AO_V2_DIAG {
+    ULONG   StructSize;                     // sizeof(AO_V2_DIAG) as built
+
+    // ----- Cable A Render -----
+    ULONG   A_R_GatedSkipCount;
+    ULONG   A_R_OverJumpCount;
+    ULONG   A_R_FramesProcessedLow;
+    ULONG   A_R_FramesProcessedHigh;
+    ULONG   A_R_PumpInvocationCount;
+    ULONG   A_R_PumpShadowDivergenceCount;
+    ULONG   A_R_PumpFeatureFlags;
+
+    // ----- Cable A Capture -----
+    ULONG   A_C_GatedSkipCount;
+    ULONG   A_C_OverJumpCount;
+    ULONG   A_C_FramesProcessedLow;
+    ULONG   A_C_FramesProcessedHigh;
+    ULONG   A_C_PumpInvocationCount;
+    ULONG   A_C_PumpShadowDivergenceCount;
+    ULONG   A_C_PumpFeatureFlags;
+
+    // ----- Cable B Render -----
+    ULONG   B_R_GatedSkipCount;
+    ULONG   B_R_OverJumpCount;
+    ULONG   B_R_FramesProcessedLow;
+    ULONG   B_R_FramesProcessedHigh;
+    ULONG   B_R_PumpInvocationCount;
+    ULONG   B_R_PumpShadowDivergenceCount;
+    ULONG   B_R_PumpFeatureFlags;
+
+    // ----- Cable B Capture -----
+    ULONG   B_C_GatedSkipCount;
+    ULONG   B_C_OverJumpCount;
+    ULONG   B_C_FramesProcessedLow;
+    ULONG   B_C_FramesProcessedHigh;
+    ULONG   B_C_PumpInvocationCount;
+    ULONG   B_C_PumpShadowDivergenceCount;
+    ULONG   B_C_PumpFeatureFlags;
+} AO_V2_DIAG;
+
+// Compile-time shape guard. Bump this C_ASSERT whenever AO_V2_DIAG grows.
+// Current layout: StructSize + 4 blocks * 7 ULONGs = 29 ULONGs = 116 bytes.
+C_ASSERT(sizeof(AO_V2_DIAG) == (1 + 4 * 7) * sizeof(ULONG));
+
 // Registry value names for persistent settings (stored under service Parameters key)
 // e.g. HKLM\SYSTEM\CurrentControlSet\Services\AOCableA\Parameters
 #define AO_REG_INTERNAL_RATE L"InternalRate"

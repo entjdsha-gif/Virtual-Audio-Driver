@@ -1,5 +1,29 @@
 # Pipeline V2 Changelog
 
+## 2026-04-13 — Phase 1: Diagnostic counters and rollout scaffolding
+
+**Files changed:**
+- `Source/Main/ioctl.h` — +`AO_V2_DIAG` struct (`StructSize` + 4 per-cable-per-direction blocks of 7 ULONGs = 116 bytes) returned via existing `IOCTL_AO_GET_STREAM_STATUS` when the caller's output buffer is large enough. V1 callers unchanged. Compact naming (`A_R_GatedSkipCount` style). `C_ASSERT` on struct shape.
+- `Source/Utilities/loopback.h` — +12 per-direction fields on `FRAME_PIPE`: `RenderGatedSkipCount`, `RenderOverJumpCount`, `RenderFramesProcessedTotal`, `RenderPumpInvocationCount`, `RenderPumpShadowDivergenceCount`, `RenderPumpFeatureFlags`, and `Capture*` mirrors. Per-direction split avoids the Speaker-vs-Mic race inherent in any single-counter design.
+- `Source/Utilities/loopback.cpp` — `FramePipeInit` zeros all new fields. `FramePipeReset` zeros only per-session counters (`RenderGatedSkipCount`, `RenderOverJumpCount`, `CaptureGatedSkipCount`, `CaptureOverJumpCount`) and preserves monotonic run-totals (`*FramesProcessedTotal`, `*PumpInvocationCount`, `*PumpShadowDivergenceCount`, `*PumpFeatureFlags`) so Phase 3's shadow-window divergence ratio stays measurable across RUN→PAUSE→RUN.
+- `Source/Main/minwavertstream.h` — +4 `AO_PUMP_FLAG_*` bit constants (`ENABLE`, `SHADOW_ONLY`, `DISABLE_LEGACY_RENDER`, `DISABLE_LEGACY_CAPTURE`). +14 member fields on `CMiniportWaveRTStream` for pump state, counters, feature flags, and Phase 3 shadow-window accumulators.
+- `Source/Main/minwavertstream.cpp` — `Init()` zeros every new field.
+- `Source/Main/adapter.cpp` — `IOCTL_AO_GET_STREAM_STATUS` handler extended with a length-gated V2 branch that snapshots `g_CableAPipe` / `g_CableBPipe` into `AO_V2_DIAG`. `bytesReturned` now set explicitly in both V1 and V2 paths. +`C_ASSERT(sizeof(AO_V2_DIAG) == 116)` as a belt-and-suspenders shape guard mirroring the one in `ioctl.h`.
+- `test_stream_monitor.py` — speculative V2 parser (Passthrough / PushLoss / PullLoss / ConvOF / ConvSF / PipeFrames / PipeFill / SpkWrite / MicRead / MaxDpcUs / PosJump) removed and replaced with a real `AO_V2_DIAG` parser matching the driver-side struct byte-for-byte. Opens the device with `V1_STATUS_SIZE + V2_DIAG_SIZE = 180` bytes. Displays per-direction counter rows with the derived shadow-divergence ratio (`div / inv * 100`) which is the Phase 3 exit-criterion metric.
+
+**What:** Phase 1 lands the diagnostic data contract and feature-flag skeleton that Phase 3 (pump helper), Phase 5 (render transport rebind), and Phase 6 (capture transport rebind) will read and write. No execution path in Phase 1 ever writes a non-zero value into these fields or reads a feature flag for a decision. Phase 1 is pure declaration plus zero initialization plus an IOCTL surface extension.
+
+**Why:** Codex Phase 1 scope — "we should not start moving transport without first making it observable." Runtime visibility must land before the transport-ownership changes in Phase 3/5/6, or debugging those phases becomes blind. Keeping ioctl.h, adapter.cpp, and test_stream_monitor.py in lock-step in a single commit satisfies the Diagnostics Rule from `CLAUDE.md`.
+
+**Exit criteria (Codex):**
+- AO builds — `build-verify.ps1 -Config Release` green.
+- Diagnostics sane and zero at idle — `python test_stream_monitor.py --once` prints every new counter as `0` after install and remains `0` across a Phone Link AO call (Phase 1 has no writer for any counter).
+- No transport behavior change is observable — `test_ioctl_diag.py ALL PASSED` continues; no functional regression.
+
+**Rollback:** `git revert <this commit>`, rebuild, reinstall. No state outside the 8 changed files.
+
+---
+
 ## 2026-04-13 — Driver INF target OS widening
 
 **Files changed:**

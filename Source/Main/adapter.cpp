@@ -33,6 +33,10 @@ C_ASSERT(FIELD_OFFSET(LOOPBACK_BUFFER, MaxLatencyMs) == 0x4D0);
 C_ASSERT(FIELD_OFFSET(LOOPBACK_BUFFER, InternalChannels) == 0x4D4);
 C_ASSERT(FIELD_OFFSET(LOOPBACK_BUFFER, InternalBlockAlign) == 0x4D8);
 
+// Phase 1: AO_V2_DIAG shape guard. Mirrors the ioctl.h C_ASSERT so a
+// mismatch caused by editing only one of the two headers fails to build.
+C_ASSERT(sizeof(AO_V2_DIAG) == 116);
+
 typedef void (*fnPcDriverUnload) (PDRIVER_OBJECT);
 fnPcDriverUnload gPCDriverUnloadRoutine = NULL;
 extern "C" DRIVER_UNLOAD DriverUnload;
@@ -1700,7 +1704,67 @@ AoDeviceControlHandler(
         pStatus->CableB_Mic.Channels         = g_CableBLoopback.MicFormat.nChannels;
 #endif
 
-        bytesReturned = sizeof(AO_STREAM_STATUS);
+        // Phase 1: V2 diagnostic extension. V1 clients pass
+        // sizeof(AO_STREAM_STATUS); they get only the V1 block and
+        // bytesReturned stays at sizeof(AO_STREAM_STATUS). V2 clients pass
+        // sizeof(AO_STREAM_STATUS) + sizeof(AO_V2_DIAG) and get both.
+        // All new counters are sourced from FRAME_PIPE (g_CableAPipe /
+        // g_CableBPipe), not the legacy LOOPBACK_BUFFER globals.
+        ULONG v2Offset = sizeof(AO_STREAM_STATUS);
+        if (irpSp->Parameters.DeviceIoControl.OutputBufferLength >=
+            v2Offset + sizeof(AO_V2_DIAG))
+        {
+            AO_V2_DIAG* pDiag = (AO_V2_DIAG*)((BYTE*)pStatus + v2Offset);
+            RtlZeroMemory(pDiag, sizeof(AO_V2_DIAG));
+            pDiag->StructSize = sizeof(AO_V2_DIAG);
+
+#if defined(CABLE_A) || !defined(CABLE_B)
+            // Cable A Render snapshot
+            pDiag->A_R_GatedSkipCount            = g_CableAPipe.RenderGatedSkipCount;
+            pDiag->A_R_OverJumpCount             = g_CableAPipe.RenderOverJumpCount;
+            pDiag->A_R_FramesProcessedLow        = (ULONG)(g_CableAPipe.RenderFramesProcessedTotal & 0xFFFFFFFF);
+            pDiag->A_R_FramesProcessedHigh       = (ULONG)(g_CableAPipe.RenderFramesProcessedTotal >> 32);
+            pDiag->A_R_PumpInvocationCount       = g_CableAPipe.RenderPumpInvocationCount;
+            pDiag->A_R_PumpShadowDivergenceCount = g_CableAPipe.RenderPumpShadowDivergenceCount;
+            pDiag->A_R_PumpFeatureFlags          = g_CableAPipe.RenderPumpFeatureFlags;
+
+            // Cable A Capture snapshot
+            pDiag->A_C_GatedSkipCount            = g_CableAPipe.CaptureGatedSkipCount;
+            pDiag->A_C_OverJumpCount             = g_CableAPipe.CaptureOverJumpCount;
+            pDiag->A_C_FramesProcessedLow        = (ULONG)(g_CableAPipe.CaptureFramesProcessedTotal & 0xFFFFFFFF);
+            pDiag->A_C_FramesProcessedHigh       = (ULONG)(g_CableAPipe.CaptureFramesProcessedTotal >> 32);
+            pDiag->A_C_PumpInvocationCount       = g_CableAPipe.CapturePumpInvocationCount;
+            pDiag->A_C_PumpShadowDivergenceCount = g_CableAPipe.CapturePumpShadowDivergenceCount;
+            pDiag->A_C_PumpFeatureFlags          = g_CableAPipe.CapturePumpFeatureFlags;
+#endif
+
+#if defined(CABLE_B) || !defined(CABLE_A)
+            // Cable B Render snapshot
+            pDiag->B_R_GatedSkipCount            = g_CableBPipe.RenderGatedSkipCount;
+            pDiag->B_R_OverJumpCount             = g_CableBPipe.RenderOverJumpCount;
+            pDiag->B_R_FramesProcessedLow        = (ULONG)(g_CableBPipe.RenderFramesProcessedTotal & 0xFFFFFFFF);
+            pDiag->B_R_FramesProcessedHigh       = (ULONG)(g_CableBPipe.RenderFramesProcessedTotal >> 32);
+            pDiag->B_R_PumpInvocationCount       = g_CableBPipe.RenderPumpInvocationCount;
+            pDiag->B_R_PumpShadowDivergenceCount = g_CableBPipe.RenderPumpShadowDivergenceCount;
+            pDiag->B_R_PumpFeatureFlags          = g_CableBPipe.RenderPumpFeatureFlags;
+
+            // Cable B Capture snapshot
+            pDiag->B_C_GatedSkipCount            = g_CableBPipe.CaptureGatedSkipCount;
+            pDiag->B_C_OverJumpCount             = g_CableBPipe.CaptureOverJumpCount;
+            pDiag->B_C_FramesProcessedLow        = (ULONG)(g_CableBPipe.CaptureFramesProcessedTotal & 0xFFFFFFFF);
+            pDiag->B_C_FramesProcessedHigh       = (ULONG)(g_CableBPipe.CaptureFramesProcessedTotal >> 32);
+            pDiag->B_C_PumpInvocationCount       = g_CableBPipe.CapturePumpInvocationCount;
+            pDiag->B_C_PumpShadowDivergenceCount = g_CableBPipe.CapturePumpShadowDivergenceCount;
+            pDiag->B_C_PumpFeatureFlags          = g_CableBPipe.CapturePumpFeatureFlags;
+#endif
+
+            bytesReturned = v2Offset + sizeof(AO_V2_DIAG);
+        }
+        else
+        {
+            bytesReturned = sizeof(AO_STREAM_STATUS);
+        }
+
         status = STATUS_SUCCESS;
         break;
     }

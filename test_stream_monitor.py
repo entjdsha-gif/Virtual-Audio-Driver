@@ -31,9 +31,20 @@ GENERIC_READ  = 0x80000000
 GENERIC_WRITE = 0x40000000
 OPEN_EXISTING = 3
 
-# AO_STREAM_STATUS = 64 bytes (4 endpoints x 16 bytes)
-# AO_V2_DIAG starts at offset 64 when driver supports it
+# AO_STREAM_STATUS = 64 bytes (4 endpoints x 16 bytes).
+# Phase 1 AO_V2_DIAG = 116 bytes, appended directly after AO_STREAM_STATUS
+# when the caller requests a buffer large enough. Layout (from ioctl.h):
+#   ULONG StructSize                                  (4 bytes)
+#   4 blocks * 7 ULONGs each = 28 ULONGs             (112 bytes)
+#     block order: A_Render, A_Capture, B_Render, B_Capture
+#     field order: GatedSkipCount, OverJumpCount,
+#                  FramesProcessedLow, FramesProcessedHigh,
+#                  PumpInvocationCount, PumpShadowDivergenceCount,
+#                  PumpFeatureFlags
 V1_STATUS_SIZE = 64
+V2_DIAG_SIZE   = 4 + 4 * 7 * 4   # StructSize + 4 * 7 ULONGs = 116
+V2_BUF_SIZE    = V1_STATUS_SIZE + V2_DIAG_SIZE
+V2_FIELDS_PER_BLOCK = 7
 
 
 def open_device(name):
@@ -56,7 +67,9 @@ def get_config(h):
 
 
 def get_stream_status(h):
-    buf_size = 512  # generous for V2 extension
+    # Phase 1: request V1 + V2 in one call. Driver writes V1 if the buffer
+    # only holds V1, and V1 + V2 if the buffer is large enough.
+    buf_size = V2_BUF_SIZE
     buf = ctypes.create_string_buffer(buf_size)
     ret = ctypes.c_ulong(0)
     ok = kernel32.DeviceIoControl(
@@ -83,58 +96,40 @@ def get_stream_status(h):
         'CableB_Mic':     endpoints[3],
     }
 
-    # Parse V2 extension: AO_V2_DIAG at offset 64
-    # Layout: StructSize(4) + CableA(BOOL+pad=4, 6xULONG=24) + CableB(BOOL+pad=4, 6xULONG=24)
-    # Total AO_V2_DIAG = 4 + 28 + 28 = 60 bytes
-    # Check if V2 data is present by verifying StructSize
-    if ret.value > V1_STATUS_SIZE + 4:
+    # Phase 1 AO_V2_DIAG — 4 blocks of 7 ULONGs each, in order:
+    #   A_Render, A_Capture, B_Render, B_Capture.
+    # Each block unpacks into:
+    #   GatedSkipCount, OverJumpCount,
+    #   FramesProcessedLow, FramesProcessedHigh,
+    #   PumpInvocationCount, PumpShadowDivergenceCount,
+    #   PumpFeatureFlags
+    result['v2'] = False
+    if ret.value >= V1_STATUS_SIZE + V2_DIAG_SIZE:
         v2_offset = V1_STATUS_SIZE
         struct_size = struct.unpack_from('<I', buf.raw, v2_offset)[0]
 
-        if struct_size > 0 and struct_size <= 256:  # sanity check
-            # CableA: BOOLEAN(pad4) + 7xULONG + pad4 + 2xULONGLONG + 2xULONG
-            off = v2_offset + 4
-            a_pt = bool(struct.unpack_from('<I', buf.raw, off)[0]); off += 4
-            a_rc, a_push, a_pull, a_cof, a_csf, a_pipe, a_fill = struct.unpack_from('<IIIIIII', buf.raw, off); off += 28
-            off += 4  # padding for ULONGLONG alignment
-            a_spk_w, a_mic_r = struct.unpack_from('<QQ', buf.raw, off); off += 16
-            a_maxdpc, a_pjump = struct.unpack_from('<II', buf.raw, off); off += 8
-            # CableB: same layout
-            b_pt = bool(struct.unpack_from('<I', buf.raw, off)[0]); off += 4
-            b_rc, b_push, b_pull, b_cof, b_csf, b_pipe, b_fill = struct.unpack_from('<IIIIIII', buf.raw, off); off += 28
-            # CableB offset 96 is already 8-byte aligned, no padding needed
-            b_spk_w, b_mic_r = struct.unpack_from('<QQ', buf.raw, off); off += 16
-            b_maxdpc, b_pjump = struct.unpack_from('<II', buf.raw, off)
+        if struct_size == V2_DIAG_SIZE:
+            def read_block(offset):
+                fields = struct.unpack_from('<IIIIIII', buf.raw, offset)
+                return {
+                    'GatedSkipCount':            fields[0],
+                    'OverJumpCount':             fields[1],
+                    'FramesProcessedLow':        fields[2],
+                    'FramesProcessedHigh':       fields[3],
+                    'PumpInvocationCount':       fields[4],
+                    'PumpShadowDivergenceCount': fields[5],
+                    'PumpFeatureFlags':          fields[6],
+                    'FramesProcessedTotal':      fields[2] | (fields[3] << 32),
+                }
 
+            cursor = v2_offset + 4  # skip StructSize
+            block_bytes = V2_FIELDS_PER_BLOCK * 4
             result['v2'] = True
-            result['CableA_Passthrough'] = a_pt
-            result['CableA_RenderCount'] = a_rc
-            result['CableA_PushLoss'] = a_push
-            result['CableA_PullLoss'] = a_pull
-            result['CableA_ConvOF'] = a_cof
-            result['CableA_ConvSF'] = a_csf
-            result['CableA_PipeFrames'] = a_pipe
-            result['CableA_PipeFill'] = a_fill
-            result['CableA_SpkWrite'] = a_spk_w
-            result['CableA_MicRead'] = a_mic_r
-            result['CableA_MaxDpcUs'] = a_maxdpc
-            result['CableA_PosJump'] = a_pjump
-            result['CableB_Passthrough'] = b_pt
-            result['CableB_RenderCount'] = b_rc
-            result['CableB_PushLoss'] = b_push
-            result['CableB_PullLoss'] = b_pull
-            result['CableB_ConvOF'] = b_cof
-            result['CableB_ConvSF'] = b_csf
-            result['CableB_PipeFrames'] = b_pipe
-            result['CableB_PipeFill'] = b_fill
-            result['CableB_SpkWrite'] = b_spk_w
-            result['CableB_MicRead'] = b_mic_r
-            result['CableB_MaxDpcUs'] = b_maxdpc
-            result['CableB_PosJump'] = b_pjump
-        else:
-            result['v2'] = False
-    else:
-        result['v2'] = False
+            result['v2_struct_size'] = struct_size
+            result['CableA_Render']  = read_block(cursor); cursor += block_bytes
+            result['CableA_Capture'] = read_block(cursor); cursor += block_bytes
+            result['CableB_Render']  = read_block(cursor); cursor += block_bytes
+            result['CableB_Capture'] = read_block(cursor)
 
     return result
 
@@ -161,6 +156,10 @@ def print_status(cable_label, handle):
     for name, ep in status.items():
         if not isinstance(ep, dict):
             continue
+        # Only V1 endpoint rows have an 'active' key. Skip V2 diag blocks
+        # (CableA_Render, CableA_Capture, ...) which carry pump counters.
+        if 'active' not in ep:
+            continue
         if cable_label == "CableA" and not name.startswith("CableA"):
             continue
         if cable_label == "CableB" and not name.startswith("CableB"):
@@ -169,41 +168,27 @@ def print_status(cable_label, handle):
         print(f"    {tag}: {format_endpoint(ep)}")
 
     if status.get('v2'):
-        pt = status.get(f"{cable_label}_Passthrough", False)
-        rc = status.get(f"{cable_label}_RenderCount", 0)
-        push = status.get(f"{cable_label}_PushLoss", 0)
-        pull = status.get(f"{cable_label}_PullLoss", 0)
-        cof = status.get(f"{cable_label}_ConvOF", 0)
-        csf = status.get(f"{cable_label}_ConvSF", 0)
-        pipe = status.get(f"{cable_label}_PipeFrames", 0)
-        fill = status.get(f"{cable_label}_PipeFill", 0)
-        pt_str = "YES" if pt else "NO"
+        # Phase 1 counter display: per-direction block for this cable.
+        # All counters stay at 0 in Phase 1; Phase 3 starts populating.
+        render = status.get(f"{cable_label}_Render", {})
+        capture = status.get(f"{cable_label}_Capture", {})
 
-        # Delta calculation
-        prev_pull = _prev.get(f"{cable_label}_pull", 0)
-        d_pull = pull - prev_pull
-        _prev[f"{cable_label}_pull"] = pull
+        def fmt_block(tag, block):
+            gs = block.get('GatedSkipCount', 0)
+            oj = block.get('OverJumpCount', 0)
+            fp = block.get('FramesProcessedTotal', 0)
+            inv = block.get('PumpInvocationCount', 0)
+            div = block.get('PumpShadowDivergenceCount', 0)
+            flags = block.get('PumpFeatureFlags', 0)
+            # Shadow divergence ratio is the Phase 3 exit-criterion metric.
+            ratio = (div / inv * 100.0) if inv > 0 else 0.0
+            return (f"    {tag}: Gated={gs} OverJump={oj} Frames={fp} "
+                    f"Inv={inv} Div={div} ({ratio:.2f}%) Flags=0x{flags:08x}")
 
-        fill_pct = f"{fill*100//pipe}%" if pipe > 0 else "?"
-        spk_state = "WRITE" if fill > 0 or d_pull == 0 else "IDLE"
-
-        spk_w = status.get(f"{cable_label}_SpkWrite", 0)
-        mic_r = status.get(f"{cable_label}_MicRead", 0)
-        maxdpc = status.get(f"{cable_label}_MaxDpcUs", 0)
-        pjump = status.get(f"{cable_label}_PosJump", 0)
-
-        # Write/Read deltas
-        prev_w = _prev.get(f"{cable_label}_w", 0)
-        prev_r = _prev.get(f"{cable_label}_r", 0)
-        d_w = spk_w - prev_w
-        d_r = mic_r - prev_r
-        _prev[f"{cable_label}_w"] = spk_w
-        _prev[f"{cable_label}_r"] = mic_r
-
-        print(f"    PT={pt_str} RC={rc} Fill={fill}/{pipe}({fill_pct}) Pull={pull}(+{d_pull}) {spk_state}")
-        print(f"    W={spk_w}(+{d_w}) R={mic_r}(+{d_r}) MaxDPC={maxdpc}us Jump={pjump}")
+        print(fmt_block("Render ", render))
+        print(fmt_block("Capture", capture))
     else:
-        print(f"    (V2 diag not available)")
+        print(f"    (V2 diag not available — expected {V2_DIAG_SIZE} bytes at offset {V1_STATUS_SIZE})")
 
 
 def main():
