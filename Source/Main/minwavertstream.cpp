@@ -37,15 +37,69 @@ Return Value:
 --*/
 {
     PAGED_CODE();
+
+    // Phase 4 (2026-04-13): stream-lifetime teardown order.
+    //
+    // Correct order per Codex Phase 4 proposal:
+    //   1. stream-close notify (does not use cable pipe state)
+    //   2. cancel / delete notification timer
+    //   3. KeFlushQueuedDpcs so no in-flight DPC can touch the pipe
+    //   4. resolve cable pipe via still-alive m_pMiniport->m_DeviceType
+    //      and call FramePipeUnregisterFormat() exactly here
+    //   5. release m_pMiniport (now that the unregister is done)
+    //   6. free remaining per-stream pool allocations
+    //
+    // STOP no longer owns cable pipe unregister; that moved here.
+    // Non-cable streams skip the unregister step but still follow the
+    // same teardown order, so cable and non-cable paths stay aligned.
+
+    if (NULL != m_pMiniport && m_bUnregisterStream)
+    {
+        m_pMiniport->StreamClosed(m_ulPin, this);
+        m_bUnregisterStream = FALSE;
+    }
+
+    if (m_pNotificationTimer)
+    {
+        ExDeleteTimer
+        (
+            m_pNotificationTimer,
+            TRUE, // Cancel the timer if it is currently set.
+            TRUE, // Wait for the timer to finish expiring and for any callback to a ExTimerCallback routine to finish.
+            NULL
+        );
+    }
+
+    // Since we just cancelled the notification timer, wait for all queued
+    // DPCs to complete before we touch any pipe state or free DPC-owned
+    // resources. After this point, no timer/DPC callback can still be
+    // advancing the cable pipe via UpdatePosition() + the Phase 3 pump.
+    KeFlushQueuedDpcs();
+
+    // Cable pipe unregister at the true stream-lifetime edge.
+    // Moved out of SetState(KSSTATE_STOP) in Phase 4 so state churn no
+    // longer collapses the cable data path.
     if (NULL != m_pMiniport)
     {
-    
-        if (m_bUnregisterStream)
+        PFRAME_PIPE pFP = NULL;
+        BOOLEAN isSpeaker = !m_bCapture;
+        eDeviceType dt = m_pMiniport->m_DeviceType;
+        if (dt == eCableASpeaker || dt == eCableAMic)
         {
-            m_pMiniport->StreamClosed(m_ulPin, this);
-            m_bUnregisterStream = FALSE;
+            pFP = &g_CableAPipe;
         }
-        
+        else if (dt == eCableBSpeaker || dt == eCableBMic)
+        {
+            pFP = &g_CableBPipe;
+        }
+        if (pFP)
+        {
+            FramePipeUnregisterFormat(pFP, isSpeaker);
+        }
+    }
+
+    if (NULL != m_pMiniport)
+    {
         m_pMiniport->Release();
         m_pMiniport = NULL;
     }
@@ -85,21 +139,6 @@ Return Value:
         ExFreePoolWithTag( m_pWfExt, MINWAVERTSTREAM_POOLTAG );
         m_pWfExt = NULL;
     }
-    if (m_pNotificationTimer)
-    {
-        ExDeleteTimer
-        (
-            m_pNotificationTimer, 
-            TRUE, // Cancel the timer if it is currently set.
-            TRUE, // Wait for the timer to finish expiring and for any callback to a ExTimerCallback routine to finish.
-            NULL
-         );
-    }
-
-    // Since we just cancelled the notification timer, wait for all queued 
-    // DPCs to complete before we free the notification DPC.
-    //
-    KeFlushQueuedDpcs();
 
     DPF_ENTER(("[CMiniportWaveRTStream::~CMiniportWaveRTStream]"));
 } // ~CMiniportWaveRTStream
@@ -1226,32 +1265,11 @@ NTSTATUS CMiniportWaveRTStream::SetState
                 // Acquire stream resources
             }
 
-            // [OLD PATH DISABLED — FRAME_PIPE handles Mic stop via FramePipeUnregisterFormat below]
-
-            // [OLD PATH DISABLED — FRAME_PIPE handles Speaker stop via FramePipeUnregisterFormat below]
-
-            // FRAME_PIPE: unregister format on stop
-            if (m_pMiniport)
-            {
-                PFRAME_PIPE pFP = NULL;
-                BOOLEAN fpIsSpeaker = !m_bCapture;
-                if (m_bCapture)
-                {
-                    if (m_pMiniport->m_DeviceType == eCableAMic)
-                        pFP = &g_CableAPipe;
-                    else if (m_pMiniport->m_DeviceType == eCableBMic)
-                        pFP = &g_CableBPipe;
-                }
-                else
-                {
-                    if (m_pMiniport->m_DeviceType == eCableASpeaker)
-                        pFP = &g_CableAPipe;
-                    else if (m_pMiniport->m_DeviceType == eCableBSpeaker)
-                        pFP = &g_CableBPipe;
-                }
-                if (pFP)
-                    FramePipeUnregisterFormat(pFP, fpIsSpeaker);
-            }
+            // Phase 4 (2026-04-13): STOP no longer owns pipe unregister.
+            // FramePipeUnregisterFormat() has moved to destructor teardown.
+            // Rationale: STOP was the accidental hard-reset trigger for the
+            // cable data path. Unregister+reset belong to true stream
+            // lifetime end, not to a state-machine transition.
 
             KeAcquireSpinLock(&m_PositionSpinLock, &oldIrql);
             // Reset DMA
@@ -1343,16 +1361,16 @@ NTSTATUS CMiniportWaveRTStream::SetState
 
                 // FRAME_PIPE: do NOT unregister on Pause.
                 // Windows audio engine pauses/resumes streams frequently between audio chunks.
-                // Unregistering on Pause causes pipe drain → massive underrun.
-                // Only STOP should unregister.
+                // Unregistering on Pause causes pipe drain -> massive underrun.
+                // Unregister now lives in destructor teardown (Phase 4, 2026-04-13).
 
                 // Pause DMA
                 if (m_ulNotificationIntervalMs > 0)
                 {
                     ExCancelTimer(m_pNotificationTimer, NULL);
-                    KeFlushQueuedDpcs(); 
+                    KeFlushQueuedDpcs();
 
-                    // If pin is transitioning from RUN, save the time since last buffer completion event was sent 
+                    // If pin is transitioning from RUN, save the time since last buffer completion event was sent
                     // so if the pin goes to RUN state again we can send the buffer completion event at correct time.
                     if (m_ullLastDPCTimeStamp > 0)
                     {
@@ -1365,6 +1383,65 @@ NTSTATUS CMiniportWaveRTStream::SetState
                         // Convert ticks to 100ns units.
                         hnsCurrentTime = KSCONVERT_PERFORMANCE_TIME(m_ullPerformanceCounterFrequency.QuadPart, qpc);
                         m_hnsDPCTimeCarryForward = hnsCurrentTime - m_ullLastDPCTimeStamp + m_hnsDPCTimeCarryForward;
+                    }
+
+                    // Phase 4 (2026-04-13): conditional VB-style pipe reset.
+                    // After timer cancel + KeFlushQueuedDpcs, no DPC/timer
+                    // callback can still be advancing this pipe. If the
+                    // opposite direction is not currently active on the
+                    // same pipe, it is safe to clear ring/fade state so the
+                    // next RUN starts from a clean baseline. If the other
+                    // side is still active we keep the conservative rule:
+                    // do not touch the pipe (under-reset is safer than
+                    // wiping a still-running peer).
+                    if (m_pMiniport &&
+                        (m_pMiniport->m_DeviceType == eCableASpeaker ||
+                         m_pMiniport->m_DeviceType == eCableBSpeaker ||
+                         m_pMiniport->m_DeviceType == eCableAMic      ||
+                         m_pMiniport->m_DeviceType == eCableBMic))
+                    {
+                        PFRAME_PIPE pFP = NULL;
+                        BOOLEAN isSpeaker = !m_bCapture;
+                        if (m_pMiniport->m_DeviceType == eCableASpeaker ||
+                            m_pMiniport->m_DeviceType == eCableAMic)
+                        {
+                            pFP = &g_CableAPipe;
+                        }
+                        else
+                        {
+                            pFP = &g_CableBPipe;
+                        }
+                        if (pFP && pFP->Initialized)
+                        {
+                            BOOLEAN otherSideActive = isSpeaker
+                                ? pFP->MicActive
+                                : pFP->SpeakerActive;
+                            if (!otherSideActive)
+                            {
+                                FramePipeReset(pFP);
+                            }
+                        }
+
+                        // Phase 4: clear per-run pump working state on PAUSE
+                        // so the next RUN starts with a fresh timing baseline.
+                        // Monotonic Phase 3 evidence counters are preserved.
+                        KIRQL pauseIrql;
+                        KeAcquireSpinLock(&m_PositionSpinLock, &pauseIrql);
+                        m_ulPumpFeatureFlags               = 0;
+                        m_bPumpInitialized                 = FALSE;
+                        m_ullPumpBaselineHns               = 0;
+                        m_ulPumpProcessedFrames            = 0;
+                        m_ulPumpLastBufferOffset           = 0;
+                        m_ullPumpShadowWindowPumpFrames    = 0;
+                        m_ullPumpShadowWindowLegacyBytes   = 0;
+                        m_ulPumpShadowWindowCallCount      = 0;
+                        m_ulLastUpdatePositionByteDisplacement = 0;
+                        // Preserve: m_ulPumpInvocationCount,
+                        //           m_ulPumpShadowDivergenceCount,
+                        //           m_ullPumpFramesProcessed.
+                        // Preserve per-session GatedSkipCount/OverJumpCount
+                        // so churn-era diagnostics survive into RUN.
+                        KeReleaseSpinLock(&m_PositionSpinLock, pauseIrql);
                     }
                 }
             }

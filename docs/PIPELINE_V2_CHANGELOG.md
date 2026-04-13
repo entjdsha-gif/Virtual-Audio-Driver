@@ -1,5 +1,59 @@
 # Pipeline V2 Changelog
 
+## 2026-04-13 — Phase 4: Align STOP/PAUSE state semantics with VB before ownership move
+
+**Files changed:**
+- `Source/Main/minwavertstream.cpp` — destructor reorder + teardown-time cable unregister; `SetState(KSSTATE_STOP)` no longer calls `FramePipeUnregisterFormat()`; `SetState(KSSTATE_PAUSE)` from RUN now does a conservative VB-style conditional `FramePipeReset()` after `KeFlushQueuedDpcs()` and also clears per-run Phase 3 pump working state while preserving monotonic Phase 3 evidence counters.
+- `results/phase4_edit_proposal.md` — approval record locked in checkpoint commit `0f531b9`.
+
+**What:** Phase 4 is a pure state-semantics realignment before any transport ownership move. Three structural changes:
+
+1. **STOP no longer unregisters the cable pipe.** The `FramePipeUnregisterFormat()` block is removed from `SetState(KSSTATE_STOP)`. STOP still owns stream-local DMA/position reset, end-of-stream flags, and the Phase 3 STOP-clear block for stream-local pump state. It no longer touches `SpeakerActive` / `MicActive` / `ActiveRenderCount` or the pipe ring.
+
+2. **PAUSE from RUN now owns conditional pipe reset + pump working-state clear.** Inside the existing `m_KsState > KSSTATE_PAUSE` + `m_ulNotificationIntervalMs > 0` branch, after the existing `ExCancelTimer()` + `KeFlushQueuedDpcs()` + DPC-time carryforward bookkeeping, the PAUSE path now:
+   - resolves the cable pipe from `m_pMiniport->m_DeviceType`,
+   - reads `pFP->MicActive` (for render streams) or `pFP->SpeakerActive` (for capture streams) as the conservative `!otherSideActive` gate,
+   - calls `FramePipeReset(pFP)` only when the opposite direction is not currently active,
+   - under `m_PositionSpinLock`, clears per-run pump working state (`m_ulPumpFeatureFlags`, `m_bPumpInitialized`, `m_ullPumpBaselineHns`, `m_ulPumpProcessedFrames`, `m_ulPumpLastBufferOffset`, `m_ullPumpShadowWindowPumpFrames`, `m_ullPumpShadowWindowLegacyBytes`, `m_ulPumpShadowWindowCallCount`, `m_ulLastUpdatePositionByteDisplacement`),
+   - preserves monotonic Phase 3 evidence (`m_ulPumpInvocationCount`, `m_ulPumpShadowDivergenceCount`, `m_ullPumpFramesProcessed`) plus per-session `GatedSkipCount` / `OverJumpCount` so churn-era diagnostics survive into the next RUN.
+
+3. **Destructor owns cable unregister at the true stream-lifetime edge, and the lifetime teardown order is rewritten.** Previous order released `m_pMiniport` first, then freed pool resources, then deleted the notification timer, then flushed queued DPCs. New order:
+   1. `StreamClosed()` (does not touch cable pipe state),
+   2. `ExDeleteTimer()` (waits for any in-flight timer callback),
+   3. `KeFlushQueuedDpcs()` (guarantees no DPC/timer path can still be advancing the pipe via `UpdatePosition()` and the Phase 3 pump),
+   4. resolve cable pipe via still-alive `m_pMiniport->m_DeviceType` and call `FramePipeUnregisterFormat(pFP, isSpeaker)`,
+   5. `m_pMiniport->Release()`,
+   6. free per-stream pool allocations (DPC, timer, muted, volume, peak, WfExt).
+
+**Why:** `VB-Cable` keeps its pipe/ring alive across `KSSTATE_STOP` and only collapses it when the stream is truly going away. AO's pre-Phase-4 behavior made STOP the accidental hard-reset trigger: Windows audio engine pauses/resumes streams around normal workflow events (including brief speaker gaps during a call), and STOP-time unregister cleared `SpeakerActive` / `MicActive` / ring state on a path that is not actually the end of the stream. Moving unregister to destructor teardown restores VB-like stream lifetime while PAUSE's conservative `!otherSideActive` reset gives us the one place that VB does collapse ring/fade state after a RUN: after the DPC flush and only when the peer direction is not still running.
+
+**Non-negotiable guardrails (all held):**
+- Phase 3 stays SHADOW_ONLY. `AO_PUMP_FLAG_DISABLE_LEGACY_RENDER` / `AO_PUMP_FLAG_DISABLE_LEGACY_CAPTURE` remain clear.
+- `KeFlushQueuedDpcs()` ordering in PAUSE is untouched and is the barrier the new reset block sits behind.
+- STOP never calls `FramePipeUnregisterFormat()` after this commit.
+- No transport ownership move. `UpdatePosition()` / `WriteBytes()` / `ReadBytes()` / Phase 3 pump helper are unchanged.
+- No IOCTL layout change. No `test_stream_monitor.py` schema change. No new `FRAME_PIPE` fields.
+- No fade-in refactor in this commit (`Phase 4a` can pick that up later if needed).
+
+**Highest risk: destructor reorder.** The teardown reorder affects both cable and non-cable streams. Non-cable streams skip the unregister step but still go through the new ordering (StreamClosed → timer delete → DPC flush → Release → free pool). Expected Phase 4 validation therefore repeats the full Phase 3 A/B validation, plus STOP → RUN / PAUSE → RUN churn, to catch any lifetime regression introduced by the reorder.
+
+**Verification:**
+- `build-verify.ps1 -Config Release` — expected green.
+- `install.ps1 -Action upgrade` — expected `INSTALL_EXIT=0`, hash match.
+- `test_ioctl_diag.py` — expected `ALL PASSED` (V1 IOCTL path intact).
+- `test_stream_monitor.py --once` — idle counters sane, `StructSize == 116`.
+- `tests/phase3_shadow_active.py` — A-step regression: `Inv > 128`, `Div == 0`, `OverJump == 0`, flags reach `0x00000003`, frame accounting matches duration × samplerate.
+- `tests/phase3_live_call_shadow.py` — B-step regression: real Phone Link call, `A_Render` peak `Inv > 128`, `Div == 0`, no visible STOP-era collapse symptoms.
+
+**Exit criteria (Codex Phase 4):**
+1. State churn no longer causes the old AO-style continuity failures.
+2. STOP is no longer the accidental hard-reset trigger for cable flow.
+3. Phase 3 shadow/divergence counters do not newly regress after STOP/PAUSE changes land.
+
+**Rollback:** `git revert <this commit>`, rebuild, reinstall. Rollback surface is 1 source file + this changelog. Phase 4 is not flag-gated; rollback is source-level.
+
+---
+
 ## 2026-04-13 — Phase 3: Shadow-mode query pump on GetPositions (no ownership move)
 
 **Files changed:**
