@@ -223,7 +223,16 @@ private:
     (
         _In_ LARGE_INTEGER ilQPC
     );
-    
+
+    // Phase 3: shadow-only query-path pump helper.
+    // Invoked from GetPositions() in the same call as UpdatePosition(ilQPC),
+    // still under m_PositionSpinLock. SHADOW_ONLY - no transport mutation,
+    // no ownership move. See results/phase3_edit_proposal.md.
+    VOID PumpToCurrentPositionFromQuery
+    (
+        _In_ LARGE_INTEGER ilQPC
+    );
+
     NTSTATUS SetCurrentWritePositionInternal
     (
         _In_  ULONG ulCurrentWritePosition

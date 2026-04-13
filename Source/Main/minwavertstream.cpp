@@ -1095,6 +1095,10 @@ NTSTATUS CMiniportWaveRTStream::GetPositions(
     if (m_KsState == KSSTATE_RUN)
     {
         UpdatePosition(ilQPC);
+        // Phase 3: shadow-only pump on the confirmed hot path (GetPositions).
+        // Same-call placement keeps m_ulLastUpdatePositionByteDisplacement
+        // fresh and stays under m_PositionSpinLock. No transport mutation.
+        PumpToCurrentPositionFromQuery(ilQPC);
     }
     if (_pullLinearBufferPosition)
     {
@@ -1264,6 +1268,53 @@ NTSTATUS CMiniportWaveRTStream::SetState
             m_bEoSReceived = FALSE;
             m_bLastBufferRendered = FALSE;
 
+            // Phase 3: clear shadow pump state so a new STOP->RUN session
+            // starts clean. Cable-only; non-cable streams never touched these.
+            if (m_pMiniport &&
+                (m_pMiniport->m_DeviceType == eCableASpeaker ||
+                 m_pMiniport->m_DeviceType == eCableBSpeaker ||
+                 m_pMiniport->m_DeviceType == eCableAMic      ||
+                 m_pMiniport->m_DeviceType == eCableBMic))
+            {
+                m_ulPumpFeatureFlags               = 0;
+                m_bPumpInitialized                 = FALSE;
+                m_ullPumpBaselineHns               = 0;
+                m_ulPumpProcessedFrames            = 0;
+                m_ulPumpLastBufferOffset           = 0;
+                m_ullPumpShadowWindowPumpFrames    = 0;
+                m_ullPumpShadowWindowLegacyBytes   = 0;
+                m_ulPumpShadowWindowCallCount      = 0;
+                m_ulLastUpdatePositionByteDisplacement = 0;
+                m_ulPumpGatedSkipCount             = 0;
+                m_ulPumpOverJumpCount              = 0;
+                m_ulPumpInvocationCount            = 0;
+                m_ulPumpShadowDivergenceCount      = 0;
+                m_ullPumpFramesProcessed           = 0;
+
+                PFRAME_PIPE pFP = NULL;
+                BOOLEAN isSpeaker = !m_bCapture;
+                if (m_pMiniport->m_DeviceType == eCableASpeaker ||
+                    m_pMiniport->m_DeviceType == eCableAMic)
+                {
+                    pFP = &g_CableAPipe;
+                }
+                else
+                {
+                    pFP = &g_CableBPipe;
+                }
+                if (pFP)
+                {
+                    if (isSpeaker)
+                    {
+                        pFP->RenderPumpFeatureFlags = 0;
+                    }
+                    else
+                    {
+                        pFP->CapturePumpFeatureFlags = 0;
+                    }
+                }
+            }
+
             KeReleaseSpinLock(&m_PositionSpinLock, oldIrql);
 
             // Wait until all work items are completed.
@@ -1385,10 +1436,62 @@ NTSTATUS CMiniportWaveRTStream::SetState
                 (
                     m_pNotificationTimer,
                     (-1) * HNSTIME_PER_MILLISECOND,
-                    HNSTIME_PER_MILLISECOND, // 1 ms 
+                    HNSTIME_PER_MILLISECOND, // 1 ms
                     NULL
                  );
 
+            }
+
+            // Phase 3: arm shadow-only pump for cable endpoints.
+            // Re-arm per-run state; preserve monotonic stream counters across
+            // PAUSE->RUN so the caller can observe total activity.
+            if (m_pMiniport &&
+                (m_pMiniport->m_DeviceType == eCableASpeaker ||
+                 m_pMiniport->m_DeviceType == eCableBSpeaker ||
+                 m_pMiniport->m_DeviceType == eCableAMic      ||
+                 m_pMiniport->m_DeviceType == eCableBMic))
+            {
+                m_ulPumpFeatureFlags = AO_PUMP_FLAG_ENABLE | AO_PUMP_FLAG_SHADOW_ONLY;
+
+                m_bPumpInitialized                 = FALSE;
+                m_ullPumpBaselineHns               = 0;
+                m_ulPumpProcessedFrames            = 0;
+                m_ulPumpLastBufferOffset           = 0;
+                m_ullPumpShadowWindowPumpFrames    = 0;
+                m_ullPumpShadowWindowLegacyBytes   = 0;
+                m_ulPumpShadowWindowCallCount      = 0;
+                m_ulLastUpdatePositionByteDisplacement = 0;
+
+                // Per-session counters: clear on fresh RUN arm.
+                m_ulPumpGatedSkipCount = 0;
+                m_ulPumpOverJumpCount  = 0;
+
+                // Monotonic counters (InvocationCount, ShadowDivergenceCount,
+                // FramesProcessed) are intentionally preserved.
+
+                // Snapshot feature flags into the FRAME_PIPE direction slot.
+                PFRAME_PIPE pFP = NULL;
+                BOOLEAN isSpeaker = !m_bCapture;
+                if (m_pMiniport->m_DeviceType == eCableASpeaker ||
+                    m_pMiniport->m_DeviceType == eCableAMic)
+                {
+                    pFP = &g_CableAPipe;
+                }
+                else
+                {
+                    pFP = &g_CableBPipe;
+                }
+                if (pFP)
+                {
+                    if (isSpeaker)
+                    {
+                        pFP->RenderPumpFeatureFlags = m_ulPumpFeatureFlags;
+                    }
+                    else
+                    {
+                        pFP->CapturePumpFeatureFlags = m_ulPumpFeatureFlags;
+                    }
+                }
             }
 
             break;
@@ -1422,6 +1525,221 @@ NTSTATUS CMiniportWaveRTStream::SetFormat
 
 //=============================================================================
 #pragma code_seg()
+//=============================================================================
+// Phase 3 shadow-only pump. Invoked from GetPositions() in the same call as
+// UpdatePosition(ilQPC) and still under m_PositionSpinLock. Performs compute,
+// compare, and counter publication only. No transport mutation, no ownership
+// move. See results/phase3_edit_proposal.md.
+
+// Rolling compare window length (calls). Locked by approval record.
+#define AO_PUMP_SHADOW_WINDOW_CALLS 128u
+
+VOID CMiniportWaveRTStream::PumpToCurrentPositionFromQuery
+(
+    _In_ LARGE_INTEGER ilQPC
+)
+{
+    // 1. Master gate.
+    if ((m_ulPumpFeatureFlags & AO_PUMP_FLAG_ENABLE) == 0)
+    {
+        return;
+    }
+
+    // 2. Cable-only gate (single source of truth; call sites stay simple).
+    if (m_pMiniport == NULL)
+    {
+        return;
+    }
+    BOOLEAN isCable =
+        (m_pMiniport->m_DeviceType == eCableASpeaker ||
+         m_pMiniport->m_DeviceType == eCableBSpeaker ||
+         m_pMiniport->m_DeviceType == eCableAMic      ||
+         m_pMiniport->m_DeviceType == eCableBMic);
+    if (!isCable)
+    {
+        return;
+    }
+
+    // 3. Format sanity.
+    if (m_pWfExt == NULL)
+    {
+        return;
+    }
+    ULONG nSamplesPerSec = m_pWfExt->Format.nSamplesPerSec;
+    ULONG nBlockAlign    = m_pWfExt->Format.nBlockAlign;
+    if (nSamplesPerSec == 0 || nBlockAlign == 0)
+    {
+        return;
+    }
+
+    // 4. Invocation count (monotonic).
+    m_ulPumpInvocationCount++;
+
+    // Convert current QPC to 100ns units, matching UpdatePosition() math.
+    LONGLONG hnsNow = KSCONVERT_PERFORMANCE_TIME(
+        m_ullPerformanceCounterFrequency.QuadPart, ilQPC);
+
+    // 5. First-call latch: capture baseline, zero working state, mirror, bail.
+    if (!m_bPumpInitialized)
+    {
+        m_ullPumpBaselineHns             = (ULONGLONG)hnsNow;
+        m_ulPumpProcessedFrames          = 0;
+        m_ullPumpShadowWindowPumpFrames  = 0;
+        m_ullPumpShadowWindowLegacyBytes = 0;
+        m_ulPumpShadowWindowCallCount    = 0;
+        m_bPumpInitialized               = TRUE;
+
+        // Mirror and return. m_ulLastUpdatePositionByteDisplacement is cleared
+        // below as part of normal cleanup so the next call starts fresh.
+        m_ulLastUpdatePositionByteDisplacement = 0;
+        goto Mirror;
+    }
+
+    // 6. Elapsed frame math from baseline.
+    //    totalFrames = elapsed_100ns * rate / 10_000_000
+    {
+        ULONGLONG elapsedHns =
+            (ULONGLONG)hnsNow - m_ullPumpBaselineHns;
+        // Guard against non-monotonic QPC conversions (should not happen).
+        if ((LONGLONG)elapsedHns < 0)
+        {
+            m_ulLastUpdatePositionByteDisplacement = 0;
+            goto Mirror;
+        }
+
+        ULONGLONG totalFrames =
+            (elapsedHns * (ULONGLONG)nSamplesPerSec) / 10000000ull;
+
+        if (totalFrames < (ULONGLONG)m_ulPumpProcessedFrames)
+        {
+            // Defensive: clock went backward vs. our run-local counter.
+            m_ulLastUpdatePositionByteDisplacement = 0;
+            goto Mirror;
+        }
+
+        ULONGLONG newFrames64 =
+            totalFrames - (ULONGLONG)m_ulPumpProcessedFrames;
+
+        // 7. 8-frame gate.
+        if (newFrames64 < (ULONGLONG)FP_MIN_GATE_FRAMES)
+        {
+            m_ulPumpGatedSkipCount++;
+            m_ulLastUpdatePositionByteDisplacement = 0;
+            goto Mirror;
+        }
+
+        // 8. Over-jump diagnostic (Phase 3 revision, 2026-04-13).
+        //    Phase 3 is SHADOW_ONLY. Over-jump here is count-only: it flags
+        //    unusually large query-to-query frame deltas but must NOT
+        //    suppress accounting or shadow compare, otherwise the rolling
+        //    window never flushes and divergence stays a false zero.
+        //    Threshold: max(framesPerDmaBuffer * 2, sampleRate / 4) so
+        //    normal WASAPI / Phone Link polling intervals pass cleanly and
+        //    only true outliers (multi-buffer stall, >=250ms gap) trip it.
+        //    Real skip/clamp semantics return in Phase 5/6 where the pump
+        //    owns transport.
+        {
+            ULONG framesPerDmaBuffer = 0;
+            if (m_ulDmaBufferSize >= nBlockAlign)
+            {
+                framesPerDmaBuffer = m_ulDmaBufferSize / nBlockAlign;
+            }
+            ULONG twoBuffers      = framesPerDmaBuffer * 2u;
+            ULONG quarterSecond   = nSamplesPerSec / 4u;
+            ULONG overJumpThreshold =
+                (twoBuffers > quarterSecond) ? twoBuffers : quarterSecond;
+
+            if (newFrames64 > (ULONGLONG)overJumpThreshold)
+            {
+                m_ulPumpOverJumpCount++;
+                // No return. No rebase. No window reset.
+                // Fall through to accounting + compare.
+            }
+        }
+
+        // 9. Accepted-frame accounting.
+        ULONG newFrames = (ULONG)newFrames64;
+        m_ulPumpProcessedFrames += newFrames;
+        m_ullPumpFramesProcessed += newFrames;
+
+        // 10. Rolling-window shadow compare vs. same-call legacy bytes.
+        m_ullPumpShadowWindowPumpFrames  += newFrames;
+        m_ullPumpShadowWindowLegacyBytes += m_ulLastUpdatePositionByteDisplacement;
+        m_ulPumpShadowWindowCallCount++;
+
+        if (m_ulPumpShadowWindowCallCount >= AO_PUMP_SHADOW_WINDOW_CALLS)
+        {
+            ULONGLONG legacyFrames =
+                m_ullPumpShadowWindowLegacyBytes / (ULONGLONG)nBlockAlign;
+            ULONGLONG pumpFrames = m_ullPumpShadowWindowPumpFrames;
+
+            ULONGLONG diff = (pumpFrames > legacyFrames)
+                ? (pumpFrames - legacyFrames)
+                : (legacyFrames - pumpFrames);
+
+            ULONGLONG larger = (pumpFrames > legacyFrames)
+                ? pumpFrames
+                : legacyFrames;
+
+            // Tolerance: max(16 frames, 2% of larger total).
+            ULONGLONG twoPercent = larger / 50ull;
+            ULONGLONG tolerance  = (twoPercent > 16ull) ? twoPercent : 16ull;
+
+            if (diff > tolerance)
+            {
+                m_ulPumpShadowDivergenceCount++;
+            }
+
+            m_ullPumpShadowWindowPumpFrames  = 0;
+            m_ullPumpShadowWindowLegacyBytes = 0;
+            m_ulPumpShadowWindowCallCount    = 0;
+        }
+    }
+
+    // 11. Cleanup: consume the stash so the next call sees a fresh value.
+    m_ulLastUpdatePositionByteDisplacement = 0;
+
+Mirror:
+    // Mirror stream counters into the correct FRAME_PIPE direction slot.
+    // Phase 1 split render/capture slots; no cross-direction race.
+    {
+        PFRAME_PIPE pFP = NULL;
+        BOOLEAN isSpeaker = !m_bCapture;
+        if (m_pMiniport->m_DeviceType == eCableASpeaker ||
+            m_pMiniport->m_DeviceType == eCableAMic)
+        {
+            pFP = &g_CableAPipe;
+        }
+        else if (m_pMiniport->m_DeviceType == eCableBSpeaker ||
+                 m_pMiniport->m_DeviceType == eCableBMic)
+        {
+            pFP = &g_CableBPipe;
+        }
+        if (pFP)
+        {
+            if (isSpeaker)
+            {
+                pFP->RenderGatedSkipCount             = m_ulPumpGatedSkipCount;
+                pFP->RenderOverJumpCount              = m_ulPumpOverJumpCount;
+                pFP->RenderFramesProcessedTotal       = m_ullPumpFramesProcessed;
+                pFP->RenderPumpInvocationCount        = m_ulPumpInvocationCount;
+                pFP->RenderPumpShadowDivergenceCount  = m_ulPumpShadowDivergenceCount;
+                pFP->RenderPumpFeatureFlags           = m_ulPumpFeatureFlags;
+            }
+            else
+            {
+                pFP->CaptureGatedSkipCount            = m_ulPumpGatedSkipCount;
+                pFP->CaptureOverJumpCount             = m_ulPumpOverJumpCount;
+                pFP->CaptureFramesProcessedTotal      = m_ullPumpFramesProcessed;
+                pFP->CapturePumpInvocationCount       = m_ulPumpInvocationCount;
+                pFP->CapturePumpShadowDivergenceCount = m_ulPumpShadowDivergenceCount;
+                pFP->CapturePumpFeatureFlags          = m_ulPumpFeatureFlags;
+            }
+        }
+    }
+}
+
+//=============================================================================
 VOID CMiniportWaveRTStream::UpdatePosition
 (
     _In_ LARGE_INTEGER ilQPC
@@ -1526,6 +1844,17 @@ VOID CMiniportWaveRTStream::UpdatePosition
     // Update the DMA time stamp for the next call to GetPosition()
     //
     m_ullDmaTimeStamp = hnsCurrentTime;
+
+    // Phase 3 (Revision 2, 2026-04-13): accumulate finalized (post-EOS-clamp,
+    // post-block-align) ByteDisplacement into the shadow pump stash.
+    // Must be `+=`, not `=`: TimerNotifyRT also calls UpdatePosition every
+    // 1 ms for cable endpoints, so per-call overwrite would drop the
+    // timer-path contribution and the pump's rolling window would only see
+    // a tiny GetPositions-only residual. With `+=`, the stash holds the
+    // true total bytes legacy transport processed between pump consumes.
+    // The pump helper reads and zeros this field under m_PositionSpinLock
+    // in PumpToCurrentPositionFromQuery(), so reader/writer are serialized.
+    m_ulLastUpdatePositionByteDisplacement += ByteDisplacement;
 }
 
 //=============================================================================

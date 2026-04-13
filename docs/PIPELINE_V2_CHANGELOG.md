@@ -1,5 +1,56 @@
 # Pipeline V2 Changelog
 
+## 2026-04-13 — Phase 3: Shadow-mode query pump on GetPositions (no ownership move)
+
+**Files changed:**
+- `Source/Main/minwavertstream.h` — +`PumpToCurrentPositionFromQuery(LARGE_INTEGER ilQPC)` private helper declaration, placed between `UpdatePosition` and `SetCurrentWritePositionInternal`. No new fields — all 14 Phase 1 state fields are reused.
+- `Source/Main/minwavertstream.cpp` — +helper implementation (right before `UpdatePosition`). `GetPositions()` now calls `PumpToCurrentPositionFromQuery(ilQPC)` in the same call as `UpdatePosition(ilQPC)`, still under `m_PositionSpinLock`. `UpdatePosition()` stashes the finalized (post-EOS-clamp, post-block-align) `ByteDisplacement` into `m_ulLastUpdatePositionByteDisplacement` at function end. `SetState(KSSTATE_RUN)` arms `AO_PUMP_FLAG_ENABLE | AO_PUMP_FLAG_SHADOW_ONLY` for cable endpoints and re-arms per-run state (monotonic counters preserved). `SetState(KSSTATE_STOP)` clears all pump state and zeros the mirrored pipe feature flags.
+- `results/phase3_edit_proposal.md` — approval record already locked in checkpoint commit `f042b79`.
+
+**What:** Phase 3 introduces a SHADOW-ONLY pump helper on the confirmed hot path (`GetPositions()`, proven in Phase 0 runtime evidence at 120 calls / 5 s during a real Phone Link run). The helper computes elapsed frames from a run-local QPC baseline, applies the 8-frame minimum gate (`FP_MIN_GATE_FRAMES`), applies a dynamic over-jump guard at `max(FP_MIN_GATE_FRAMES, framesPerDmaBuffer / 2)`, and runs a rolling-window compare against the same-call legacy `ByteDisplacement` over `AO_PUMP_SHADOW_WINDOW_CALLS = 128` calls with a `max(16 frames, 2% of larger total)` tolerance. Stream counters are mirrored into the Phase 1 per-direction `FRAME_PIPE` slots.
+
+**Why:** Phase 3 is the parity-first gate in front of Phase 5 (render ownership move) and Phase 6 (capture ownership move). Before any transport ownership moves from legacy `UpdatePosition()` → `ReadBytes()/WriteBytes()` into a query-driven pump, the pump's timing/accounting has to prove itself against the legacy math on real runtime under the same spinlock. Shadow-mode isolates timing and accounting risk from transport risk.
+
+**Non-goals:**
+- No transport mutation. The helper never calls `FramePipeWriteFromDma`, `FramePipeReadToDma`, `WriteBytes`, or `ReadBytes`.
+- `AO_PUMP_FLAG_DISABLE_LEGACY_RENDER` / `AO_PUMP_FLAG_DISABLE_LEGACY_CAPTURE` stay clear in Phase 3.
+- `GetPosition()` (cold path per Phase 0) is untouched.
+- `TimerNotifyRT` (legacy timer path) is untouched — Phase 3 is strictly query-path bring-up.
+- No IOCTL shape change. No `test_stream_monitor.py` schema change. Phase 1 already landed the diagnostic contract.
+- No new `FRAME_PIPE` fields. Phase 1 already split render/capture slots.
+
+**Stash semantic (Revision 2, locked 2026-04-13 after first-flush false divergence):**
+`UpdatePosition()` now accumulates the finalized ByteDisplacement into `m_ulLastUpdatePositionByteDisplacement` with `+=`, not `=`. Reason: `TimerNotifyRT` also calls `UpdatePosition()` every 1 ms for cable endpoints, under the same `m_PositionSpinLock`. With per-call overwrite, the pump's rolling-window legacy-byte sum only captured the residual bytes between the most recent timer tick and each `GetPositions()` call (~1 ms worth). The pump's elapsed-time math, in contrast, covered the full baseline-to-now interval (~100 ms per call). The resulting ~99% mismatch guaranteed a false divergence firing on every window flush. With `+=`, the stash holds the true total bytes legacy transport processed between pump consumes, matching the pump's baseline-to-now scope. The pump helper reads and zeros this field under the same spinlock, so reader/writer are fully serialized.
+
+**Locked defaults (from approval record in `results/phase3_edit_proposal.md`, Revision 1 + Revision 2):**
+1. `AO_PUMP_SHADOW_WINDOW_CALLS = 128`
+2. Divergence tolerance = `max(16 frames, 2% of larger total)`
+3. Over-jump threshold = `max(framesPerDmaBuffer * 2, sampleRate / 4)`
+4. Cable-endpoint guard lives inside `PumpToCurrentPositionFromQuery()` (single source of truth).
+
+**Over-jump semantic (Revision 1, locked 2026-04-13 after false-green bring-up):**
+Phase 3 over-jump is count-only diagnostic. When `newFrames` exceeds the threshold, `m_ulPumpOverJumpCount++` fires but the helper does NOT return, does NOT rebase `m_ulPumpProcessedFrames`, and does NOT reset the rolling-window accumulators. Frame accounting and shadow compare proceed normally. Real skip/clamp semantics return in Phase 5/6 when the pump starts owning transport. This revision was required because the first bring-up run hit the over-jump branch on ~96% of calls, so the rolling shadow window never flushed and `PumpShadowDivergenceCount == 0` was a false green. Phase 3 closure now additionally requires at least one real window flush during active validation.
+
+**State-transition contract:**
+- **RUN arm (cable only):** set flags = `ENABLE|SHADOW_ONLY`; zero baseline, processed-frames, last-buffer-offset, window accumulators, stash, per-session `GatedSkipCount`/`OverJumpCount`; preserve monotonic `InvocationCount`/`ShadowDivergenceCount`/`FramesProcessed`; snapshot flags into the correct `FRAME_PIPE` direction slot.
+- **STOP clear (cable only):** zero everything including monotonic counters and mirrored pipe feature flags so a new STOP→RUN session starts from zero.
+- **PAUSE:** untouched. RUN re-arm rebuilds the timing baseline on resume.
+- **Runtime rollback:** clearing `AO_PUMP_FLAG_ENABLE` at runtime immediately turns the helper into a no-op — no reinstall/reboot.
+
+**Exit criteria (Codex Phase 3, Revision 1):**
+1. AO builds green.
+2. No regression in basic playback/capture open/close.
+3. Helper shows sane frame deltas under position polling.
+4. Shadow mode proves gate/accounting stability.
+5. 5-minute Phone Link-like run: `PumpShadowDivergenceCount` windowed count stays at `0`.
+6. Zero-divergence holds under normal, aggressive, and sparse polling.
+7. **At least one real rolling-window compare executes during active validation** — `0` divergence with zero window flushes does not pass.
+8. Clearing the feature flag at runtime turns the helper into an accounting-only no-op.
+
+**Rollback:** `git revert <this commit>`, rebuild, reinstall. Expected surface is 2 source files + this changelog.
+
+---
+
 ## 2026-04-13 — Phase 2: Format parity fixes for 32-bit PCM and 32-bit float (G9, G10)
 
 **Files changed:**

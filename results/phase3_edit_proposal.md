@@ -2,12 +2,26 @@
 
 Date: 2026-04-13
 Author: Codex
-Status: PROPOSAL - pending lock before edit
+Status: PROPOSAL - revised after first bring-up false-green finding
 Scope: Phase 3 of the `feature/ao-fixed-pipe-rewrite` parity-first rewrite.
 
 ## Approval record
 
-Locked 2026-04-13 (user + Claude, based on this Codex proposal).
+Locked 2026-04-13, then revised after Phase 3 first bring-up produced a
+false-green shadow result.
+
+Revision reason:
+- first active polling run proved that helper wiring, flags, and hot-path hook
+  were correct,
+- but almost every call hit the over-jump guard,
+- which prevented the rolling shadow window from ever flushing,
+- so `PumpShadowDivergenceCount == 0` was not yet a meaningful parity signal.
+
+Revision principle:
+- in Phase 3 SHADOW_ONLY mode, over-jump remains a diagnostic counter, not a
+  compare-suppressing stop condition.
+- real skip/clamp semantics belong to Phase 5/6, where the pump starts owning
+  transport.
 
 Scope lock:
 - Hook target: `CMiniportWaveRTStream::GetPositions()` ONLY.
@@ -25,9 +39,16 @@ Scope lock:
 Default lock:
 1. `AO_PUMP_SHADOW_WINDOW_CALLS = 128`
 2. Divergence tolerance = `max(16 frames, 2% of the larger total)`
-3. Over-jump threshold = `max(FP_MIN_GATE_FRAMES /* =8 */, framesPerDmaBuffer / 2)`
+3. Over-jump threshold = `max(framesPerDmaBuffer * 2, sampleRate / 4)`
 4. Cable-endpoint guard lives INSIDE `PumpToCurrentPositionFromQuery()`
    (single source of truth; call sites stay simple).
+
+Semantic lock:
+- Phase 3 over-jump is count-only diagnostic.
+- Over-jump increments `m_ulPumpOverJumpCount` but does NOT block window
+  accumulation or shadow compare.
+- Phase 3 closure requires at least one real shadow-window flush during active
+  validation; `divergence == 0` without a flush is not considered green.
 
 Any deviation from the above requires a new proposal revision before edit.
 
@@ -102,6 +123,7 @@ moves in Phase 5 and Phase 6.
   `AO_PUMP_FLAG_DISABLE_LEGACY_CAPTURE` must remain clear.
 - `UpdatePosition()` remains the only transport owner in this phase.
 - Pump helper performs compute, compare, and counter publication only.
+- Over-jump in Phase 3 is diagnostic only; it must not suppress shadow compare.
 - Runtime rollback must still be a simple feature-flag clear, not a reinstall.
 
 ### 1.5 Exit criteria
@@ -117,7 +139,9 @@ Authoritative Phase 3 exit criteria remain the Codex rules:
    stays at `0`.
 6. The same zero-divergence result holds under at least three polling regimes:
    normal, aggressive, and sparse.
-7. Clearing the Phase 3 feature flag at runtime immediately turns the helper
+7. At least one real rolling-window compare executes during active validation;
+   `0` divergence with zero flushes does not pass.
+8. Clearing the Phase 3 feature flag at runtime immediately turns the helper
    into an accounting-only no-op.
 
 ### 1.6 Idle expectations
@@ -206,6 +230,28 @@ Consequence:
 - no attempt to "shadow compare" inside the timer callback.
 
 Phase 3 is strictly the public query-path bring-up.
+
+### 2.6 First bring-up exposed a false-green over-jump policy
+
+Observed active validation pattern:
+
+- helper invocation counts increased,
+- feature flags were correct,
+- divergence stayed `0`,
+- but `OverJumpCount` increased on nearly every call,
+- and the rolling window never flushed.
+
+Root cause:
+- the earlier threshold (`framesPerDmaBuffer / 2`) was far below real
+  query-to-query frame deltas under normal polling,
+- so the helper counted almost every call as an over-jump,
+- and the original skip/rebase behavior prevented window compare from running.
+
+Consequence:
+- Phase 3 cannot treat over-jump as a compare-blocking condition.
+- In SHADOW_ONLY mode, over-jump must remain visible for diagnostics while
+  allowing the rolling compare to continue.
+- True clamp/skip semantics move to Phase 5/6 when transport ownership exists.
 
 ---
 
@@ -310,8 +356,10 @@ Required helper responsibilities:
 8. Over-jump guard:
    - derive `framesPerDmaBuffer = m_ulDmaBufferSize / nBlockAlign`
    - compare `newFrames` against the chosen threshold
-   - if exceeded, increment `m_ulPumpOverJumpCount`, rebase, mirror state,
-     return
+   - if exceeded, increment `m_ulPumpOverJumpCount`
+   - do NOT return
+   - do NOT rebase
+   - continue into rolling-window accumulation and compare
 9. Accepted-frame accounting:
    - advance `m_ulPumpProcessedFrames`
    - increment `m_ullPumpFramesProcessed`
@@ -465,14 +513,17 @@ Reason:
 Recommended default:
 
 ```text
-max(FP_MIN_GATE_FRAMES, framesPerDmaBuffer / 2)
+max(framesPerDmaBuffer * 2, sampleRate / 4)
 ```
 
 Reason:
 - avoids a magic absolute frame constant,
 - scales with actual DMA buffer geometry,
-- mirrors the "half-buffer is suspicious" intuition used in the Claude sketch,
-- remains safely above the normal 8-frame minimum gate.
+- stays above normal query-to-query deltas seen in practice,
+- keeps over-jump meaningful as an anomaly counter instead of a near-always-hit
+  false alarm,
+- still leaves Phase 5/6 free to impose a stricter transport-owning guard if
+  runtime evidence later supports it.
 
 ### 4.4 Cable-endpoint guard location
 
@@ -504,10 +555,13 @@ Reason:
 
 1. normal polling run
    - 5-minute run
+   - at least one rolling shadow window flush
    - divergence counter stays `0`
 2. aggressive polling run
+   - at least one rolling shadow window flush
    - divergence counter stays `0`
 3. sparse polling run
+   - at least one rolling shadow window flush
    - divergence counter stays `0`
 4. runtime rollback proof
    - clearing `AO_PUMP_FLAG_ENABLE` turns helper into a no-op immediately
