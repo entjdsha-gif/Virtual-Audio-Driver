@@ -32,6 +32,26 @@ DEFINE_GUID(GUID_DEVINTERFACE_AO_VIRTUAL_CABLE,
 // Used by install.ps1 to enable in-session upgrade without reboot.
 #define IOCTL_AO_PREPARE_UNLOAD     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x805, METHOD_BUFFERED, FILE_WRITE_ACCESS)
 
+// Phase 5 (2026-04-14): SET_PUMP_FEATURE_FLAGS - runtime rollback knob for
+// pump transport ownership. Write-only. Input buffer is AO_PUMP_FLAGS_REQ.
+// In Phase 5, accepted mask bits are restricted to
+// AO_PUMP_FLAG_DISABLE_LEGACY_RENDER; all other bits in SetMask/ClearMask
+// are silently dropped. Handler finds the active cable render stream on
+// the target miniport and atomically applies
+//   flags |= (SetMask & AcceptedMask); flags &= ~(ClearMask & AcceptedMask)
+// under the stream's m_PositionSpinLock. Effect is visible at the next
+// PumpToCurrentPositionFromQuery() invocation (1-2 position queries).
+#define IOCTL_AO_SET_PUMP_FEATURE_FLAGS CTL_CODE(FILE_DEVICE_UNKNOWN, 0x806, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+
+// Input struct for IOCTL_AO_SET_PUMP_FEATURE_FLAGS.
+// Both masks are applied in order: SetMask bits turn on, then ClearMask
+// bits turn off. Caller may therefore pass the same bit in both fields
+// to force a clear regardless of current state.
+typedef struct _AO_PUMP_FLAGS_REQ {
+    ULONG   SetMask;
+    ULONG   ClearMask;
+} AO_PUMP_FLAGS_REQ;
+
 // Stream status for a single cable endpoint
 typedef struct _AO_ENDPOINT_STATUS {
     BOOLEAN Active;
@@ -118,11 +138,22 @@ typedef struct _AO_V2_DIAG {
     ULONG   B_C_PumpInvocationCount;
     ULONG   B_C_PumpShadowDivergenceCount;
     ULONG   B_C_PumpFeatureFlags;
+
+    // Phase 5 (2026-04-14): per-side drive counters for one-owner proof.
+    // Only render-side counters are wired in Phase 5; capture-side will
+    // come in Phase 6. These live at the V2 tail so Phase 1/3/4 consumers
+    // that read only the first 116 bytes still work (the driver writes
+    // the old layout too when the buffer is smaller).
+    ULONG   A_R_PumpDriveCount;
+    ULONG   A_R_LegacyDriveCount;
+    ULONG   B_R_PumpDriveCount;
+    ULONG   B_R_LegacyDriveCount;
 } AO_V2_DIAG;
 
 // Compile-time shape guard. Bump this C_ASSERT whenever AO_V2_DIAG grows.
-// Current layout: StructSize + 4 blocks * 7 ULONGs = 29 ULONGs = 116 bytes.
-C_ASSERT(sizeof(AO_V2_DIAG) == (1 + 4 * 7) * sizeof(ULONG));
+// Phase 5 layout: StructSize (1) + 4 blocks * 7 ULONGs (28) +
+// 4 render-side drive counters (4) = 33 ULONGs = 132 bytes.
+C_ASSERT(sizeof(AO_V2_DIAG) == (1 + 4 * 7 + 4) * sizeof(ULONG));
 
 // Registry value names for persistent settings (stored under service Parameters key)
 // e.g. HKLM\SYSTEM\CurrentControlSet\Services\AOCableA\Parameters

@@ -35,7 +35,9 @@ C_ASSERT(FIELD_OFFSET(LOOPBACK_BUFFER, InternalBlockAlign) == 0x4D8);
 
 // Phase 1: AO_V2_DIAG shape guard. Mirrors the ioctl.h C_ASSERT so a
 // mismatch caused by editing only one of the two headers fails to build.
-C_ASSERT(sizeof(AO_V2_DIAG) == 116);
+// Phase 5 (2026-04-14): bumped from 116 to 132 after render-side drive
+// counter tail extension.
+C_ASSERT(sizeof(AO_V2_DIAG) == 132);
 
 typedef void (*fnPcDriverUnload) (PDRIVER_OBJECT);
 fnPcDriverUnload gPCDriverUnloadRoutine = NULL;
@@ -1758,6 +1760,22 @@ AoDeviceControlHandler(
             pDiag->B_C_PumpFeatureFlags          = g_CableBPipe.CapturePumpFeatureFlags;
 #endif
 
+            // Phase 5 (2026-04-14): render-side drive counters at V2 tail.
+            // Zero-filled for cables not built into this driver variant
+            // (CABLE_A-only builds leave B counters at zero, etc.).
+            pDiag->A_R_PumpDriveCount            = 0;
+            pDiag->A_R_LegacyDriveCount          = 0;
+            pDiag->B_R_PumpDriveCount            = 0;
+            pDiag->B_R_LegacyDriveCount          = 0;
+#if defined(CABLE_A) || !defined(CABLE_B)
+            pDiag->A_R_PumpDriveCount            = g_CableAPipe.RenderPumpDriveCount;
+            pDiag->A_R_LegacyDriveCount          = g_CableAPipe.RenderLegacyDriveCount;
+#endif
+#if defined(CABLE_B) || !defined(CABLE_A)
+            pDiag->B_R_PumpDriveCount            = g_CableBPipe.RenderPumpDriveCount;
+            pDiag->B_R_LegacyDriveCount          = g_CableBPipe.RenderLegacyDriveCount;
+#endif
+
             bytesReturned = v2Offset + sizeof(AO_V2_DIAG);
         }
         else
@@ -1798,6 +1816,33 @@ AoDeviceControlHandler(
         }
 
         status = STATUS_SUCCESS;
+        break;
+    }
+
+    case IOCTL_AO_SET_PUMP_FEATURE_FLAGS:
+    {
+        // Phase 5 (2026-04-14): runtime rollback knob for render
+        // ownership. Write-only, mask-constrained to
+        // AO_PUMP_FLAG_DISABLE_LEGACY_RENDER inside
+        // AoPumpApplyRenderFlagMask(). Effect is visible at the next
+        // PumpToCurrentPositionFromQuery() call (1-2 position queries).
+        if (irpSp->Parameters.DeviceIoControl.InputBufferLength < sizeof(AO_PUMP_FLAGS_REQ))
+        {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        AO_PUMP_FLAGS_REQ* pReq = (AO_PUMP_FLAGS_REQ*)Irp->AssociatedIrp.SystemBuffer;
+        ULONG setMask   = pReq->SetMask;
+        ULONG clearMask = pReq->ClearMask;
+#if defined(CABLE_A)
+        status = AoPumpApplyRenderFlagMask(0, setMask, clearMask);
+#elif defined(CABLE_B)
+        status = AoPumpApplyRenderFlagMask(1, setMask, clearMask);
+#else
+        status = AoPumpApplyRenderFlagMask(0, setMask, clearMask);
+        if (NT_SUCCESS(status))
+            status = AoPumpApplyRenderFlagMask(1, setMask, clearMask);
+#endif
         break;
     }
 

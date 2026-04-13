@@ -39,8 +39,14 @@ GENERIC_WRITE = 0x40000000
 OPEN_EXISTING = 3
 
 V1_STATUS_SIZE = 64
-V2_DIAG_SIZE = 4 + 4 * 7 * 4  # 116
-V2_BUF_SIZE = V1_STATUS_SIZE + V2_DIAG_SIZE
+# Phase 5 (2026-04-14): driver now returns 132-byte V2 tail (was 116 in
+# Phase 1/3/4). Allocate the larger buffer so the driver writes the full
+# new shape including the render-side drive counters at the tail. The
+# Phase 1 blocks stay at the same offsets, so this script's slicing of
+# the A_Render block is unchanged.
+V2_DIAG_SIZE_P1 = 4 + 4 * 7 * 4          # 116
+V2_DIAG_SIZE    = V2_DIAG_SIZE_P1 + 16   # 132
+V2_BUF_SIZE     = V1_STATUS_SIZE + V2_DIAG_SIZE
 
 
 def open_device(name):
@@ -59,10 +65,11 @@ def read_render_counters(h):
     ok = kernel32.DeviceIoControl(
         h, IOCTL_AO_GET_STREAM_STATUS, None, 0, buf, V2_BUF_SIZE, ctypes.byref(ret), None
     )
-    if not ok or ret.value < V1_STATUS_SIZE + V2_DIAG_SIZE:
+    if not ok or ret.value < V1_STATUS_SIZE + V2_DIAG_SIZE_P1:
         return None
     struct_size = struct.unpack_from("<I", buf.raw, V1_STATUS_SIZE)[0]
-    if struct_size != V2_DIAG_SIZE:
+    # Accept either the Phase 1 (116) or the Phase 5 (132) shape.
+    if struct_size != V2_DIAG_SIZE_P1 and struct_size != V2_DIAG_SIZE:
         return None
     # CableA_Render is the first block, right after StructSize.
     offset = V1_STATUS_SIZE + 4
@@ -221,9 +228,12 @@ def run_regime(name, duration_s, poll_interval_s, device_idx, h):
     print(f"  delta (t_in_run -> t_near_end): Inv+={inv_delta} Div+={div_delta} Frames+={frames_delta}")
 
     ok = True
-    if t_near_end["PumpFeatureFlags"] != 0x00000003:
+    # Phase 3 expected 0x00000003 (ENABLE|SHADOW_ONLY).
+    # Phase 5 adds DISABLE_LEGACY_RENDER for cable speaker RUN, so the
+    # accepted set widens to {0x03, 0x07} on the render side.
+    if t_near_end["PumpFeatureFlags"] not in (0x00000003, 0x00000007):
         print(
-            f"  [FAIL] Flags=0x{t_near_end['PumpFeatureFlags']:08X} while stream should be in RUN with ENABLE|SHADOW_ONLY"
+            f"  [FAIL] Flags=0x{t_near_end['PumpFeatureFlags']:08X} while stream should be in RUN with ENABLE|SHADOW_ONLY or Phase 5 render-armed"
         )
         ok = False
     if inv_delta <= 0:

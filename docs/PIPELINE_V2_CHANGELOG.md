@@ -1,5 +1,70 @@
 # Pipeline V2 Changelog
 
+## 2026-04-14 — Phase 5: Pump owns cable render transport (IOCTL-gated runtime rollback)
+
+**Files changed:**
+- `Source/Utilities/loopback.h` — 2 new `FRAME_PIPE` fields (`RenderPumpDriveCount`, `RenderLegacyDriveCount`); new C-style entry `AoPumpApplyRenderFlagMask()` declared here.
+- `Source/Utilities/loopback.cpp` — `FramePipeInit()` zeros the new fields. `FramePipeReset()` intentionally does NOT touch them (monotonic evidence counters, like the Phase 1 pump counters).
+- `Source/Main/ioctl.h` — new `IOCTL_AO_SET_PUMP_FEATURE_FLAGS` code, new `AO_PUMP_FLAGS_REQ` request struct, `AO_V2_DIAG` extended with 4 tail ULONGs (`A_R_PumpDriveCount`, `A_R_LegacyDriveCount`, `B_R_PumpDriveCount`, `B_R_LegacyDriveCount`), `C_ASSERT` bumped from 116 to 132.
+- `Source/Main/adapter.cpp` — mirror `C_ASSERT` bumped to 132; V2 diag fill populates the 4 new tail fields for whichever cable(s) the build targets; new `IOCTL_AO_SET_PUMP_FEATURE_FLAGS` dispatch that unpacks the `AO_PUMP_FLAGS_REQ` and calls `AoPumpApplyRenderFlagMask()`.
+- `Source/Main/minwavertstream.h` — new public `ApplyPumpFlagMaskUnderLock()` method.
+- `Source/Main/minwavertstream.cpp` —
+  - pump helper body `PumpToCurrentPositionFromQuery()`: cable pipe resolution hoisted out of the Mirror block to just after the cable-only gate so both the new transport block and the Mirror block share one `pFP`; new render transport block between step 9 (accepted-frame accounting) and step 10 (rolling-window shadow compare), gated on `!m_bCapture && cable speaker && (flags & AO_PUMP_FLAG_DISABLE_LEGACY_RENDER) && pFP->Initialized && m_pDmaBuffer && m_ulDmaBufferSize > 0 && newFrames > 0`; first-call sync from `m_ullLinearPosition % m_ulDmaBufferSize` so the first pump chunk lands where the legacy path would have written; wrap-safe DMA chunks into `FramePipeWriteFromDma()`; `m_ulPumpLastBufferOffset` advances independently of `m_ullLinearPosition`; `RenderPumpDriveCount` incremented once per helper invocation that executes the block (not per chunk);
+  - `UpdatePosition()` render branch: existing cable `ReadBytes(ByteDisplacement)` call is now gated `!pumpOwnsRender` where `pumpOwnsRender = isCable && (m_ulPumpFeatureFlags & AO_PUMP_FLAG_DISABLE_LEGACY_RENDER)`. Non-cable render (savedata fallback) is unchanged;
+  - `ReadBytes()` cable branch: `RenderLegacyDriveCount` incremented once per invocation that enters the cable-pipe branch (not per DMA chunk);
+  - `SetState(KSSTATE_RUN)` cable speaker arm: new `runFlags` builder adds `AO_PUMP_FLAG_DISABLE_LEGACY_RENDER` for cable speaker; after arming, registers this stream via `AoPumpRegisterActiveRenderStream()` so the IOCTL rollback knob can find it;
+  - `SetState(KSSTATE_PAUSE)` from RUN (cable speaker): `AoPumpUnregisterActiveRenderStream()` called after the Phase 4 pump working-state clear;
+  - `SetState(KSSTATE_STOP)` (cable speaker): `AoPumpUnregisterActiveRenderStream()` called after the Phase 3 STOP clear, outside `m_PositionSpinLock`;
+  - destructor: unconditional `AoPumpUnregisterActiveRenderStream()` before the Phase 4 cable unregister, so a torn-down stream that skipped clean SetState transitions still drops its registration;
+  - new static file-scope globals `g_CableAActiveRenderStream` / `g_CableBActiveRenderStream` with per-cable `KSPIN_LOCK`s, plus static register/unregister helpers, plus the `extern "C" AoPumpApplyRenderFlagMask()` implementation that resolves the target stream under the per-cable lock and calls `ApplyPumpFlagMaskUnderLock()` on it with mask-constrained bits.
+- `test_stream_monitor.py` — parser accepts both Phase 1 (116) and Phase 5 (132) V2 diag shapes; Phase 5 render rows display `PumpDrv` and `LegacyDrv` counters when present.
+- `tests/phase3_shadow_active.py`, `tests/phase3_live_call_shadow.py` — buffer size bumped to 132 and `StructSize` check accepts either shape. A_Render block offsets are unchanged so the rest of these scripts work without edits.
+- `tests/phase5_rollback.py` (new) — drives the Phase 5 rollback smoke test: starts a continuous WASAPI exclusive sine into AO Cable A speaker, toggles `IOCTL_AO_SET_PUMP_FEATURE_FLAGS` to clear then re-set `AO_PUMP_FLAG_DISABLE_LEGACY_RENDER`, and asserts the four-quadrant counter signature (`RenderPumpDriveCount` grows / `RenderLegacyDriveCount` frozen when pump-owned; opposite when legacy-owned).
+- `results/phase5_edit_proposal.md` — locked approval record in checkpoint `a1d8d3a`.
+
+**What:** Cable render transport moves from the legacy `UpdatePosition() -> ReadBytes() -> FramePipeWriteFromDma()` chain to the Phase 3 pump helper. Both call sites now check `AO_PUMP_FLAG_DISABLE_LEGACY_RENDER` on a single flag bit, with logically complementary gates — the pump transport block runs iff the bit is set, and `ReadBytes()` runs for cable render iff the bit is clear. The two paths are therefore mutually exclusive by construction at the source level.
+
+Runtime rollback: a new write-only IOCTL (`IOCTL_AO_SET_PUMP_FEATURE_FLAGS`) takes an `AO_PUMP_FLAGS_REQ { SetMask, ClearMask }` struct and atomically updates the active cable render stream's `m_ulPumpFeatureFlags` under its `m_PositionSpinLock`. The IOCTL is mask-constrained to `AO_PUMP_FLAG_DISABLE_LEGACY_RENDER` in Phase 5; other bits are silently dropped. Effect is visible at the very next `PumpToCurrentPositionFromQuery()` invocation (1-2 position queries), matching Codex exit criterion #5's literal requirement. The IOCTL is not persistent — each RUN transition re-arms the default (flag set).
+
+One-owner evidence: two new `FRAME_PIPE` fields per cable (`RenderPumpDriveCount`, `RenderLegacyDriveCount`) are incremented at the two respective call sites, each at most once per invocation. The V2 diag struct exposes them at the tail (`V2_DIAG_SIZE` 116 -> 132). The rollback smoke test asserts the four-quadrant signature: pump-owned state grows `RenderPumpDriveCount` and freezes `RenderLegacyDriveCount`; legacy-owned state does the opposite.
+
+**Why:** Codex Phase 5 "move render-side progression behind the query-driven helper". Phase 3 established the shadow compare math, Phase 4 aligned STOP/PAUSE state semantics, and this phase actually moves render transport ownership. Capture side stays on the legacy path until Phase 6. The IOCTL is scope-expanded rollout/rollback infrastructure, not a product feature; without it Codex exit criterion #5 can't be proved.
+
+**Non-negotiable guardrails (all held):**
+- Capture ownership is NOT touched. `AO_PUMP_FLAG_DISABLE_LEGACY_CAPTURE` stays clear. `UpdatePosition()`'s `WriteBytes()` call site is unchanged. The pump helper gains no capture transport block in this phase.
+- `UpdatePosition()` still owns `m_ullLinearPosition`, `m_ullWritePosition`, `m_ullPresentationPosition`, `m_ullDmaTimeStamp`, and the three carry-forward fields. The pump transport block intentionally does NOT touch any of these.
+- Pump helper uses its own buffer offset (`m_ulPumpLastBufferOffset`), synced to WaveRT view on first accepted call after RUN, then advances independently.
+- Overflow is reject, not overwrite. `FramePipeWriteFromDma()` return value is ignored; pipe's `DropCount` is the drop telemetry.
+- Phase 3 SHADOW_ONLY stays set alongside the new `DISABLE_LEGACY_RENDER` bit. The rolling-window shadow compare still runs; semantically it now compares the pump's frame math against `UpdatePosition()`'s byte math (drift detector) rather than against a live legacy transport owner.
+- Phase 4 STOP/PAUSE state semantics are untouched.
+- Phase 4 destructor teardown order is untouched; the new pump unregister is inserted before the Phase 4 cable unregister.
+- No fade-in refactor.
+
+**Phase 3 shadow semantics after Phase 5:** `PumpShadowDivergenceCount` is no longer live parity proof against an active legacy transport owner. It is drift-detector proof that the pump's frame-delta math still agrees with `UpdatePosition()`'s byte-delta math. Any new divergence tick during Phase 5 validation is therefore evidence of a pump/UpdatePosition accounting drift, not a legacy-vs-pump race, and blocks commit regardless.
+
+**Verification:**
+- `build-verify.ps1 -Config Release` — green, 17/17 PASS.
+- `install.ps1 -Action upgrade` — expected `INSTALL_EXIT=0`, manifest match.
+- `test_ioctl_diag.py` — V1 IOCTL path intact, `ALL PASSED`.
+- `test_stream_monitor.py --once` — idle counters sane, `StructSize == 132`, drive counters visible.
+- `tests/phase3_shadow_active.py` — 3 regimes × 20s, `Inv > 128`, `Div == 0`, `OverJump == 0`, `Flags == 0x00000007` (ENABLE|SHADOW_ONLY|DISABLE_LEGACY_RENDER).
+- `tests/phase4_churn.py` — 20 STOP/RUN cycles × 1s, `Div == 0`, symbolic link stable.
+- `tests/phase3_live_call_shadow.py` — real Phone Link call, `A_Render peak Inv > 128`, `Div == 0`, flags reach `0x00000007`.
+- `tests/phase5_rollback.py` — four-quadrant one-owner assertion via IOCTL rollback.
+
+**Exit criteria (Codex Phase 5):**
+1. Render-side data progression works while query path is active.
+2. No byte-ring semantics reintroduced.
+3. No direct old-path overwrite behavior remains.
+4. One-owner confirmation that render transport fires from exactly one owner on the query path (via direct per-side counter evidence in `tests/phase5_rollback.py`).
+5. Runtime rollback smoke test passes: clearing the render-ownership flag returns render transport to the legacy path within one or two position queries (via `IOCTL_AO_SET_PUMP_FEATURE_FLAGS`, validated in `tests/phase5_rollback.py`).
+
+**Rollback:**
+- **Runtime (preferred, no rebuild):** issue `IOCTL_AO_SET_PUMP_FEATURE_FLAGS` with `ClearMask = AO_PUMP_FLAG_DISABLE_LEGACY_RENDER`. Render transport returns to legacy `ReadBytes` path on the next `GetPositions()` call. No reboot, no reinstall, no stream restart. The same IOCTL issued with `SetMask = AO_PUMP_FLAG_DISABLE_LEGACY_RENDER` re-enables pump ownership equally fast.
+- **Full source rollback:** `git revert <phase5-commit>`, rebuild, reinstall. Phase 3 and Phase 4 remain intact because Phase 5 is a strictly additive patch.
+
+---
+
 ## 2026-04-13 — Phase 4: Align STOP/PAUSE state semantics with VB before ownership move
 
 **Files changed:**

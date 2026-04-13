@@ -1361,6 +1361,11 @@ NTSTATUS FramePipeInit(
     pPipe->CapturePumpShadowDivergenceCount = 0;
     pPipe->CapturePumpFeatureFlags          = 0;
 
+    // Phase 5: per-side drive counters. Monotonic; not touched by
+    // FramePipeReset(). See loopback.h for the one-owner contract.
+    pPipe->RenderPumpDriveCount             = 0;
+    pPipe->RenderLegacyDriveCount           = 0;
+
     pPipe->ScratchDma           = scratchDma;
     pPipe->ScratchSpk           = scratchSpk;
     pPipe->ScratchMic           = scratchMic;

@@ -233,6 +233,21 @@ private:
         _In_ LARGE_INTEGER ilQPC
     );
 
+public:
+    // Phase 5 (2026-04-14): IOCTL_AO_SET_PUMP_FEATURE_FLAGS entry point.
+    // Called from AoPumpApplyRenderFlagMask() (see loopback.h) after the
+    // per-cable active-stream pointer has been resolved. Acquires
+    // m_PositionSpinLock internally and applies SetMask then ClearMask.
+    // Masks are already constrained to AO_PUMP_FLAG_DISABLE_LEGACY_RENDER
+    // by the caller; this method does not re-validate.
+    VOID ApplyPumpFlagMaskUnderLock
+    (
+        _In_ ULONG SetMask,
+        _In_ ULONG ClearMask
+    );
+
+private:
+
     NTSTATUS SetCurrentWritePositionInternal
     (
         _In_  ULONG ulCurrentWritePosition

@@ -42,8 +42,11 @@ OPEN_EXISTING = 3
 #                  PumpInvocationCount, PumpShadowDivergenceCount,
 #                  PumpFeatureFlags
 V1_STATUS_SIZE = 64
-V2_DIAG_SIZE   = 4 + 4 * 7 * 4   # StructSize + 4 * 7 ULONGs = 116
-V2_BUF_SIZE    = V1_STATUS_SIZE + V2_DIAG_SIZE
+# Phase 1 V2 diag: StructSize + 4 * 7 ULONGs = 116 bytes.
+# Phase 5 tail extension: +4 ULONGs (A_R/B_R pump/legacy drive counts) = 132.
+V2_DIAG_SIZE_P1  = 4 + 4 * 7 * 4                 # 116
+V2_DIAG_SIZE     = V2_DIAG_SIZE_P1 + 4 * 4       # 132
+V2_BUF_SIZE      = V1_STATUS_SIZE + V2_DIAG_SIZE
 V2_FIELDS_PER_BLOCK = 7
 
 
@@ -104,11 +107,14 @@ def get_stream_status(h):
     #   PumpInvocationCount, PumpShadowDivergenceCount,
     #   PumpFeatureFlags
     result['v2'] = False
-    if ret.value >= V1_STATUS_SIZE + V2_DIAG_SIZE:
+    # Accept either Phase 1 (116) or Phase 5 (132) tail, whichever the
+    # driver reports. Phase 5 clients see the full tail and 4 extra
+    # render-side drive counters; older drivers return the Phase 1 shape.
+    if ret.value >= V1_STATUS_SIZE + V2_DIAG_SIZE_P1:
         v2_offset = V1_STATUS_SIZE
         struct_size = struct.unpack_from('<I', buf.raw, v2_offset)[0]
 
-        if struct_size == V2_DIAG_SIZE:
+        if struct_size == V2_DIAG_SIZE_P1 or struct_size == V2_DIAG_SIZE:
             def read_block(offset):
                 fields = struct.unpack_from('<IIIIIII', buf.raw, offset)
                 return {
@@ -129,7 +135,21 @@ def get_stream_status(h):
             result['CableA_Render']  = read_block(cursor); cursor += block_bytes
             result['CableA_Capture'] = read_block(cursor); cursor += block_bytes
             result['CableB_Render']  = read_block(cursor); cursor += block_bytes
-            result['CableB_Capture'] = read_block(cursor)
+            result['CableB_Capture'] = read_block(cursor); cursor += block_bytes
+
+            # Phase 5 tail: 4 ULONGs of render-side drive counters.
+            # Present iff the driver returned the 132-byte shape.
+            if struct_size == V2_DIAG_SIZE:
+                a_r_pump, a_r_legacy, b_r_pump, b_r_legacy = struct.unpack_from(
+                    '<IIII', buf.raw, cursor)
+                result['CableA_Render']['RenderPumpDriveCount']   = a_r_pump
+                result['CableA_Render']['RenderLegacyDriveCount'] = a_r_legacy
+                result['CableB_Render']['RenderPumpDriveCount']   = b_r_pump
+                result['CableB_Render']['RenderLegacyDriveCount'] = b_r_legacy
+            else:
+                for key in ('CableA_Render', 'CableB_Render'):
+                    result[key]['RenderPumpDriveCount']   = None
+                    result[key]['RenderLegacyDriveCount'] = None
 
     return result
 
@@ -173,7 +193,7 @@ def print_status(cable_label, handle):
         render = status.get(f"{cable_label}_Render", {})
         capture = status.get(f"{cable_label}_Capture", {})
 
-        def fmt_block(tag, block):
+        def fmt_block(tag, block, is_render=False):
             gs = block.get('GatedSkipCount', 0)
             oj = block.get('OverJumpCount', 0)
             fp = block.get('FramesProcessedTotal', 0)
@@ -182,10 +202,18 @@ def print_status(cable_label, handle):
             flags = block.get('PumpFeatureFlags', 0)
             # Shadow divergence ratio is the Phase 3 exit-criterion metric.
             ratio = (div / inv * 100.0) if inv > 0 else 0.0
-            return (f"    {tag}: Gated={gs} OverJump={oj} Frames={fp} "
+            line = (f"    {tag}: Gated={gs} OverJump={oj} Frames={fp} "
                     f"Inv={inv} Div={div} ({ratio:.2f}%) Flags=0x{flags:08x}")
+            if is_render:
+                # Phase 5 render-side drive counters (may be None if the
+                # driver is still on Phase 1/3/4 layout).
+                pump_drv = block.get('RenderPumpDriveCount')
+                leg_drv  = block.get('RenderLegacyDriveCount')
+                if pump_drv is not None and leg_drv is not None:
+                    line += f" | PumpDrv={pump_drv} LegacyDrv={leg_drv}"
+            return line
 
-        print(fmt_block("Render ", render))
+        print(fmt_block("Render ", render, is_render=True))
         print(fmt_block("Capture", capture))
     else:
         print(f"    (V2 diag not available — expected {V2_DIAG_SIZE} bytes at offset {V1_STATUS_SIZE})")

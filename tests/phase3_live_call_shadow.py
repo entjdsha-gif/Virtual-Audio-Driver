@@ -36,8 +36,12 @@ GENERIC_WRITE = 0x40000000
 OPEN_EXISTING = 3
 
 V1_STATUS_SIZE = 64
-V2_DIAG_SIZE = 4 + 4 * 7 * 4
-V2_BUF_SIZE = V1_STATUS_SIZE + V2_DIAG_SIZE
+# Phase 5 (2026-04-14): driver writes 132-byte V2 tail. This script keeps
+# using only the Phase 1 block offsets, which are stable, but allocates
+# the larger buffer so the StructSize check still matches.
+V2_DIAG_SIZE_P1 = 4 + 4 * 7 * 4
+V2_DIAG_SIZE    = V2_DIAG_SIZE_P1 + 16
+V2_BUF_SIZE     = V1_STATUS_SIZE + V2_DIAG_SIZE
 
 SHADOW_WINDOW = 128
 
@@ -58,10 +62,10 @@ def read_all_blocks(h):
     ok = kernel32.DeviceIoControl(
         h, IOCTL_AO_GET_STREAM_STATUS, None, 0, buf, V2_BUF_SIZE, ctypes.byref(ret), None
     )
-    if not ok or ret.value < V1_STATUS_SIZE + V2_DIAG_SIZE:
+    if not ok or ret.value < V1_STATUS_SIZE + V2_DIAG_SIZE_P1:
         return None
     struct_size = struct.unpack_from("<I", buf.raw, V1_STATUS_SIZE)[0]
-    if struct_size != V2_DIAG_SIZE:
+    if struct_size != V2_DIAG_SIZE_P1 and struct_size != V2_DIAG_SIZE:
         return None
 
     def read_block(offset):
@@ -187,9 +191,11 @@ def main():
     primary_overjump = peak_overjump["A_Render"]
     primary_flags = saw_flags["A_Render"]
 
-    if primary_flags != 0x00000003:
+    # Phase 3 expected 0x00000003. Phase 5 cable speaker RUN also arms
+    # DISABLE_LEGACY_RENDER (0x04), so 0x07 is the Phase 5 render state.
+    if primary_flags not in (0x00000003, 0x00000007):
         print(
-            f"  [WARN] A_Render flags_seen=0x{primary_flags:08X}, expected 0x00000003 at some point"
+            f"  [WARN] A_Render flags_seen=0x{primary_flags:08X}, expected 0x00000003 or 0x00000007 at some point"
         )
     else:
         print("  [PASS] A_Render flags reached ENABLE|SHADOW_ONLY")

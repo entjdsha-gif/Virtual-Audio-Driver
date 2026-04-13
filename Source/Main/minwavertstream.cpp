@@ -12,6 +12,20 @@
 
 #pragma warning (disable : 4127)
 
+// Phase 5 (2026-04-14): forward declarations for per-cable active
+// render-stream registration helpers. Definitions live later in this
+// same file (near AoPumpApplyRenderFlagMask) so the static-file-scope
+// globals they touch are declared together; but the destructor and
+// SetState both need to call them from earlier in the file.
+static VOID AoPumpRegisterActiveRenderStream(
+    _In_ eDeviceType DeviceType,
+    _In_ PCMiniportWaveRTStream Stream
+);
+static VOID AoPumpUnregisterActiveRenderStream(
+    _In_ eDeviceType DeviceType,
+    _In_ PCMiniportWaveRTStream Stream
+);
+
 //=============================================================================
 // CMiniportWaveRTStream
 //=============================================================================
@@ -75,6 +89,20 @@ Return Value:
     // resources. After this point, no timer/DPC callback can still be
     // advancing the cable pipe via UpdatePosition() + the Phase 3 pump.
     KeFlushQueuedDpcs();
+
+    // Phase 5 (2026-04-14): drop any residual per-cable active
+    // render-stream registration before the cable unregister. A stream
+    // that went through STOP/PAUSE normally already dropped the
+    // registration, but a stream that was torn down directly (without a
+    // clean SetState transition) still needs to clear it so the next
+    // incoming IOCTL does not find a dangling pointer. The helper only
+    // clears if the current pointer matches, so this is safe even if
+    // another stream already registered.
+    if (NULL != m_pMiniport && !m_bCapture)
+    {
+        AoPumpUnregisterActiveRenderStream(
+            m_pMiniport->m_DeviceType, this);
+    }
 
     // Cable pipe unregister at the true stream-lifetime edge.
     // Moved out of SetState(KSSTATE_STOP) in Phase 4 so state churn no
@@ -1335,6 +1363,20 @@ NTSTATUS CMiniportWaveRTStream::SetState
 
             KeReleaseSpinLock(&m_PositionSpinLock, oldIrql);
 
+            // Phase 5 (2026-04-14): drop per-cable active-render-stream
+            // registration if this is a cable speaker stream. Must be
+            // OUTSIDE m_PositionSpinLock because the helper takes the
+            // per-cable active-stream lock, and the Phase 5 lock order is
+            // per-cable-active-stream-lock BEFORE m_PositionSpinLock
+            // (never the reverse).
+            if (m_pMiniport && !m_bCapture &&
+                (m_pMiniport->m_DeviceType == eCableASpeaker ||
+                 m_pMiniport->m_DeviceType == eCableBSpeaker))
+            {
+                AoPumpUnregisterActiveRenderStream(
+                    m_pMiniport->m_DeviceType, this);
+            }
+
             // Wait until all work items are completed.
 #if !defined(CABLE_A) && !defined(CABLE_B)
             if (!m_bCapture && !g_DoNotCreateDataFiles)
@@ -1442,6 +1484,19 @@ NTSTATUS CMiniportWaveRTStream::SetState
                         // Preserve per-session GatedSkipCount/OverJumpCount
                         // so churn-era diagnostics survive into RUN.
                         KeReleaseSpinLock(&m_PositionSpinLock, pauseIrql);
+
+                        // Phase 5 (2026-04-14): drop per-cable active
+                        // render-stream registration on PAUSE from RUN.
+                        // Same lock-order reason as STOP: this must be
+                        // outside m_PositionSpinLock. Capture streams
+                        // never registered, so skip them here.
+                        if (!m_bCapture &&
+                            (m_pMiniport->m_DeviceType == eCableASpeaker ||
+                             m_pMiniport->m_DeviceType == eCableBSpeaker))
+                        {
+                            AoPumpUnregisterActiveRenderStream(
+                                m_pMiniport->m_DeviceType, this);
+                        }
                     }
                 }
             }
@@ -1528,7 +1583,19 @@ NTSTATUS CMiniportWaveRTStream::SetState
                  m_pMiniport->m_DeviceType == eCableAMic      ||
                  m_pMiniport->m_DeviceType == eCableBMic))
             {
-                m_ulPumpFeatureFlags = AO_PUMP_FLAG_ENABLE | AO_PUMP_FLAG_SHADOW_ONLY;
+                ULONG runFlags = AO_PUMP_FLAG_ENABLE | AO_PUMP_FLAG_SHADOW_ONLY;
+                // Phase 5 (2026-04-14): arm render ownership for cable
+                // speaker endpoints. Pump takes over FramePipeWriteFromDma
+                // on this stream until STOP/PAUSE clears the flag or the
+                // IOCTL_AO_SET_PUMP_FEATURE_FLAGS rollback knob clears it
+                // at runtime. Capture streams never get the render bit.
+                if (!m_bCapture &&
+                    (m_pMiniport->m_DeviceType == eCableASpeaker ||
+                     m_pMiniport->m_DeviceType == eCableBSpeaker))
+                {
+                    runFlags |= AO_PUMP_FLAG_DISABLE_LEGACY_RENDER;
+                }
+                m_ulPumpFeatureFlags = runFlags;
 
                 m_bPumpInitialized                 = FALSE;
                 m_ullPumpBaselineHns               = 0;
@@ -1568,6 +1635,17 @@ NTSTATUS CMiniportWaveRTStream::SetState
                     {
                         pFP->CapturePumpFeatureFlags = m_ulPumpFeatureFlags;
                     }
+                }
+
+                // Phase 5: register as the per-cable active render stream
+                // so the IOCTL rollback knob can find us. Only cable
+                // speaker streams register; capture registers in Phase 6.
+                if (!m_bCapture &&
+                    (m_pMiniport->m_DeviceType == eCableASpeaker ||
+                     m_pMiniport->m_DeviceType == eCableBSpeaker))
+                {
+                    AoPumpRegisterActiveRenderStream(
+                        m_pMiniport->m_DeviceType, this);
                 }
             }
 
@@ -1635,6 +1713,20 @@ VOID CMiniportWaveRTStream::PumpToCurrentPositionFromQuery
     if (!isCable)
     {
         return;
+    }
+
+    // Phase 5 (2026-04-14): hoist cable pipe resolution out of the Mirror
+    // block so the render transport step below and the Mirror step both
+    // use the same resolved pointer.
+    PFRAME_PIPE pFP = NULL;
+    if (m_pMiniport->m_DeviceType == eCableASpeaker ||
+        m_pMiniport->m_DeviceType == eCableAMic)
+    {
+        pFP = &g_CableAPipe;
+    }
+    else
+    {
+        pFP = &g_CableBPipe;
     }
 
     // 3. Format sanity.
@@ -1739,6 +1831,71 @@ VOID CMiniportWaveRTStream::PumpToCurrentPositionFromQuery
         m_ulPumpProcessedFrames += newFrames;
         m_ullPumpFramesProcessed += newFrames;
 
+        // 9b. Phase 5 (2026-04-14): render transport block.
+        //     Pump takes ownership of FramePipeWriteFromDma for cable
+        //     speaker endpoints when AO_PUMP_FLAG_DISABLE_LEGACY_RENDER
+        //     is set. Legacy ReadBytes() cable branch is gated on the
+        //     complement of this flag, so the two sites are mutually
+        //     exclusive for cable render (dual-gate pattern).
+        //     - uses the pump-owned buffer offset, NOT
+        //       m_ullLinearPosition, to avoid long-run drift vs WaveRT
+        //       contract accounting;
+        //     - on first accepted call after RUN, syncs the pump offset
+        //       to the current WaveRT view so the first chunk lands at
+        //       the same byte the legacy path would have written;
+        //     - wraps the DMA buffer in chunks just like ReadBytes();
+        //     - does NOT touch m_ullLinearPosition, m_ullWritePosition,
+        //       m_ullPresentationPosition, or m_ullDmaTimeStamp. Those
+        //       stay UpdatePosition's responsibility per the WaveRT
+        //       packet-mode contract.
+        //     - FramePipeWriteFromDma return value is intentionally
+        //       unused: overflow is tracked by the pipe's DropCount and
+        //       is not a pump-side retry signal (reject, not overwrite).
+        if ((m_ulPumpFeatureFlags & AO_PUMP_FLAG_DISABLE_LEGACY_RENDER) != 0 &&
+            !m_bCapture &&
+            (m_pMiniport->m_DeviceType == eCableASpeaker ||
+             m_pMiniport->m_DeviceType == eCableBSpeaker) &&
+            pFP != NULL && pFP->Initialized &&
+            m_pDmaBuffer != NULL && m_ulDmaBufferSize > 0 &&
+            newFrames > 0)
+        {
+            ULONG bytesToMove = newFrames * nBlockAlign;
+
+            // First-call sync: if the pump has no prior offset but
+            // UpdatePosition's linear position has advanced, catch up to
+            // the current WaveRT view. After this first sync the pump's
+            // offset advances independently.
+            if (m_ulPumpLastBufferOffset == 0 && m_ullLinearPosition > 0)
+            {
+                m_ulPumpLastBufferOffset =
+                    (ULONG)(m_ullLinearPosition % m_ulDmaBufferSize);
+            }
+
+            ULONG bufferOffset = m_ulPumpLastBufferOffset;
+            ULONG remaining    = bytesToMove;
+            while (remaining > 0)
+            {
+                ULONG chunk = remaining;
+                ULONG room  = m_ulDmaBufferSize - bufferOffset;
+                if (chunk > room)
+                {
+                    chunk = room;
+                }
+                FramePipeWriteFromDma(
+                    pFP,
+                    m_pDmaBuffer + bufferOffset,
+                    chunk);
+                bufferOffset = (bufferOffset + chunk) % m_ulDmaBufferSize;
+                remaining   -= chunk;
+            }
+            m_ulPumpLastBufferOffset = bufferOffset;
+
+            // Phase 5 one-owner evidence: increment render pump drive
+            // counter exactly once per helper invocation that actually
+            // executed the transport block. Not per chunk.
+            pFP->RenderPumpDriveCount++;
+        }
+
         // 10. Rolling-window shadow compare vs. same-call legacy bytes.
         m_ullPumpShadowWindowPumpFrames  += newFrames;
         m_ullPumpShadowWindowLegacyBytes += m_ulLastUpdatePositionByteDisplacement;
@@ -1779,19 +1936,10 @@ VOID CMiniportWaveRTStream::PumpToCurrentPositionFromQuery
 Mirror:
     // Mirror stream counters into the correct FRAME_PIPE direction slot.
     // Phase 1 split render/capture slots; no cross-direction race.
+    // Phase 5: pFP is the hoisted cable pipe resolved right after the
+    // cable-only gate; same pointer is used by the render transport block.
     {
-        PFRAME_PIPE pFP = NULL;
         BOOLEAN isSpeaker = !m_bCapture;
-        if (m_pMiniport->m_DeviceType == eCableASpeaker ||
-            m_pMiniport->m_DeviceType == eCableAMic)
-        {
-            pFP = &g_CableAPipe;
-        }
-        else if (m_pMiniport->m_DeviceType == eCableBSpeaker ||
-                 m_pMiniport->m_DeviceType == eCableBMic)
-        {
-            pFP = &g_CableBPipe;
-        }
         if (pFP)
         {
             if (isSpeaker)
@@ -1897,10 +2045,21 @@ VOID CMiniportWaveRTStream::UpdatePosition
         {
             // Cable A/B always calls ReadBytes for loopback.
             // Non-cable devices only call ReadBytes when saving to file.
+            // Phase 5 (2026-04-14): render ownership dual-gate.
+            // Cable render transport is handled by the Phase 3 pump
+            // helper (PumpToCurrentPositionFromQuery) when
+            // AO_PUMP_FLAG_DISABLE_LEGACY_RENDER is set. The legacy
+            // ReadBytes() call below is gated on the complement, so the
+            // pump and ReadBytes never fire simultaneously for the same
+            // cable render stream. Clearing the flag via
+            // IOCTL_AO_SET_PUMP_FEATURE_FLAGS returns transport to this
+            // legacy path within 1-2 position queries.
             CMiniportWaveRT* pMp = m_pMiniport;
             BOOL isCable = (pMp && (pMp->m_DeviceType == eCableASpeaker ||
                                      pMp->m_DeviceType == eCableBSpeaker));
-            if (isCable || !g_DoNotCreateDataFiles)
+            BOOL pumpOwnsRender = isCable &&
+                ((m_ulPumpFeatureFlags & AO_PUMP_FLAG_DISABLE_LEGACY_RENDER) != 0);
+            if ((isCable && !pumpOwnsRender) || !g_DoNotCreateDataFiles)
             {
                 ReadBytes(ByteDisplacement);
             }
@@ -2117,6 +2276,16 @@ For other devices: save data to file (original behavior).
         (int)devType, ByteDisplacement, pPipe);
 #endif
 
+    // Phase 5 one-owner evidence: if we are about to run the cable
+    // legacy render path at all (ByteDisplacement > 0 and pPipe != NULL),
+    // count this invocation once. Not per DMA chunk. Counter freezes
+    // whenever AO_PUMP_FLAG_DISABLE_LEGACY_RENDER is set because
+    // UpdatePosition's dual-gate skips this call entirely in that case.
+    if (pPipe != NULL && ByteDisplacement > 0)
+    {
+        pPipe->RenderLegacyDriveCount++;
+    }
+
     while (ByteDisplacement > 0)
     {
         ULONG runWrite = min(ByteDisplacement, m_ulDmaBufferSize - bufferOffset);
@@ -2137,6 +2306,142 @@ For other devices: save data to file (original behavior).
         bufferOffset = (bufferOffset + runWrite) % m_ulDmaBufferSize;
         ByteDisplacement -= runWrite;
     }
+}
+
+//=============================================================================
+// Phase 5 (2026-04-14): IOCTL_AO_SET_PUMP_FEATURE_FLAGS stream-side handler.
+// Called from AoPumpApplyRenderFlagMask() (C-style entry point exported to
+// adapter.cpp via loopback.h) after the per-cable active-stream pointer has
+// been resolved. Masks are already constrained to
+// AO_PUMP_FLAG_DISABLE_LEGACY_RENDER by the caller.
+//=============================================================================
+VOID CMiniportWaveRTStream::ApplyPumpFlagMaskUnderLock
+(
+    _In_ ULONG SetMask,
+    _In_ ULONG ClearMask
+)
+{
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&m_PositionSpinLock, &oldIrql);
+    m_ulPumpFeatureFlags |= SetMask;
+    m_ulPumpFeatureFlags &= ~ClearMask;
+    KeReleaseSpinLock(&m_PositionSpinLock, oldIrql);
+}
+
+//=============================================================================
+// Phase 5 (2026-04-14): per-cable active cable-speaker stream pointers.
+// Set by SetState(KSSTATE_RUN) on cable speaker RUN, cleared by PAUSE (from
+// RUN) / STOP / destructor. Protected by per-cable spinlocks, initialized
+// to zero by BSS (KSPIN_LOCK is a ULONG_PTR; zero is the unlocked state,
+// which matches what KeInitializeSpinLock would write, so no explicit init
+// is required for globals in this module).
+// Only cable speaker streams register here; capture streams will use a
+// parallel global in Phase 6.
+//=============================================================================
+static PCMiniportWaveRTStream   g_CableAActiveRenderStream = NULL;
+static PCMiniportWaveRTStream   g_CableBActiveRenderStream = NULL;
+static KSPIN_LOCK               g_CableAActiveRenderLock;
+static KSPIN_LOCK               g_CableBActiveRenderLock;
+
+static VOID
+AoPumpRegisterActiveRenderStream(
+    _In_ eDeviceType DeviceType,
+    _In_ PCMiniportWaveRTStream Stream
+)
+{
+    KIRQL oldIrql;
+    if (DeviceType == eCableASpeaker)
+    {
+        KeAcquireSpinLock(&g_CableAActiveRenderLock, &oldIrql);
+        g_CableAActiveRenderStream = Stream;
+        KeReleaseSpinLock(&g_CableAActiveRenderLock, oldIrql);
+    }
+    else if (DeviceType == eCableBSpeaker)
+    {
+        KeAcquireSpinLock(&g_CableBActiveRenderLock, &oldIrql);
+        g_CableBActiveRenderStream = Stream;
+        KeReleaseSpinLock(&g_CableBActiveRenderLock, oldIrql);
+    }
+}
+
+static VOID
+AoPumpUnregisterActiveRenderStream(
+    _In_ eDeviceType DeviceType,
+    _In_ PCMiniportWaveRTStream Stream
+)
+{
+    KIRQL oldIrql;
+    if (DeviceType == eCableASpeaker)
+    {
+        KeAcquireSpinLock(&g_CableAActiveRenderLock, &oldIrql);
+        // Only clear if this stream is still the current owner. Prevents
+        // a late STOP/destructor from a previous stream wiping a newer
+        // stream's registration.
+        if (g_CableAActiveRenderStream == Stream)
+        {
+            g_CableAActiveRenderStream = NULL;
+        }
+        KeReleaseSpinLock(&g_CableAActiveRenderLock, oldIrql);
+    }
+    else if (DeviceType == eCableBSpeaker)
+    {
+        KeAcquireSpinLock(&g_CableBActiveRenderLock, &oldIrql);
+        if (g_CableBActiveRenderStream == Stream)
+        {
+            g_CableBActiveRenderStream = NULL;
+        }
+        KeReleaseSpinLock(&g_CableBActiveRenderLock, oldIrql);
+    }
+}
+
+//=============================================================================
+// Phase 5 (2026-04-14): C-style IOCTL entry point exported to adapter.cpp
+// via loopback.h. Finds the active cable render stream for the given cable
+// index, constrains the masks to AO_PUMP_FLAG_DISABLE_LEGACY_RENDER, and
+// applies the update under the target stream's m_PositionSpinLock. Lock
+// order: per-cable active-stream lock BEFORE the stream's spinlock.
+//=============================================================================
+extern "C"
+NTSTATUS
+AoPumpApplyRenderFlagMask(
+    _In_ ULONG cableIndex,
+    _In_ ULONG setMask,
+    _In_ ULONG clearMask
+)
+{
+    const ULONG acceptedMask = AO_PUMP_FLAG_DISABLE_LEGACY_RENDER;
+    ULONG setMasked   = setMask   & acceptedMask;
+    ULONG clearMasked = clearMask & acceptedMask;
+
+    PCMiniportWaveRTStream target = NULL;
+    KIRQL oldIrql;
+
+    if (cableIndex == 0)
+    {
+        KeAcquireSpinLock(&g_CableAActiveRenderLock, &oldIrql);
+        target = g_CableAActiveRenderStream;
+        KeReleaseSpinLock(&g_CableAActiveRenderLock, oldIrql);
+    }
+    else if (cableIndex == 1)
+    {
+        KeAcquireSpinLock(&g_CableBActiveRenderLock, &oldIrql);
+        target = g_CableBActiveRenderStream;
+        KeReleaseSpinLock(&g_CableBActiveRenderLock, oldIrql);
+    }
+    else
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (target == NULL)
+    {
+        // No active render stream for this cable. Treat as a successful
+        // no-op so test scripts can issue the IOCTL during idle.
+        return STATUS_SUCCESS;
+    }
+
+    target->ApplyPumpFlagMaskUnderLock(setMasked, clearMasked);
+    return STATUS_SUCCESS;
 }
 
 //=============================================================================

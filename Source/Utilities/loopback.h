@@ -286,6 +286,19 @@ typedef struct _FRAME_PIPE {
     ULONG               RenderPumpFeatureFlags;
     ULONG               CapturePumpFeatureFlags;
 
+    // Phase 5 (2026-04-14): per-side drive counters for one-owner proof.
+    // Each counter is incremented at most once per UpdatePosition/pump
+    // helper invocation that actually reaches the FramePipeWriteFromDma
+    // call site for this direction. RenderPumpDriveCount is written by
+    // PumpToCurrentPositionFromQuery's render transport block.
+    // RenderLegacyDriveCount is written by ReadBytes() when it enters the
+    // cable-pipe branch. Both are monotonic evidence counters, like the
+    // Phase 1 pump counters; FramePipeReset() does not touch them.
+    // Exclusivity is the Phase 5 one-owner property: at any moment,
+    // exactly one of the two is growing for a given cable render stream.
+    volatile ULONG      RenderPumpDriveCount;   // Phase 5 pump transport fires
+    volatile ULONG      RenderLegacyDriveCount; // Phase 5 ReadBytes cable render fires
+
     // ─── Scratch Buffers (allocated at PASSIVE, used at DISPATCH) ───
     // Speaker and Mic DPCs run on separate cores — each needs its own scratch.
     BYTE*               ScratchDma;         // DMA linearization buffer (future use)
@@ -373,5 +386,31 @@ VOID FramePipeReadToDma(
 //=============================================================================
 extern FRAME_PIPE g_CableAPipe;
 extern FRAME_PIPE g_CableBPipe;
+
+//=============================================================================
+// Phase 5 (2026-04-14): IOCTL_AO_SET_PUMP_FEATURE_FLAGS C-style entry point.
+// adapter.cpp (which does not include minwavert.h / minwavertstream.h) calls
+// this to apply a mask-constrained render-ownership flag update to the
+// currently-active cable speaker stream. cableIndex: 0 = Cable A, 1 = Cable B.
+// Masks are silently restricted to AO_PUMP_FLAG_DISABLE_LEGACY_RENDER inside
+// the helper implementation in minwavertstream.cpp. Returns STATUS_SUCCESS
+// even when there is no active stream (treated as a no-op). Effect is
+// visible at the next PumpToCurrentPositionFromQuery() invocation and the
+// next UpdatePosition() render branch (1-2 position queries).
+//=============================================================================
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+NTSTATUS
+AoPumpApplyRenderFlagMask(
+    _In_ ULONG cableIndex,
+    _In_ ULONG setMask,
+    _In_ ULONG clearMask
+);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
