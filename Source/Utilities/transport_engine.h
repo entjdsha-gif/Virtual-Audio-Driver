@@ -27,9 +27,10 @@
 
 #include <ntddk.h>
 #include <wdm.h>
+#include "loopback.h"   // FRAME_PIPE full definition — engine event runners need it
 
-// Forward declaration — avoids pulling the full miniport header into callers
-// that only need the engine surface.
+// Forward declaration — the miniport header pulls in the whole WaveRT/PortCls
+// world, so we keep the stream type opaque at the engine API boundary.
 class CMiniportWaveRTStream;
 
 //=============================================================================
@@ -46,6 +47,16 @@ typedef struct _AO_STREAM_RT {
     // Non-owning backpointer to the stream that owns this struct.
     CMiniportWaveRTStream*  Stream;
 
+    // Reference count. +1 from the stream owner at alloc time. The timer
+    // callback takes additional refs under EngineLock while building its
+    // due-stream snapshot and releases them after each event runs. The
+    // allocation is freed when RefCount reaches zero — either by the
+    // destructor's FreeStreamRt call or by the last in-flight event's
+    // release, whichever comes later. This is how we close the UAF race
+    // between the timer callback's drop-lock-then-run pattern and stream
+    // destruction.
+    volatile LONG           RefCount;
+
     // Classification — filled on first registration, stable thereafter.
     BOOLEAN                 IsCapture;
     BOOLEAN                 IsCable;
@@ -54,13 +65,19 @@ typedef struct _AO_STREAM_RT {
     // Scheduling state — flipped by OnRun / OnPause / OnStop.
     BOOLEAN                 Active;
 
-    // Format snapshot — populated at RUN, used by event runners in Step 3/4.
+    // Format snapshot — populated at RUN, used by event runners.
     ULONG                   SampleRate;
     ULONG                   Channels;
     ULONG                   BlockAlign;
 
-    // Event sizing — frame-count authoritative. Derived fields are optional
-    // caches filled in Step 2+.
+    // Target FRAME_PIPE and DMA buffer info — populated at RUN so the
+    // engine event runners can move data without looking up globals or
+    // touching the stream object.
+    PFRAME_PIPE             Pipe;
+    BYTE*                   DmaBuffer;
+    ULONG                   DmaBufferSize;
+
+    // Event sizing — frame-count authoritative.
     ULONG                   FramesPerEvent;
     ULONG                   BytesPerEvent;
     LONGLONG                EventPeriodQpc;
@@ -72,12 +89,14 @@ typedef struct _AO_STREAM_RT {
     ULONG                   StartupThresholdFrames;
     ULONG                   MinHeadroomFrames;
 
-    // Diagnostic counters — filled in Step 3/4 when events actually run.
+    // Diagnostic counters — populated by event runners in Step 3/4.
     ULONG                   LateEventCount;
     ULONG                   UnderrunEvents;
     ULONG                   DropEvents;
 
-    // DMA-side cursor and sub-sample carry (non-integer event-size rates).
+    // DMA-side cursor advanced by each event and sub-sample carry for
+    // non-integer event sizes (44.1k etc, Step 3 scope covers integer
+    // multiples only).
     ULONG                   DmaOffset;
     ULONG                   CarryFrames;
 } AO_STREAM_RT, *PAO_STREAM_RT;
@@ -149,6 +168,9 @@ typedef struct _AO_STREAM_SNAPSHOT {
     ULONG          SampleRate;
     ULONG          Channels;
     ULONG          BlockAlign;
+    PFRAME_PIPE    Pipe;
+    BYTE*          DmaBuffer;
+    ULONG          DmaBufferSize;
 } AO_STREAM_SNAPSHOT;
 
 extern "C" AO_STREAM_RT* AoTransportAllocStreamRt(CMiniportWaveRTStream* stream);

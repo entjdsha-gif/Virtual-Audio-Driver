@@ -1547,6 +1547,15 @@ NTSTATUS CMiniportWaveRTStream::SetState
                         snap.SampleRate    = m_pWfExt->Format.nSamplesPerSec;
                         snap.Channels      = m_pWfExt->Format.nChannels;
                         snap.BlockAlign    = m_pWfExt->Format.nBlockAlign;
+                        // Phase 6 Step 3: engine needs pipe + DMA buffer info
+                        // so AoRunRenderEvent can push DMA content into the
+                        // ring without looking up globals or calling back
+                        // into the stream object. DmaBuffer comes from the
+                        // portcls-allocated WaveRT buffer already owned by
+                        // this stream.
+                        snap.Pipe          = pFP;
+                        snap.DmaBuffer     = m_pDmaBuffer;
+                        snap.DmaBufferSize = m_ulDmaBufferSize;
                         AoTransportOnRunEx(&snap);
                     }
                 }
@@ -1965,12 +1974,20 @@ VOID CMiniportWaveRTStream::UpdatePosition
         }
 
         {
-            // Cable A/B always calls ReadBytes for loopback.
-            // Non-cable devices only call ReadBytes when saving to file.
+            // Phase 6 Step 3: cable speaker transport now runs exclusively
+            // from the AO_TRANSPORT_ENGINE timer callback via
+            // AoRunRenderEvent. Do NOT call ReadBytes for cable speakers
+            // from UpdatePosition any more — that path is the legacy
+            // query-driven writer and would double-write the ring alongside
+            // the engine event runner, which in turn would produce overflow
+            // reject counts and corrupt audio.
+            //
+            // Non-cable streams still call ReadBytes for the file-save
+            // diagnostic path when g_DoNotCreateDataFiles is clear.
             CMiniportWaveRT* pMp = m_pMiniport;
             BOOL isCable = (pMp && (pMp->m_DeviceType == eCableASpeaker ||
                                      pMp->m_DeviceType == eCableBSpeaker));
-            if (isCable || !g_DoNotCreateDataFiles)
+            if (!isCable && !g_DoNotCreateDataFiles)
             {
                 ReadBytes(ByteDisplacement);
             }

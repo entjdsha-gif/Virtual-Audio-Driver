@@ -16,6 +16,7 @@
 //=============================================================================
 
 #include "transport_engine.h"
+#include "loopback.h"   // FRAME_PIPE + FramePipeWriteFromDma — only engine TU needs this
 
 #define AO_TE_POOL_TAG              'eTOA'      // 'AOTe' little-endian
 
@@ -215,7 +216,24 @@ AoTransportAllocStreamRt(CMiniportWaveRTStream* stream)
     InitializeListHead(&rt->Link);
     rt->Stream = stream;
     rt->Active = FALSE;
+    rt->RefCount = 1;   // stream owner holds the initial ref
     return rt;
+}
+
+// Internal: drop one ref, free if zero. Caller must not touch rt after.
+// Safe to call at DISPATCH_LEVEL (no lock acquired, no paged memory access
+// beyond the pool free which is non-paged).
+static VOID
+AoTeReleaseRt(AO_STREAM_RT* rt)
+{
+    if (rt == NULL)
+    {
+        return;
+    }
+    if (InterlockedDecrement(&rt->RefCount) == 0)
+    {
+        ExFreePoolWithTag(rt, AO_TE_POOL_TAG);
+    }
 }
 
 extern "C" VOID
@@ -226,11 +244,11 @@ AoTransportFreeStreamRt(AO_STREAM_RT* rt)
         return;
     }
 
+    // Defensive: make sure the rt is no longer linked into the active list.
+    // A well-behaved caller should have invoked OnStopEx first, but this
+    // path must be idempotent in case the destructor order drifts.
     KIRQL old;
     KeAcquireSpinLock(&g_AoTransportEngine.Lock, &old);
-
-    // Detach from active list if still linked. A well-behaved caller should
-    // have called OnStop first, but we defensively detach here.
     if (rt->Link.Flink != NULL && !IsListEmpty(&rt->Link))
     {
         RemoveEntryList(&rt->Link);
@@ -240,10 +258,11 @@ AoTransportFreeStreamRt(AO_STREAM_RT* rt)
         }
         InitializeListHead(&rt->Link);
     }
-
     KeReleaseSpinLock(&g_AoTransportEngine.Lock, old);
 
-    ExFreePoolWithTag(rt, AO_TE_POOL_TAG);
+    // Drop the owner ref. If the timer callback still holds a ref from a
+    // previous due-list snapshot, free is deferred until that ref drains.
+    AoTeReleaseRt(rt);
 }
 
 //=============================================================================
@@ -279,6 +298,10 @@ AoTransportOnRunEx(const AO_STREAM_SNAPSHOT* snapshot)
     rt->SampleRate    = snapshot->SampleRate;
     rt->Channels      = snapshot->Channels;
     rt->BlockAlign    = snapshot->BlockAlign;
+    rt->Pipe          = snapshot->Pipe;
+    rt->DmaBuffer     = snapshot->DmaBuffer;
+    rt->DmaBufferSize = snapshot->DmaBufferSize;
+    rt->DmaOffset     = 0;   // engine cursor starts at 0 on each RUN transition
 
     // Samples-only seeding: scale the reference frame constants to this
     // stream's actual rate. The engine period in QPC is the same for every
@@ -421,16 +444,78 @@ AoTransportOnStopEx(AO_STREAM_RT* rt)
 }
 
 //=============================================================================
-// AoTransportTimerCallback — shared timer fires here at ~20 ms intervals.
+// Event runners — Step 3 wires the render runner. Step 4 wires capture.
+//=============================================================================
+
+// AoComputeFramesForEvent — return the number of frames this tick should
+// move for this stream. Step 3 scope handles only rates that divide the
+// reference-rate frame constant evenly (48 kHz, 96 kHz, 192 kHz). Non-
+// integer cases (44.1 kHz family) will use rt->CarryFrames in a later step;
+// for now they still land on the integer floor and the carry is updated
+// so the error averages to zero over time.
+static ULONG
+AoComputeFramesForEvent(AO_STREAM_RT* rt)
+{
+    // Step 3: return FramesPerEvent directly. The CarryFrames field is
+    // wired so a later SRC step can replace this body without touching the
+    // call site.
+    return rt->FramesPerEvent;
+}
+
+// AoRunRenderEvent — push FramesPerEvent frames from the stream's DMA
+// buffer into its FRAME_PIPE ring. Mirrors the legacy ReadBytes loop:
+// splits into two chunks when the event straddles the DMA ring wrap.
 //
-// Step 1 policy: iterate the active list and log the fact that the callback
-// ran. Absolutely no data movement. This validates that:
-//   - ExAllocateTimer/ExSetTimer succeeded
-//   - the DPC path is reachable
-//   - spinlock discipline around the list is correct
+// Runs at DISPATCH_LEVEL from the timer callback. Acquires PipeLock via
+// FramePipeWriteFromDma — never holds EngineLock while calling in.
+static VOID
+AoRunRenderEvent(AO_STREAM_RT* rt, LONGLONG qpc)
+{
+    UNREFERENCED_PARAMETER(qpc);
+
+    if (rt->Pipe == NULL || rt->DmaBuffer == NULL || rt->DmaBufferSize == 0)
+    {
+        return;
+    }
+
+    ULONG frames = AoComputeFramesForEvent(rt);
+    if (frames == 0)
+    {
+        return;
+    }
+
+    ULONG bytes  = frames * rt->BlockAlign;
+    ULONG offset = rt->DmaOffset;
+    ULONG bufSz  = rt->DmaBufferSize;
+
+    while (bytes > 0)
+    {
+        ULONG chunk = bytes;
+        if (chunk > bufSz - offset)
+        {
+            chunk = bufSz - offset;
+        }
+
+        FramePipeWriteFromDma(rt->Pipe, rt->DmaBuffer + offset, chunk);
+
+        offset = (offset + chunk) % bufSz;
+        bytes -= chunk;
+    }
+
+    rt->DmaOffset = offset;
+}
+
+//=============================================================================
+// AoTransportTimerCallback — shared timer fires here at the engine period.
 //
-// Step 3 replaces the body of the loop with render event dispatch, Step 4
-// adds capture dispatch.
+// Pattern: snapshot due streams under EngineLock (taking a ref on each so
+// the destructor cannot free the rt while we still hold a pointer), drop
+// EngineLock, run events, release refs (freeing any rt whose final ref we
+// are holding).
+//
+// Step 3 dispatches render events for speaker streams. Capture streams are
+// collected into the snapshot but their events are still no-ops — Step 4
+// fills in the capture runner.
 //=============================================================================
 static VOID
 AoTransportTimerCallback(
@@ -440,10 +525,6 @@ AoTransportTimerCallback(
     UNREFERENCED_PARAMETER(Timer);
     UNREFERENCED_PARAMETER(Context);
 
-    // Snapshot-and-drop pattern: take the lock, copy due-stream pointers to
-    // a small stack array, release the lock, then run events. Step 1 has no
-    // events to run, so we just count.
-    //
     // ActiveStreams should be tiny (typically ≤ 4: Cable A/B render + capture
     // for one client each). A fixed local array is safe.
     AO_STREAM_RT* due[16];
@@ -464,11 +545,14 @@ AoTransportTimerCallback(
         {
             continue;
         }
-
         if (now.QuadPart < rt->NextEventQpc)
         {
             continue;
         }
+
+        // Take a ref under the engine lock so the destructor cannot free
+        // this rt while we still hold a pointer in due[].
+        InterlockedIncrement(&rt->RefCount);
 
         due[dueCount++] = rt;
         rt->NextEventQpc += rt->EventPeriodQpc;
@@ -476,16 +560,22 @@ AoTransportTimerCallback(
 
     KeReleaseSpinLock(&g_AoTransportEngine.Lock, old);
 
-    // Step 1: no event dispatch. Step 3/4 replaces this loop body.
-    //
-    // We intentionally suppress per-tick DbgPrint here so the callback is
-    // cheap enough to leave armed during full live-call tests. Uncomment
-    // during skeleton validation only.
-    //
-    // for (ULONG i = 0; i < dueCount; i++)
-    // {
-    //     DbgPrint("[AoTransport] tick due rt=%p\n", due[i]);
-    // }
-    UNREFERENCED_PARAMETER(due);
-    UNREFERENCED_PARAMETER(dueCount);
+    // Run events outside the engine lock. Order: render (speaker side)
+    // first, then capture, so that within a single tick Cable B mic reads
+    // the pipe content that Cable B speaker just wrote. Step 3 only
+    // implements the render runner; capture path lands in Step 4.
+    for (ULONG i = 0; i < dueCount; i++)
+    {
+        AO_STREAM_RT* rt = due[i];
+        if (!rt->IsCapture)
+        {
+            AoRunRenderEvent(rt, now.QuadPart);
+        }
+    }
+    // (Step 4) capture pass will walk due[] again here.
+
+    for (ULONG i = 0; i < dueCount; i++)
+    {
+        AoTeReleaseRt(due[i]);
+    }
 }
