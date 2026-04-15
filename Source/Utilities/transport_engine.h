@@ -110,6 +110,70 @@ typedef struct _AO_STREAM_RT {
     // Still zero until the GCD SRC step lands; kept here so the later
     // work doesn't have to widen the runtime struct.
     ULONG                   CarryFrames;
+
+    //=========================================================================
+    // Phase 6 Option Y — Y1A runtime structure freeze
+    //
+    // Fields below are the VB-equivalent cable runtime state. Added in Y1A
+    // (header freeze); populated + read by AoCableAdvanceByQpc starting in
+    // Y1B (shadow mode — helper computes everything, externally visible
+    // truth stays on legacy MSVAD path). Retired in Y2 (render) and Y3
+    // (capture) when audible ownership moves into the canonical helper.
+    //
+    // Source spec: results/phase6_vb_verification.md §2, §5, §7, §9.5
+    // Layout mapped 1:1 to VB stream offsets where practical.
+    //=========================================================================
+
+    // Audio format (extends the Step 1 SampleRate/Channels/BlockAlign set).
+    // VB +0x86: container bits; AO Y1A stores explicitly for 4-way bpp
+    // dispatch in AoRingWriteFromClient (22b0 equivalent).
+    USHORT                  BitsPerSample;
+
+    // Cable ring buffer size in frames. Distinct from DmaBufferSize (bytes
+    // of raw DMA container) — this is the frame-denominated cable ring the
+    // canonical helper wraps cursor arithmetic against. VB +0xA8.
+    ULONG                   RingSizeFrames;
+
+    // Canonical advance helper state — VB 6320 direct translation.
+    ULONGLONG               AnchorQpc100ns;              // VB +0x180
+    ULONG                   PublishedFramesSinceAnchor;  // VB +0x198
+    ULONGLONG               DmaCursorFrames;             // VB +0x0D0 (frame-denominated)
+    ULONGLONG               DmaCursorFramesPrev;         // VB +0x0D8
+    volatile LONGLONG       MonoFramesLow;               // VB +0x0E0
+    volatile LONGLONG       MonoFramesMirror;            // VB +0x0E8 (mirror of Low)
+    LONG                    LastAdvanceDelta;            // VB +0x1B8
+    ULONG                   StatOverrunCounter;          // canonical helper reject count
+
+    // Packet notification state. VB shared-mode clients never arm these
+    // (NotifyArmed stays 0) so the [+0x8188] dispatch is bypassed; AO's
+    // existing STATUS_NOT_SUPPORTED path for m_ulNotificationsPerBuffer==0
+    // is already semantically equivalent. Preserved for event-driven
+    // parity only. VB +0x7C / +0x164 / +0x165.
+    ULONG                   NotifyBoundaryBytes;
+    UCHAR                   NotifyArmed;
+    UCHAR                   NotifyFired;
+
+    // Per-stream scratch buffer for DMA-circular -> linear staging before
+    // FRAME_PIPE conversion/write. VB stores at stream +0x178 and uses a
+    // plain memcpy (FUN_140007680) into it. Allocated at RUN, freed at
+    // STOP / free. Size is bounded by the worst-case single advance
+    // (overrun guard = SampleRate/2 frames × BlockAlign bytes).
+    PVOID                   CableScratchBuffer;
+    ULONG                   CableScratchSize;
+
+    // Fade-in envelope counter. Reset to -96 at packet boundary; advanced
+    // per sample by AoApplyFadeEnvelope until it reaches 0 (saturated).
+    // Drives the 95-entry +0x12a60 fade table in 51a8 equivalent.
+    // This is the VB click-suppression mechanism.
+    LONG                    FadeSampleCounter;
+
+    // Y1 debug hit counters. Shadow-mode observability only — lets the
+    // Y1C gate confirm the helper is reached from query + timer paths
+    // without log flooding. Remove in Y4. Guarded by AO_PHASE6_DEBUG in
+    // the cpp so release builds can drop them cheaply.
+    volatile LONG           DbgShadowAdvanceHits;
+    volatile LONG           DbgShadowQueryHits;
+    volatile LONG           DbgShadowTimerHits;
 } AO_STREAM_RT, *PAO_STREAM_RT;
 
 //=============================================================================
@@ -199,5 +263,62 @@ extern "C" VOID          AoTransportOnStopEx(AO_STREAM_RT* rt);
 // take any engine locks.
 extern "C" VOID          AoTransportPublishProducedBytes(AO_STREAM_RT* rt,
                                                           ULONGLONG producedBytesMono);
+
+//=============================================================================
+// Phase 6 Option Y — canonical cable advance API (Y1A prototypes)
+//
+// These functions implement the VB-equivalent cable transport model. In Y1
+// the helper runs in shadow mode: it computes advance, updates shadow
+// bookkeeping, and bumps diagnostic counters, but the externally visible
+// truth (GetPosition return values, FRAME_PIPE contents, DMA cursors
+// consumed by legacy ReadBytes/WriteBytes) stays on the legacy MSVAD path.
+//
+// Audible ownership migrates to this helper in Y2 (render) and Y3 (capture).
+//=============================================================================
+
+// Reason-tagged entry into AoCableAdvanceByQpc. The helper dispatches
+// render vs capture paths internally based on AO_STREAM_RT::IsCapture,
+// but the reason lets the helper distinguish query-driven advance (from
+// GetPosition / GetPositions) from timer-driven advance (from the shared
+// transport timer DPC), and lets the Y1C shadow gate count both separately.
+typedef enum _AO_ADVANCE_REASON {
+    AO_ADVANCE_QUERY = 0,           // from GetPosition / GetPositions
+    AO_ADVANCE_TIMER_RENDER = 1,    // from shared timer DPC, render stream
+    AO_ADVANCE_TIMER_CAPTURE = 2,   // from shared timer DPC, capture stream
+    AO_ADVANCE_PACKET = 3,          // event-driven WaveRT packet surface
+} AO_ADVANCE_REASON;
+
+// Canonical advance helper. Single owner of cable transport/accounting
+// truth once Y2/Y3 complete. nowQpcRaw is a raw KeQueryPerformanceCounter
+// result (the helper converts to 100ns internally and consults the QPC
+// frequency itself). Flags reserved for future use; pass 0 in Y1/Y2.
+//
+// Y1B rule: this function may compute and update shadow state, but must
+// not write FRAME_PIPE and must not replace the legacy audible truth.
+extern "C" VOID AoCableAdvanceByQpc(AO_STREAM_RT* rt,
+                                     ULONGLONG nowQpcRaw,
+                                     AO_ADVANCE_REASON reason,
+                                     ULONG flags);
+
+// Fade envelope application. Used by the render path inside the canonical
+// helper starting in Y2 to suppress packet-boundary clicks. samples is an
+// in-place int32_t array of frameCount frames × channel samples (channel-
+// planar or interleaved — envelope is applied per sample regardless).
+// perStreamCounter is the stream's FadeSampleCounter, advanced by this
+// function. Values match VB's 95-entry +0x12a60 table exactly.
+extern "C" VOID AoApplyFadeEnvelope(LONG* samples,
+                                     ULONG sampleCount,
+                                     LONG* perStreamCounter);
+
+// Reset the fade counter to -96 (pre-silence prefix). Called at packet
+// boundary transitions in the render path to start a fresh fade-in.
+extern "C" VOID AoResetFadeCounter(AO_STREAM_RT* rt);
+
+// Cable-specific runtime field reset. Called from AoTransportOnStopEx and
+// from the destructor path after KeFlushQueuedDpcs. Matches the VB 669c
+// caller-side pattern: clears DMA cursor, monotonic counters, anchor QPC,
+// published frames, and fade state. Shared timer teardown is engine-
+// global and handled separately by AoTransportEngineCleanup.
+extern "C" VOID AoCableResetRuntimeFields(AO_STREAM_RT* rt);
 
 #endif // AO_TRANSPORT_ENGINE_H
