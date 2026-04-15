@@ -36,17 +36,27 @@
 // clients negotiate 48 kHz; the engine scales to non-48k streams at RUN time.
 //
 // AO_TE_EVENT_FRAMES_AT_REF is the shared-timer event quantum at the
-// reference rate. 960 frames @ 48000 Hz is the VB-Cable-equivalent cadence
-// step; expressing it as frames keeps the constant invariant under rate
-// changes.
+// reference rate. 48 frames @ 48000 Hz = 1 ms, matching the VB-Cable
+// ExAllocateTimer2 period captured via WinDbg on FUN_1400065b8 —
+// ExSetTimer(-10000, 10000, NULL) is a 1 ms due / 1 ms period timer.
+// See results/phase6_vb_verification.md §3 "Shared Timer Confirmation".
+//
+// The original Step 1 scaffold used 960 (20 ms) which predates the VB
+// timing verification and was carried over through Y1/Y2/Y3-v2 without
+// update. Y3-v2.1 migrates to the verified 1 ms value so cable mic DMA
+// fill granularity is fine enough to avoid visible position stall
+// between client queries. This is a targeted parity fix; it does NOT
+// alter the "multiple active call sources, one canonical owner" rule
+// in PHASE6_Y_IMPLEMENTATION_WORK_ORDER.md.
 //
 // AO_TE_STARTUP_THRESHOLD_FRAMES_AT_REF / AO_TE_STARTUP_TARGET_FRAMES_AT_REF
 // are the capture startup cushion values from PHASE6_PLAN.md §6, also in
-// frames. Step 4 will tune these; Step 1 seeds them so the runtime has
-// sensible defaults for the no-op callback path.
+// frames. They live on the per-stream startup state machine and are
+// independent of the shared-timer period — do not reduce them in
+// lockstep with AO_TE_EVENT_FRAMES_AT_REF.
 //
 #define AO_TE_REFERENCE_RATE                 48000U
-#define AO_TE_EVENT_FRAMES_AT_REF              960U   // 20 ms-equivalent @ 48k, stored as frames
+#define AO_TE_EVENT_FRAMES_AT_REF               48U   // 1 ms @ 48k, matches VB ExAllocateTimer2
 #define AO_TE_STARTUP_THRESHOLD_FRAMES_AT_REF  960U
 #define AO_TE_STARTUP_TARGET_FRAMES_AT_REF    1440U
 
