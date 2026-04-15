@@ -100,6 +100,25 @@ When changing stream-status diagnostics, update these together:
 
 Do not trust hardcoded struct offsets without re-verifying layout.
 
+## Pre-Experiment Cable Check (엄수)
+
+라이브콜 실험 전 **매번** 시스템 기본장치가 AO Cable A/B인지 확인할 것. install.ps1의 restore 경로가 이전 세션의 default device(보통 VB-Audio)를 복원해버려 사용자도 모르게 VB 경로로 실험이 돌아가는 사고가 실제로 발생했음.
+
+확인해야 할 것:
+- **기본 재생장치** = "스피커 (AO Cable A)" — VB Cable A 아님
+- **기본 녹음장치** = "마이크 배열 (AO Cable B)" — VB Cable B 아님
+- 둘 다 AO가 아니면 실험 결과는 AO 드라이버가 아닌 VB baseline을 측정한 것이므로 **무효**
+
+확인 도구:
+```powershell
+# 빠른 체크
+Get-CimInstance -ClassName Win32_PnPEntity | Where-Object { $_.Name -like "*Cable*" -and $_.Status -eq "OK" }
+# 또는 설정 실행
+powershell -File C:\Users\jongw\AppData\Local\Temp\set_ao_by_name.ps1
+```
+
+install 직후에는 반드시 `set_ao_by_name.ps1` 실행. run 시작 전 로그에 AO Cable A/B default 전환이 기록되는지 확인.
+
 ## Experiment Commit Rule (엄수)
 
 모든 실험은 진행하면서 commit 한다. 나중에 어느 phase/commit에서 어떤 결과가 나왔는지 찾아야 하므로:

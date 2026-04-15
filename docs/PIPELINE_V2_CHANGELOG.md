@@ -1,5 +1,31 @@
 # Pipeline V2 Changelog
 
+## 2026-04-15 — FP_WRITE trace + 300 ms headroom test (negative result)
+
+**Files changed:**
+- `Source/Utilities/loopback.cpp` — added per-write `[FP_WRITE]` DbgPrint in `FramePipeWriteFromDma` (pipe, QPC, req frames, wrote frames, fill after, drop count). Enables write-side cadence cross-reference against the existing FP_READ trace. Updated `FramePipePrefillSilence` to scale prefill size from `FP_STARTUP_HEADROOM_MS` constant.
+- `Source/Utilities/loopback.h` — bumped `FP_STARTUP_HEADROOM_MS` 40 → 300.
+- `Source/Main/aocablea.inx`, `aocableb.inx` — `DriverVer` bumped 5.3.0.4 → 5.3.0.5 → 5.3.0.6.
+- `CLAUDE.md` — new **Pre-Experiment Cable Check** section: pre-run verification that the default playback is AO Cable A and the default recording is AO Cable B, because `install.ps1` restore quietly reverts to whatever was previously the default (typically VB-Audio).
+
+**What:** Wired a second diagnostic trace point on the writer side to settle the question of whether mid-call chopping was a writer starvation problem or a reader starvation problem, and tested whether a larger prefill cushion (300 ms) would smooth out the burst+gap pattern.
+
+**Why:** phase5c_headroom_run1 (40 ms prefill) left mid-call chopping unresolved. Two hypotheses: (a) 40 ms is too small and a bigger cushion would cover the AI's 200–250 ms burst gap; or (b) prefill size is the wrong axis entirely and no cushion can fix a writer-reader cadence mismatch once it drains.
+
+**Test results:**
+
+- **Write-side cadence measurement** (phase5c_instr_ed23271_run1.dbgview.log, extended): Cable B had 11,481 FP_WRITE events spanning 33 s with a worst gap of **6903 ms** and 198 gaps > 5 ms. The big multi-second gaps align with periods of AI silence between utterances (expected), but there are also 50-200 ms gaps tracking the AI's 250 ms OpenAI-Realtime burst cadence — those are the gaps that eat the prefill cushion on small-headroom configurations.
+
+- **phase5c_h300_run1** (300 ms prefill, verified Cable A/B both AO this time): user judgment *"ai 가 찎찍거린다고 느끼면 a도 문제 b 도 문제인거겟다. 그리고 품질저하. 스크립트 다끊기고 안좋았음."* — both directions perceptually **worse** than the 40 ms run. AI reported its input (Cable A path) as screechy, and the direct TTS script playback (Cable B path) was heavily chopped.
+
+**Finding:** Prefill size is **not the right axis.** A larger cushion buys more time before the first drain, but the writer-reader rate mismatch reasserts itself the moment the cushion is exhausted. Both 40 ms and 300 ms variants produced mid-call audible artifacts, and 300 ms was subjectively worse — likely because the larger cushion lets the ring drift further before refills catch up, making the transition back to real-data more jarring.
+
+**Next direction:** Phase 5b — dedicated driver-side 20 ms DPC timer that owns ring fill cadence, pulling from the upstream WASAPI buffer at a fixed interval and injecting silence frames when the upstream has nothing. This matches the VB-Cable pipeline architecture documented in `results/vbcable_pipeline_analysis.md` and decouples reader consumption rate from upstream writer burst pattern entirely.
+
+**Pre-experiment discipline note:** One run in this iteration was wasted because the default recording device silently reverted to VB-Audio Cable B after an install.ps1 cycle — the AO driver was never in the path for that run even though we thought it was. Added a hard Pre-Experiment Cable Check rule to CLAUDE.md to prevent recurrence.
+
+---
+
 ## 2026-04-15 — Capture-side read instrumentation + startup headroom prefill
 
 **Files changed:**

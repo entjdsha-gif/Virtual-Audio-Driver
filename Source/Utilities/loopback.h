@@ -207,14 +207,24 @@ extern LOOPBACK_BUFFER g_CableBLoopback;
 #define FP_CAPACITY_MULTIPLIER      2       // CapacityFrames = TargetFill * 2
 #define FP_MIN_GATE_FRAMES          8       // skip sub-sample noise (VB reference)
 #define FP_MAX_CHANNELS             16      // static array sizing for SRC state
-// Startup headroom: small fixed silence cushion injected on speaker
-// RegisterFormat (!wasActive). Size in milliseconds; actual frame count
+// Startup headroom: fixed silence cushion injected on speaker
+// RegisterFormat / KSSTATE_RUN. Size in milliseconds; actual frame count
 // is derived from PipeSampleRate at fire time so it scales across
-// 44.1/48/96/192k. 40 ms gives reader ~40 × the ~1 ms Phone Link pull
-// cadence of breathing room while writer catches up — large enough to
-// absorb 20-ms WaveRT packet jitter, small enough that post-dial silence
-// latency is imperceptible.
-#define FP_STARTUP_HEADROOM_MS      40
+// 44.1/48/96/192k.
+//
+// Sizing is driven by measured upstream burst cadence. WaveRT delivers
+// cable speaker data in ~200-250 ms bursts that match the OpenAI
+// Realtime API's 250 ms write chunks. Between bursts, FramePipeWriteFromDma
+// is idle for ~200 ms while Phone Link reads the ring at 48 kHz. A
+// cushion smaller than the inter-burst gap drains to zero between
+// bursts and returns zero-fill silence to the reader — not perceived
+// as clean drop-outs but as degraded quality because the silence
+// fragments interleave with real speech samples.
+//
+// 300 ms covers the observed 200-250 ms gap with ~50 ms margin. Startup
+// latency of 300 ms is noticeable but acceptable for a freshly-answered
+// call (user is still raising the phone to their ear).
+#define FP_STARTUP_HEADROOM_MS      300
 
 //=============================================================================
 // FRAME_PIPE structure

@@ -1993,6 +1993,16 @@ ULONG FramePipeWriteFromDma(
         offset += chunk;
     }
 
+    // Per-write cadence trace (pairs with FP_READ to diagnose mid-call
+    // UNDERRUNs — distinguishes writer jitter from reader starvation).
+    {
+        LARGE_INTEGER qpc2 = KeQueryPerformanceCounter(NULL);
+        ULONG fillNow = pPipe->FillFrames;
+        DbgPrint("[FP_WRITE] pipe=%p qpc=%lld req=%u wrote=%u fillAfter=%u drop=%u\n",
+            pPipe, qpc2.QuadPart, totalFrames, totalWritten,
+            fillNow, pPipe->DropCount);
+    }
+
     // Rate-limited diagnostics (~1s interval)
     pPipe->DbgWriteFrames += totalWritten;
     {
