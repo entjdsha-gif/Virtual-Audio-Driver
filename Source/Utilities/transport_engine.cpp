@@ -54,8 +54,15 @@
 // load, hibernation resume, etc.) the callback will run multiple virtual
 // ticks per real tick to drain the backlog. This constant caps the per-
 // callback drain so one real tick can never spend an unbounded amount of
-// time at DISPATCH_LEVEL. 8 × 20 ms = 160 ms max catch-up per callback;
-// anything older than that rolls into the next callback.
+// time at DISPATCH_LEVEL. 8 × 20 ms = 160 ms max catch-up per callback.
+//
+// IMPORTANT: the cap does NOT drop the excess backlog. NextEventQpc only
+// advances by the capped count, so the remaining (overdueTicks - cap)
+// ticks reappear as still-overdue on the next real callback and get
+// processed there (possibly subject to another cap). The backlog
+// converges over multiple callbacks without losing any audio frames.
+// LateEventCount increments by the *deferred* tick count as a drift /
+// cap-hit diagnostic; it is not a "dropped frames" counter.
 #define AO_TE_MAX_OVERDUE_TICKS                  8U
 
 //=============================================================================
@@ -778,12 +785,14 @@ AoTransportTimerCallback(
         ULONG    overdueTicks =
             1U + (ULONG)(behindQpc / rt->EventPeriodQpc);
 
-        // Bounded catch-up — see AO_TE_MAX_OVERDUE_TICKS comment above.
-        // Anything past the cap is DROPPED from this callback's workload
-        // and will NOT be replayed in the next callback either (we
-        // advance NextEventQpc by the capped count, not by the true
-        // backlog). Count the dropped ticks in LateEventCount so the
-        // diagnostic path shows up in logs instead of vanishing.
+        // Bounded catch-up — see AO_TE_MAX_OVERDUE_TICKS header comment.
+        // Anything past the cap is deferred: we advance NextEventQpc
+        // only by the capped count, so the remaining backlog ticks
+        // stay "overdue" and get picked up on the next real callback.
+        // LateEventCount is bumped by the deferred count as a drift /
+        // cap-hit diagnostic — NOT a dropped-frames counter. Audio
+        // itself is not lost here; it is just processed one (or more)
+        // callbacks later.
         if (overdueTicks > AO_TE_MAX_OVERDUE_TICKS)
         {
             rt->LateEventCount += (overdueTicks - AO_TE_MAX_OVERDUE_TICKS);
@@ -791,10 +800,10 @@ AoTransportTimerCallback(
         }
 
         // Advance NextEventQpc by exactly the number of ticks we are
-        // taking responsibility for in this callback. The next real
-        // callback picks up from the new NextEventQpc; any remaining
-        // backlog beyond the cap is deferred (or, above, dropped with
-        // the clamp-hit counter bump).
+        // taking responsibility for in this callback. Any backlog past
+        // the cap remains as still-overdue time and will be handled on
+        // the next real callback (possibly subject to another cap if
+        // the drift keeps growing).
         rt->NextEventQpc += (LONGLONG)overdueTicks * rt->EventPeriodQpc;
 
         // Take a ref under the engine lock so the destructor cannot free
