@@ -914,10 +914,22 @@ AoResetFadeCounter(AO_STREAM_RT* rt)
 // DmaConsumedMono, NextEventQpc, LateEventCount, etc.) — those stay
 // owned by the Step 1 scaffold until Y2/Y3 retire it.
 //
-// NotifyArmed is preserved across STOP so an event-driven client that
-// set a notification count before stopping does not lose its arm state
-// across a pause/resume pair. NotifyFired is cleared so the one-shot
-// gate re-opens on the next boundary crossing.
+// Notification fields (NotifyBoundaryBytes, NotifyArmed, NotifyFired)
+// are ALL preserved across STOP. Verified against VB Ghidra decompile
+// on 2026-04-16: none of the three FUN_14000669c caller sites (lines
+// 4544, 4798, 11464 in vbcable_all_functions.c) touch +0x7C / +0x164 /
+// +0x165. VB's sole initialization of these fields is at fresh stream
+// register time (lines 11738-11739: `+0x7c = 0` and a 2-byte
+// `+0x164 = 0` clearing both NotifyArmed and NotifyFired).
+//
+// AO's equivalent "fresh stream register time" is the ExAllocatePool2 +
+// RtlZeroMemory inside AoTransportAllocStreamRt — that zeroes all
+// notify fields once per stream object lifetime, which is where they
+// should stay zero until the client arms them. STOP/resume cycles must
+// NOT reset them or an event-driven client would silently lose its
+// arm state.
+//
+// Source: results/phase6_vb_verification.md §9.6 (NotifyArmed closure)
 //-----------------------------------------------------------------------------
 extern "C" VOID
 AoCableResetRuntimeFields(AO_STREAM_RT* rt)
@@ -941,8 +953,9 @@ AoCableResetRuntimeFields(AO_STREAM_RT* rt)
     rt->LastAdvanceDelta   = 0;
     rt->StatOverrunCounter = 0;
 
-    // Preserve NotifyBoundaryBytes + NotifyArmed (client-controlled).
-    rt->NotifyFired        = 0;
+    // Notification fields (NotifyBoundaryBytes, NotifyArmed, NotifyFired)
+    // are intentionally NOT reset here — see function header comment for
+    // the VB parity verification that led to this rule.
 
     // Fade state — reset so the next audible run starts with a fresh
     // silence prefix. AoResetFadeCounter is intentionally inlined here
