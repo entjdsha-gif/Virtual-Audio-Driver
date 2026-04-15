@@ -1,5 +1,20 @@
 # VB-Cable -> AO Reimplementation Plan (Codex)
 
+> **⚠️ CURRENT STATUS — Phases 1–4 complete, Phase 5 reverted, Phase 5c in place.
+> See `docs/CURRENT_STATE.md` for the live roadmap including Phase 6 redesign.**
+>
+> Phase 5 original (GetPositions-driven render ownership, commit `2c733f1`) was
+> **reverted** in commit `ed23271` (Phase 5c) because measurement proved GetPositions
+> fires at ~130 ms while Phone Link reads Cable B mic at ~1 ms, producing burst+gap
+> mid-call chopping. Phase 5 scaffold (ownership flags, counters, IOCTL) is retained
+> but the transport call site is back on UpdatePosition packet cadence.
+>
+> Phase 6 now targets an **independent high-resolution timer** (1 ms ExAllocateTimer)
+> as the cadence owner — not GetPositions. The Phase 6 plan in this document
+> (capture ownership via query pump) is therefore **architecturally revised**; the
+> goal of "driver owns transport cadence" stands, but the mechanism has changed.
+> See `CURRENT_STATE.md` § Phase 6 for the authoritative step list.
+
 Date: 2026-04-13  
 Owner: Codex  
 Status: Planning baseline fixed, ready to implement in phases

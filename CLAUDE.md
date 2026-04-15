@@ -1,5 +1,7 @@
 # AO Virtual Cable - Claude Instructions (Fixed Pipe Rewrite)
 
+> **Current state and roadmap: `docs/CURRENT_STATE.md`** — single source of truth for where we are (Phase 5c, about to start Phase 6) and what's next. Read this first if resuming cold.
+
 ## Opinion Rule (엄수)
 
 - 사용자가 실행을 지시해도, Claude에게 **더 나은 의견 또는 개선안이 있다면 반드시 실행 전에 먼저 말할 것**.

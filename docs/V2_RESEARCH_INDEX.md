@@ -1,5 +1,9 @@
 # V2 Research Baseline — Asset Index
 
+> **Current roadmap lives in `docs/CURRENT_STATE.md`.** This file indexes research
+> assets (VB-Cable RE, prior design artifacts). For the active Phase 5c / Phase 6
+> roadmap use `CURRENT_STATE.md`.
+
 Branch: `feature/ao-pipeline-v2` @ ef50902 (frozen)
 Date: 2026-04-12
 

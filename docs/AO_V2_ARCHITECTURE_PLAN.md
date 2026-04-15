@@ -1,5 +1,12 @@
 # AO Virtual Cable — Fixed Frame Pipe Rewrite Plan
 
+> **⚠️ HISTORICAL — See `docs/CURRENT_STATE.md` for the current roadmap.**
+> This document captures the M1–M6 productization milestones on the byte-ring baseline.
+> The audio pipeline has since transitioned to the INT32 frame pipe (Phase 1–5c) and
+> is now moving toward a dedicated cadence timer (Phase 6). Process/install/control
+> panel content below is still accurate; the architecture comparison sections are
+> superseded by the Phase 5/5c work recorded in `PIPELINE_V2_CHANGELOG.md`.
+
 > Date: 2026-04-12
 > Active Branch: `feature/ao-fixed-pipe-rewrite`
 > Rewrite Base: `main` @ `b856d94`
