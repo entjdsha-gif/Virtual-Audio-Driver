@@ -358,6 +358,74 @@ So **bpp 0x78C (1932) = WAVE_FORMAT_EXTENSIBLE float variant** or a VB-internal 
 - Monotonic counter mirror field rule (write both +0xE0 and +0xE8 equivalents)
 - 63/64 drift correction formula from §4
 
+## 9.5. Ghidra Static Closure (2026-04-16 follow-up)
+
+After §9 open items were raised, three parallel Ghidra passes on the existing decompile (`results/ghidra_decompile/vbcable_all_functions.c`) closed all remaining blockers.
+
+### 9.5.1. Unregister / STOP entry confirmed — `FUN_14000669c`
+
+669c is **both** the in-stream cleanup path (called from 5cc0's `+0x165 && +0x60` branch) **and** the stream destructor/unregister. It has 3 caller sites in addition to 5cc0:
+- Line 4544, 4798 — stream STOP/close paths
+- Line 11464 — miniport teardown
+
+Behavior:
+1. Linear search of `g_streamTable[8]` for the stream ptr, clears the slot
+2. Decrements `g_streamGen`; updates `g_streamCount` to highest-populated index
+3. **When g_streamCount reaches 0**: calls `ExDeleteTimer(DAT_140012fd8, 1, ...)` (synchronized) then clears the handle and zeros instance ctx fields `+0x298/+0x2A0/+0x2A8` (the drift correction accumulator)
+4. Per-stream field reset happens at the **caller site**, not inside 669c itself:
+   - Capture streams: zero `+0xD0..+0x108` (cursor, prev cursor, monotonic counters, spare)
+   - Render streams: zero `+0x50..+0x88` (different layout due to render/capture struct divergence)
+   - Both: anchor QPC `+0x180` cleared at line ~4590
+
+**Implication for Y**: monotonic counters `+0xE0/+0xE8` **ARE cleared on STOP** (correction to earlier §5 note). AO's `AoTransportOnStopEx` must zero the equivalent fields. Shared timer is ref-counted globally: last stream out destroys it.
+
+### 9.5.2. Ring allocation + scratch buffer
+
+- **Ring allocator**: `FUN_140001008 → FUN_140003a04(tag, size)` at miniport init (line 11541)
+- **Ring stored at**: stream `+0x170` (base ptr)
+- **Size formula** (agent finding, approximate): `(channels * 16) * 12 + 400` bytes with channels derived from `max(0xF00, framesPerChunk * 0x2ee00 / rate)` — **need to re-verify**, but bounded to a small (<few KB) per-channel allocation. Not literally `frames × channels × 4`.
+- **Scratch buffer**: per-stream, stored at `+0x178`. Passed as dst to `FUN_140007680` for DMA wrap linearization.
+- **FUN_140007680**: plain SSE-optimized memcpy with overlap handling (NOT a conversion) — small-copy byte-wise, medium 8-byte aligned, large 64-byte SSE, backward-copy for overlap.
+
+**Implication for Y**: AO's FRAME_PIPE can use a **per-stream scratch** of bounded size (enough for one DMA wrap's worth) and reuse `RtlCopyMemory` / `memcpy`. Size bound = max burst size = `sampleRate/2 * bytesPerFrame` (from 6320's overrun guard).
+
+### 9.5.3. ★ Packet notification — VB does NOT notify shared-mode clients
+
+**Critical finding that closes the "packet notification OPEN" question**:
+
+- **`+0x7C` is NOT a derived boundary — it is set by the client via `SetNotificationCount` API** (`FUN_140004700 → FUN_140004764`)
+- **`+0x164` is a "notify enabled" gate flag, NOT a count**. Initialized to 0 at stream alloc. Only becomes non-zero when client explicitly calls `SetNotificationCount` with a valid non-zero byte position.
+- **`SetNotificationCount(0)` is explicitly rejected with `STATUS_INVALID_PARAMETER` (0xC0000010)** at line 3296.
+- **Shared-mode clients that never call `SetNotificationCount` get ZERO packet notifications.** The check at 6320:0x6544 (`cmp byte ptr [rdi+0x164], 0; je skip`) bypasses the entire [+0x8188] call path.
+
+**Why this matters**:
+- Phone Link, Realtek-class audio apps, and most shared-mode consumers never set a notification count. They poll via `GetPosition`.
+- VB's "packet notify via [+0x8188]" path is **event-driven / WaveRT exclusive-mode only**.
+- AO's existing behavior — returning `STATUS_NOT_SUPPORTED` for `GetReadPacket`/`SetWritePacket`/`GetPacketCount` when `m_ulNotificationsPerBuffer == 0` — is **already semantically equivalent to VB** for shared-mode clients.
+
+**Implication for Y1**:
+- **Y1 does NOT need to replicate the [+0x8188] notification call path.** It only matters for event-driven clients which AO already handles through the existing PortCls contract.
+- The **entire "packet notification contract is OPEN"** item from Codex's `VB_PARITY_DEBUG_RESULTS.md` §7 can be marked **CLOSED** — shared-mode clients (the only ones AO currently cares about for live call) don't take this path at all.
+- Bug B's "지지직 overlay" was never about missing packet notifications. The root cause (now confirmed) is the structural decoupling of update chain from transport cadence in the MSVAD-pattern code, which Y's canonical advance helper directly fixes.
+
+**Callback target identity** (for completeness, even though shared-mode skips it):
+```
+thunk @ +0x8188  →  jmp rax
+                    where rax = stream[+0x98][+0x128][0][+0xB0]
+                    i.e., IPortWaveRTStream-like vtable method
+args: (notifyCtx, 8=eventCode, position, boundaryByteOffset)
+```
+
+### 9.5.4. Updated open-item status
+
+| Item | Status | Note |
+|---|---|---|
+| Unregister/STOP entry | **CLOSED** | 669c confirmed multi-role, caller-side reset |
+| Scratch buffer | **CLOSED** | per-stream at +0x178, memcpy via 7680 |
+| Ring allocation/size | **MOSTLY CLOSED** | per-stream at +0x170, formula approximate — re-verify if byte-exact parity demanded |
+| +0x7C boundary semantics | **CLOSED** | client-set via SetNotificationCount, bytes |
+| Packet notify shared-mode | **CLOSED** | VB doesn't notify shared-mode clients; AO already matches |
+
 ## 10. Verdict (updated after §7 closure)
 
 **All major gaps closed.** VB-equivalence is now achievable at byte-exact level for standard paths:
