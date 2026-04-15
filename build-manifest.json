@@ -1,36 +1,36 @@
 ﻿{
     "config":  "Release",
-    "timestamp":  "2026-04-16 08:48:10",
+    "timestamp":  "2026-04-16 08:52:52",
     "artifacts":  {
                       "aocableb.inf":  {
                                            "path":  "D:\\mywork\\ao-phase6\\x64\\Release\\CableB\\aocableb.inf",
-                                           "sha256":  "ED1C393EF8DB24459CED0A428B310DD5E769FCCD600DE42B2B5AA3BB1A6C9B9B",
-                                           "size":  13292,
-                                           "modified":  "2026-04-16 08:48:08"
+                                           "sha256":  "461D247938FE1338A05E667A0C2CF50D842F578C21A3251CCB308196C71AB669",
+                                           "size":  13294,
+                                           "modified":  "2026-04-16 08:52:50"
                                        },
                       "aocableb.sys":  {
                                            "path":  "D:\\mywork\\ao-phase6\\x64\\Release\\CableB\\aocableb.sys",
-                                           "sha256":  "7668658342C705AA3FC7E17DDD6FD93659D9930175E05B5A589348DE572D58F6",
-                                           "size":  105520,
-                                           "modified":  "2026-04-16 08:48:08"
+                                           "sha256":  "BB7ABFF10443AF8CAEEE16D561B6E331635BE83F67E46047E97E94212C654074",
+                                           "size":  106072,
+                                           "modified":  "2026-04-16 08:52:50"
                                        },
                       "Utilities.lib":  {
                                             "path":  "D:\\mywork\\ao-phase6\\Source\\Utilities\\x64\\Release\\Utilities.lib",
-                                            "sha256":  "D2A2B3D7604E2B5C5F90965482BC8B9581CE5082EEA5CA54585A7C8610F22A10",
-                                            "size":  415362,
-                                            "modified":  "2026-04-16 08:48:03"
+                                            "sha256":  "D1BE8CE727AF268B88517529DA2124B068794B7841D50871900969C0E0CA2E1E",
+                                            "size":  416538,
+                                            "modified":  "2026-04-16 08:52:46"
                                         },
                       "aocablea.sys":  {
                                            "path":  "D:\\mywork\\ao-phase6\\x64\\Release\\CableA\\aocablea.sys",
-                                           "sha256":  "E5FB41341CC90A46BB15B20D299E4D48AD471F251093228A590FE1D374DFC956",
-                                           "size":  105520,
-                                           "modified":  "2026-04-16 08:48:07"
+                                           "sha256":  "3F09AE13731CB27123A294F794ED57D6F05B61E6B5ED7F30C5A8D98B85832B85",
+                                           "size":  106072,
+                                           "modified":  "2026-04-16 08:52:49"
                                        },
                       "aocablea.inf":  {
                                            "path":  "D:\\mywork\\ao-phase6\\x64\\Release\\CableA\\aocablea.inf",
-                                           "sha256":  "BA3DEA82CFDEE2C75979DAF9C05D2230E24A5BBC13EB3EFC5345D9BF20D6780E",
-                                           "size":  12940,
-                                           "modified":  "2026-04-16 08:48:06"
+                                           "sha256":  "D2786A11C7A375B8E419ADE0D995549AEE4BCD3B45E98003130236A2699212EF",
+                                           "size":  12942,
+                                           "modified":  "2026-04-16 08:52:48"
                                        },
                       "AOControlPanel.exe":  {
                                                  "path":  "D:\\mywork\\ao-phase6\\x64\\Release\\AOControlPanel.exe",

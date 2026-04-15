@@ -701,14 +701,48 @@ AoRunCaptureEvent(AO_STREAM_RT* rt, LONGLONG qpc)
     // state machine and underrun counter) preserved in git history at
     // commit a8ac0fb.
 
-    // Phase 6 Y1C shadow hook-up: invoke the canonical helper in
-    // shadow mode so the shared timer capture path is a visible call
-    // source for the Y1C gate. Shadow bookkeeping only; legacy capture
-    // transport (WriteBytes via UpdatePosition) remains the audible
-    // owner until Y3 retires it.
+    // Phase 6 Y3-v3: cable mic is now timer-driven (capture audible
+    // path). Helper advance -> AoCableReadCaptureToDma -> pipe read ->
+    // envelope -> denormalize -> DMA write.
     if (rt != NULL && rt->IsCable)
     {
         AoCableAdvanceByQpc(rt, (ULONGLONG)qpc, AO_ADVANCE_TIMER_CAPTURE, 0);
+
+        // Phase 6 Y3-v3 diagnostic — symmetric to the render side.
+        // 1 Hz per-stream DbgPrint showing the capture helper state
+        // so we can tell whether the audible crackle is caused by
+        // underrun, envelope, or format path issues. Output format:
+        //   [AoY3cap] rt=PTR fade=counter dmon=DmaProducedMono
+        //              fill=/cap ur=underrun drp=drop
+        if (rt->IsCapture && rt->BlockAlign > 0 && g_AoTeQpcFrequency > 0)
+        {
+            LONGLONG elapsedQpc = qpc - rt->DbgY2LastPrintQpc;
+            if (elapsedQpc >= g_AoTeQpcFrequency ||
+                rt->DbgY2LastPrintQpc == 0)
+            {
+                ULONG pipeFill = 0;
+                ULONG pipeCap  = 0;
+                ULONG underrun = 0;
+                ULONG drops    = 0;
+                if (rt->Pipe != NULL)
+                {
+                    pipeFill = rt->Pipe->FillFrames;
+                    pipeCap  = rt->Pipe->CapacityFrames;
+                    underrun = rt->Pipe->UnderrunCount;
+                    drops    = rt->Pipe->DropCount;
+                }
+
+                LONGLONG dmon = (LONGLONG)rt->DmaProducedMono;
+                LONG fadeCtr  = rt->FadeSampleCounter;
+
+                DbgPrint("[AoY3cap] rt=%p fade=%d dmon=%lld "
+                         "fill=%u/%u ur=%u drp=%u\n",
+                         rt, fadeCtr, dmon,
+                         pipeFill, pipeCap, underrun, drops);
+
+                rt->DbgY2LastPrintQpc = qpc;
+            }
+        }
     }
 }
 
