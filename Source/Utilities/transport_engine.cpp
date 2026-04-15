@@ -505,6 +505,87 @@ AoRunRenderEvent(AO_STREAM_RT* rt, LONGLONG qpc)
     rt->DmaOffset = offset;
 }
 
+// AoRunCaptureEvent — drain FramePipeReadToDma frames into the stream's
+// capture DMA buffer. Mirrors the legacy WriteBytes loop and handles the
+// startup state machine from PHASE6_PLAN.md §6.
+//
+// Startup: if rt->StartupArmed is TRUE we check the ring fill. If it hasn't
+// reached StartupThresholdFrames yet, the entire DMA chunk is zero-filled
+// and we skip the pipe read (so the reader does not advance). Once the
+// ring clears the threshold, StartupArmed is dropped and steady-state
+// reads take over. StartupArmed is re-armed per session in OnRunEx, so
+// every fresh mic stream gets its own cushion window.
+//
+// Runs at DISPATCH_LEVEL from the timer callback. FramePipeReadToDma
+// takes PipeLock internally — we must never be holding EngineLock here.
+static VOID
+AoRunCaptureEvent(AO_STREAM_RT* rt, LONGLONG qpc)
+{
+    UNREFERENCED_PARAMETER(qpc);
+
+    if (rt->Pipe == NULL || rt->DmaBuffer == NULL || rt->DmaBufferSize == 0)
+    {
+        return;
+    }
+
+    ULONG frames = AoComputeFramesForEvent(rt);
+    if (frames == 0)
+    {
+        return;
+    }
+
+    ULONG bytes  = frames * rt->BlockAlign;
+    ULONG offset = rt->DmaOffset;
+    ULONG bufSz  = rt->DmaBufferSize;
+
+    // Startup gate — see §6 of PHASE6_PLAN.md. While armed, emit silence
+    // to the DMA buffer and do NOT advance the pipe read cursor so the
+    // writer side can build up a cushion. StartupArmed is explicit state
+    // re-set on each OnRunEx so we never hit the sticky-flag bug that
+    // the old FramePipe gate had.
+    if (rt->StartupArmed)
+    {
+        ULONG fill = FramePipeGetFillFrames(rt->Pipe);
+        if (fill < rt->StartupThresholdFrames)
+        {
+            while (bytes > 0)
+            {
+                ULONG chunk = bytes;
+                if (chunk > bufSz - offset)
+                {
+                    chunk = bufSz - offset;
+                }
+                RtlZeroMemory(rt->DmaBuffer + offset, chunk);
+                offset = (offset + chunk) % bufSz;
+                bytes -= chunk;
+            }
+            rt->DmaOffset = offset;
+            return;
+        }
+        // Cushion reached — leave startup mode.
+        rt->StartupArmed = FALSE;
+    }
+
+    // Steady-state read. FramePipeReadToDma guarantees the requested
+    // byteCount is fully filled (silence on underrun), so we do not need
+    // to track a partial-read count at this layer.
+    while (bytes > 0)
+    {
+        ULONG chunk = bytes;
+        if (chunk > bufSz - offset)
+        {
+            chunk = bufSz - offset;
+        }
+
+        FramePipeReadToDma(rt->Pipe, rt->DmaBuffer + offset, chunk);
+
+        offset = (offset + chunk) % bufSz;
+        bytes -= chunk;
+    }
+
+    rt->DmaOffset = offset;
+}
+
 //=============================================================================
 // AoTransportTimerCallback — shared timer fires here at the engine period.
 //
@@ -562,8 +643,7 @@ AoTransportTimerCallback(
 
     // Run events outside the engine lock. Order: render (speaker side)
     // first, then capture, so that within a single tick Cable B mic reads
-    // the pipe content that Cable B speaker just wrote. Step 3 only
-    // implements the render runner; capture path lands in Step 4.
+    // the pipe content that Cable B speaker just wrote.
     for (ULONG i = 0; i < dueCount; i++)
     {
         AO_STREAM_RT* rt = due[i];
@@ -572,7 +652,17 @@ AoTransportTimerCallback(
             AoRunRenderEvent(rt, now.QuadPart);
         }
     }
-    // (Step 4) capture pass will walk due[] again here.
+    // Capture pass — Step 4. Mic DMA is filled from the pipe at the same
+    // cadence the render side pushed new frames, so pipe fill oscillation
+    // per tick is minimized.
+    for (ULONG i = 0; i < dueCount; i++)
+    {
+        AO_STREAM_RT* rt = due[i];
+        if (rt->IsCapture)
+        {
+            AoRunCaptureEvent(rt, now.QuadPart);
+        }
+    }
 
     for (ULONG i = 0; i < dueCount; i++)
     {

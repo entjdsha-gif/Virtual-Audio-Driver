@@ -1942,7 +1942,19 @@ VOID CMiniportWaveRTStream::UpdatePosition
 
     if (m_bCapture)
     {
-        WriteBytes(ByteDisplacement);
+        // Phase 6 Step 4: cable mic capture transport now runs from the
+        // AO_TRANSPORT_ENGINE timer callback via AoRunCaptureEvent. Do
+        // NOT call WriteBytes for cable mic streams — that path would
+        // double-fill the DMA with pipe content and fight the engine
+        // event runner. Non-cable mic streams (file-playback / tone
+        // generator paths) still reach WriteBytes unchanged.
+        CMiniportWaveRT* pMp = m_pMiniport;
+        BOOL isCableMic = (pMp && (pMp->m_DeviceType == eCableAMic ||
+                                    pMp->m_DeviceType == eCableBMic));
+        if (!isCableMic)
+        {
+            WriteBytes(ByteDisplacement);
+        }
     }
     else
     {
