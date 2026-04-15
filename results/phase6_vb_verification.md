@@ -439,38 +439,49 @@ args: (notifyCtx, 8=eventCode, position, boundaryByteOffset)
 | Ring allocation/size | **MOSTLY CLOSED** | per-stream at +0x170, formula approximate — re-verify if byte-exact parity demanded |
 | +0x7C boundary semantics | **CLOSED** | client-set via SetNotificationCount, bytes |
 | Packet notify shared-mode | **CLOSED** | VB doesn't notify shared-mode clients; AO already matches |
-| NotifyArmed STOP preservation | **PROVISIONAL** | AO Y1B preserves across STOP — NOT directly verified in VB. Must be confirmed or corrected before Y2 (see §9.6) |
+| NotifyArmed STOP preservation | **CLOSED** | VB preserves all 3 notify fields across STOP; cleared once only at register init (lines 11738-11739). AO Y1B corrected 2026-04-16 to match — all three preserved. |
 
-### 9.6. Provisional items tracked for Y2 pre-flight closure
+### 9.6. Notification field STOP semantics — CLOSED 2026-04-16
 
-These items were noted during Y1B implementation review (Codex validation,
-2026-04-16) as NOT fully verified against VB. They are acceptable to carry
-through Y1C shadow mode, but must be resolved before Y2 promotes the helper
-to audible ownership.
+Originally flagged as provisional during Codex Y1B review. Closed by a
+focused Ghidra pass on VB `FUN_14000669c`'s three caller sites (lines
+4544, 4798, 11464 in `vbcable_all_functions.c`).
 
-**P-1. NotifyArmed preservation across STOP**
+**Findings**:
 
-Current AO Y1B behavior (`AoCableResetRuntimeFields`): preserves
-`NotifyArmed` + `NotifyBoundaryBytes` across STOP, clears only `NotifyFired`.
-Rationale at the time: event-driven clients that called `SetNotificationCount`
-should not lose their arm state across a pause/resume pair.
+1. **None of the three 669c caller sites touch `+0x7C`, `+0x164`, or
+   `+0x165`.** Each verdict is PRESERVES — only DMA cursor, monotonic
+   counter, and anchor QPC fields get caller-side zeroed.
 
-**Gap**: VB's actual STOP reset scope for the notify-related fields
-(+0x164 / +0x165 / +0x7C) was not directly captured. The Ghidra pass on
-`FUN_14000669c` only dumped the cursor/counter caller-side reset pattern
-(+0xD0..+0x108 for capture, +0x50..+0x88 for render, +0x180 anchor).
+2. **VB's sole initialization of the notify fields is at fresh stream
+   register time**, at lines 11738-11739 of the decompile:
+   ```c
+   *(undefined8 *)(param_1 + 0x7c)  = 0;    // NotifyBoundaryBytes
+   *(undefined2 *)(param_1 + 0x164) = 0;    // NotifyArmed + NotifyFired (2 bytes)
+   ```
 
-**Closure plan before Y2**: one of —
-  (a) dump `FUN_14000669c`'s caller sites in Ghidra and check whether they
-      also zero `[rcx+0x164]` / `[rcx+0x7C]`; or
-  (b) WinDbg BP on `FUN_140004700` (`SetNotificationCount`) across a
-      stream stop/resume cycle to observe client re-arm behavior; or
-  (c) if unresolved, change AO Y1B to clear `NotifyArmed` on STOP and
-      require clients to re-arm via `SetNotificationCount` after resume.
+3. **`SetNotificationCount` (`FUN_140004700` → `FUN_140004764`) writes
+   `+0x7c` and reads `+0x164` as a gate** — it arms but does not clear
+   on its own.
 
-Until closed, treat the current behavior as a design choice, not a VB
-parity claim. The shared-mode live-call path is unaffected either way
-(NotifyArmed stays 0 for shared-mode clients regardless).
+**VB behavior model**:
+  - Stream register → all notify fields zero
+  - Client `SetNotificationCount` → `+0x7c` and `+0x164` armed
+  - Cursor crosses boundary → `+0x165 = 1` (one-shot fire)
+  - Stream STOP → all three fields retained
+  - Stream destroy/recreate → fresh zero via register-time init
+
+**AO Y1B correction** (committed as addendum to `be790b9`):
+`AoCableResetRuntimeFields` no longer clears `NotifyFired`. All three
+notify fields (`NotifyBoundaryBytes`, `NotifyArmed`, `NotifyFired`) are
+preserved across STOP. AO's equivalent of VB's "register-time init" is
+the `ExAllocatePool2` + `RtlZeroMemory` inside `AoTransportAllocStreamRt`,
+which zeros the struct once per stream object lifetime — matching VB's
+once-only initialization semantics at the correct lifecycle boundary.
+
+**Implication for Y2/Y3**: no further action required for notification
+STOP semantics. Event-driven clients that arm via `SetNotificationCount`
+retain their arm state across pause/resume cycles, matching VB exactly.
 
 ## 10. Verdict (updated after §7 closure)
 
