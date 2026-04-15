@@ -1,4 +1,4 @@
-/*++
+﻿/*++
 
 Copyright (c) Microsoft Corporation All Rights Reserved
 
@@ -133,6 +133,16 @@ protected:
     PLONG                       m_plPeakMeter;
     PWAVEFORMATEXTENSIBLE       m_pWfExt;
     ULONG                       m_ulContentId;
+
+    //
+    // Phase 6 Step 1: per-stream transport runtime state. Allocated on first
+    // RUN transition via AoTransportAllocStreamRt and freed in the stream
+    // destructor via AoTransportFreeStreamRt. The engine holds a non-owning
+    // link pointer via the AO_STREAM_RT::Link field; this stream owns the
+    // allocation itself. Opaque forward declaration here — full definition
+    // lives in transport_engine.h.
+    //
+    struct _AO_STREAM_RT*       m_pTransportRt;
 #if !defined(CABLE_A) && !defined(CABLE_B)
     CSaveData                   m_SaveData;
     ToneGenerator               m_ToneGenerator;

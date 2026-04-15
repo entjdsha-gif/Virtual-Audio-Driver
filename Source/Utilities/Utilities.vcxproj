@@ -186,6 +186,7 @@
     <ClCompile Include="loopback.cpp" />
     <ClCompile Include="savedata.cpp" />
     <ClCompile Include="tonegenerator.cpp" />
+    <ClCompile Include="transport_engine.cpp" />
   </ItemGroup>
   <ItemGroup>
     <Inf Exclude="@(Inf)" Include="*.inf" />

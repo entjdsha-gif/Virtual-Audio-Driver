@@ -1,4 +1,4 @@
-/*++
+﻿/*++
 
 Copyright (c) Microsoft Corporation All Rights Reserved
 
@@ -23,6 +23,7 @@ Abstract:
 #include "endpoints.h"
 #include "minipairs.h"
 #include "loopback.h"
+#include "transport_engine.h"
 #include "ioctl.h"
 
 // Layout verification (must match loopback.cpp in Utilities.lib)
@@ -234,6 +235,14 @@ Environment:
     AoFree16chBlock(&g_pDyn16RenderB);
     AoFree16chBlock(&g_pDyn16CaptureB);
 #endif
+
+    //
+    // Phase 6 Step 1: tear down the shared transport engine before freeing
+    // the pipes. The engine's timer must be fully stopped and any in-flight
+    // DPC drained (ExDeleteTimer Wait=TRUE) before any stream runtime that
+    // the callback may have referenced is freed.
+    //
+    AoTransportEngineCleanup();
 
     //
     // Cleanup loopback buffers.
@@ -613,6 +622,18 @@ Return Value:
     }
 
     //
+    // Phase 6 Step 1: initialize the shared transport engine. The engine
+    // owns the global 20 ms event timer. Step 1 wires the skeleton only —
+    // the timer callback is a no-op and no data movement is switched onto
+    // the engine yet. See docs/PHASE6_PLAN.md §8.
+    //
+    ntStatus = AoTransportEngineInit();
+    IF_FAILED_ACTION_JUMP(
+        ntStatus,
+        DPF(D_ERROR, ("AoTransportEngineInit failed, 0x%x", ntStatus)),
+        Done);
+
+    //
     // All done.
     //
     ntStatus = STATUS_SUCCESS;
@@ -627,6 +648,10 @@ Done:
             g_hParametersKey = NULL;
         }
         AoDeleteControlDevice();
+
+        // Phase 6: engine cleanup is idempotent and safe to call even if
+        // AoTransportEngineInit never ran (guarded by Initialized flag).
+        AoTransportEngineCleanup();
 
 #if defined(CABLE_A)
         LoopbackCleanup(&g_CableALoopback);

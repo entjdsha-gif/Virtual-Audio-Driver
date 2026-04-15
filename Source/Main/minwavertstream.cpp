@@ -5,6 +5,7 @@
 #include "minwavert.h"
 #include "minwavertstream.h"
 #include "loopback.h"
+#include "transport_engine.h"
 #define MINWAVERTSTREAM_POOLTAG 'SRWM'
 // ~4ms fade-in to prevent pop/click, scaled to sample rate
 #define FADE_MS 4
@@ -75,6 +76,23 @@ Return Value:
     // resources. After this point, no timer/DPC callback can still be
     // advancing the cable pipe via UpdatePosition() + the Phase 3 pump.
     KeFlushQueuedDpcs();
+
+    //
+    // Phase 6 Step 1: unlink this stream from the shared transport engine
+    // and free its runtime object. AoTransportOnStopEx is idempotent (safe
+    // even if we never called OnRunEx) and AoTransportFreeStreamRt detaches
+    // defensively before freeing. KeFlushQueuedDpcs above covers the stream
+    // timer path; the engine timer is drained separately in
+    // AoTransportEngineCleanup during driver unload, which runs after all
+    // stream destructors. Step 3/4 will tighten ordering once the callback
+    // actually touches pipe state.
+    //
+    if (m_pTransportRt)
+    {
+        AoTransportOnStopEx(m_pTransportRt);
+        AoTransportFreeStreamRt(m_pTransportRt);
+        m_pTransportRt = NULL;
+    }
 
     // Cable pipe unregister at the true stream-lifetime edge.
     // Moved out of SetState(KSSTATE_STOP) in Phase 4 so state churn no
@@ -244,6 +262,7 @@ Return Value:
     m_bCapture = FALSE;
     m_ulDmaBufferSize = 0;
     m_pDmaBuffer = NULL;
+    m_pTransportRt = NULL;
     m_ulNotificationsPerBuffer = 0;
     m_KsState = KSSTATE_STOP;
     m_pTimer = NULL;
@@ -1335,6 +1354,15 @@ NTSTATUS CMiniportWaveRTStream::SetState
 
             KeReleaseSpinLock(&m_PositionSpinLock, oldIrql);
 
+            // Phase 6 Step 1: tell the shared transport engine that this
+            // stream is no longer scheduling-active. Does not free the
+            // runtime allocation — that remains attached to the stream
+            // until the destructor runs. Safe if never registered.
+            if (m_pTransportRt)
+            {
+                AoTransportOnStopEx(m_pTransportRt);
+            }
+
             // Wait until all work items are completed.
 #if !defined(CABLE_A) && !defined(CABLE_B)
             if (!m_bCapture && !g_DoNotCreateDataFiles)
@@ -1358,6 +1386,17 @@ NTSTATUS CMiniportWaveRTStream::SetState
                 //
                 // Run -> Pause
                 //
+
+                // Phase 6 Step 1: tell the shared transport engine to stop
+                // scheduling events for this stream. Runtime allocation is
+                // preserved so a PAUSE -> RUN cycle can reuse it. No data
+                // movement is wired onto the engine yet so this is a no-op
+                // effect-wise, but keeping the call here means Step 3/4 will
+                // not need to revisit the SetState path.
+                if (m_pTransportRt)
+                {
+                    AoTransportOnPauseEx(m_pTransportRt);
+                }
 
                 // FRAME_PIPE: do NOT unregister on Pause.
                 // Windows audio engine pauses/resumes streams frequently between audio chunks.
@@ -1479,6 +1518,37 @@ NTSTATUS CMiniportWaveRTStream::SetState
                         m_pWfExt->Format.nChannels,
                         m_pWfExt->Format.nBlockAlign,
                         isFloat);
+
+                    //
+                    // Phase 6 Step 1: register this stream with the shared
+                    // transport engine. Runtime allocation is lazy — we do
+                    // it here on first RUN after construction. Subsequent
+                    // PAUSE -> RUN cycles reuse m_pTransportRt.
+                    //
+                    // The engine callback is currently a no-op, so this
+                    // registration has no observable effect on transport.
+                    // It exists to validate the skeleton — if something
+                    // goes wrong (BSOD, lock order violation, leak) we
+                    // want it to surface here before Step 3/4 wires data
+                    // movement onto the engine.
+                    //
+                    if (m_pTransportRt == NULL)
+                    {
+                        m_pTransportRt = AoTransportAllocStreamRt(this);
+                    }
+                    if (m_pTransportRt)
+                    {
+                        AO_STREAM_SNAPSHOT snap;
+                        RtlZeroMemory(&snap, sizeof(snap));
+                        snap.Rt            = m_pTransportRt;
+                        snap.IsCapture     = m_bCapture;
+                        snap.IsCable       = TRUE;
+                        snap.IsSpeakerSide = fpIsSpeaker;
+                        snap.SampleRate    = m_pWfExt->Format.nSamplesPerSec;
+                        snap.Channels      = m_pWfExt->Format.nChannels;
+                        snap.BlockAlign    = m_pWfExt->Format.nBlockAlign;
+                        AoTransportOnRunEx(&snap);
+                    }
                 }
             }
             // [OLD PATH DISABLED — LoopbackRegisterFormat, MicSink stash/register removed]
