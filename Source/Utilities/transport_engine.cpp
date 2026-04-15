@@ -619,13 +619,14 @@ AoRunRenderEvent(AO_STREAM_RT* rt, LONGLONG qpc)
     {
         AoCableAdvanceByQpc(rt, (ULONGLONG)qpc, AO_ADVANCE_TIMER_RENDER, 0);
 
-        // Phase 6 Y2-1.5 rate-limited byte diff DbgPrint.
+        // Phase 6 Y2-1.5 rate-limited byte diff DbgPrint + pipe state.
         // Fires once per second per cable render stream so DebugView
         // can show whether helper vs legacy cumulative byte totals
-        // are converging. Last-second deltas (dH, dL) make it easy
-        // to tell whether a non-zero cumulative diff is historical
-        // leftover or an active drift. Removed in Y4 with the rest
-        // of the Y2 diagnostic counters.
+        // are converging AND whether the cable pipe is healthy.
+        // Added pipe->FillFrames / UnderrunCount / DropCount for Y3
+        // diagnosis: if the capture side is underrunning we will see
+        // UnderrunCount climb even though the render-side H/L numbers
+        // look clean.
         if (!rt->IsCapture && rt->BlockAlign > 0 && g_AoTeQpcFrequency > 0)
         {
             LONGLONG elapsedQpc = qpc - rt->DbgY2LastPrintQpc;
@@ -639,10 +640,23 @@ AoRunRenderEvent(AO_STREAM_RT* rt, LONGLONG qpc)
                 LONGLONG diffMax     = rt->DbgY2RenderByteDiffMax;
                 LONG     mismatchHits = rt->DbgY2RenderMismatchHits;
 
+                ULONG pipeFill  = 0;
+                ULONG pipeCap   = 0;
+                ULONG underrun  = 0;
+                ULONG drops     = 0;
+                if (rt->Pipe != NULL)
+                {
+                    pipeFill = rt->Pipe->FillFrames;
+                    pipeCap  = rt->Pipe->CapacityFrames;
+                    underrun = rt->Pipe->UnderrunCount;
+                    drops    = rt->Pipe->DropCount;
+                }
+
                 DbgPrint("[AoY2.5] rt=%p H=%lld L=%lld dH=%lld dL=%lld "
-                         "diffMax=%lld miss=%d\n",
+                         "diffMax=%lld miss=%d fill=%u/%u ur=%u drp=%u\n",
                          rt, helperNow, legacyNow, helperDelta, legacyDelta,
-                         diffMax, mismatchHits);
+                         diffMax, mismatchHits,
+                         pipeFill, pipeCap, underrun, drops);
 
                 rt->DbgY2HelperPrevSnapshot = helperNow;
                 rt->DbgY2LegacyPrevSnapshot = legacyNow;
