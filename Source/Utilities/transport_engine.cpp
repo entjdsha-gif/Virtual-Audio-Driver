@@ -1012,6 +1012,116 @@ AoCableResetRuntimeFields(AO_STREAM_RT* rt)
 }
 
 //-----------------------------------------------------------------------------
+// Phase 6 Y2-1 — render audible path scaffolding
+//
+// Both functions below are defined but only invoked when
+// rt->RenderAudibleActive is TRUE, which Y2-1 never sets. Y2-2 flips
+// the switch and retires legacy ReadBytes ownership for cable render
+// streams.
+//-----------------------------------------------------------------------------
+
+// AoCableApplyRenderFadeInScratch — opaque-pointer adapter called
+// from loopback.cpp's FramePipeWriteFromDmaEx. Wraps AoApplyFadeEnvelope
+// with the stream's FadeSampleCounter so loopback.cpp does not need to
+// know AO_STREAM_RT layout. Safe with NULL rtOpaque.
+extern "C" VOID
+AoCableApplyRenderFadeInScratch(
+    PVOID   rtOpaque,
+    LONG*   scratch,
+    ULONG   sampleCount)
+{
+    if (rtOpaque == NULL)
+    {
+        return;
+    }
+    AO_STREAM_RT* rt = (AO_STREAM_RT*)rtOpaque;
+    AoApplyFadeEnvelope(scratch, sampleCount, &rt->FadeSampleCounter);
+}
+
+// AoCableWriteRenderFromDma — DMA -> scratch -> envelope -> FRAME_PIPE
+// transfer for cable render streams. Called from the render branch of
+// AoCableAdvanceByQpc when rt->RenderAudibleActive is TRUE.
+//
+// advanceFrames is the helper-authoritative per-tick frame count
+// (already subject to the 8-frame gate and 127-rebase + 0.5s overrun
+// reject in the caller). This function:
+//
+//   1. Converts advanceFrames to bytes via rt->BlockAlign
+//   2. Computes the DMA start offset from rt->DmaProducedMono
+//      (published by legacy UpdatePosition tail — this is the current
+//      monotonic "bytes ever written by the WaveRT client")
+//   3. Loops over the DMA circular buffer wrap boundary, calling
+//      FramePipeWriteFromDmaEx for each contiguous run with rtOpaque
+//      set so the fade envelope is applied on scratch during the
+//      normalize-to-pipe step
+//
+// Cursor semantics for Y2-1 (switch off): DmaProducedMono still comes
+// from legacy UpdatePosition, so advanceBytes computed from
+// advanceFrames × BlockAlign must equal the legacy ByteDisplacement for
+// this call to be cursor-consistent. Y2-2 validates this invariant at
+// the switchover and, if necessary, re-homes DmaProducedMono publish
+// into the helper.
+//
+// DMA start offset math: the legacy path computes
+// `bufferOffset = LinearPosition_old % DmaBufferSize` where
+// LinearPosition_old is the value BEFORE the legacy UpdatePosition
+// advance. The legacy publish puts LinearPosition_new into
+// DmaProducedMono after the advance, so we recover the old offset via
+// `(DmaProducedMono - advanceBytes) % DmaBufferSize`. This is correct
+// as long as advanceBytes matches the legacy displacement.
+extern "C" VOID
+AoCableWriteRenderFromDma(AO_STREAM_RT* rt, ULONG advanceFrames)
+{
+    if (rt == NULL || advanceFrames == 0 || rt->BlockAlign == 0 ||
+        rt->DmaBuffer == NULL || rt->DmaBufferSize == 0 ||
+        rt->Pipe == NULL)
+    {
+        return;
+    }
+
+    ULONGLONG advanceBytes = (ULONGLONG)advanceFrames * rt->BlockAlign;
+
+    // Defensive: never try to read more than one DMA buffer worth of
+    // bytes in a single call. If advanceBytes exceeds the buffer size
+    // the canonical helper's overrun reject should have caught it, but
+    // we still guard here so a runaway advance cannot wrap past itself.
+    if (advanceBytes > rt->DmaBufferSize)
+    {
+        advanceBytes = rt->DmaBufferSize;
+    }
+
+    // Start offset from the legacy-published produced byte count.
+    // DmaProducedMono is the NEW (post-advance) LinearPosition value,
+    // so we back off by advanceBytes to find where this tick's data
+    // begins in the circular DMA buffer.
+    ULONGLONG producedNew = (ULONGLONG)rt->DmaProducedMono;
+    ULONGLONG producedOld = producedNew - advanceBytes;
+    ULONG     startOffset = (ULONG)(producedOld % (ULONGLONG)rt->DmaBufferSize);
+
+    ULONG bytesRemaining = (ULONG)advanceBytes;
+    ULONG bufferOffset   = startOffset;
+
+    while (bytesRemaining > 0)
+    {
+        ULONG runWrite = bytesRemaining;
+        ULONG spaceToEnd = rt->DmaBufferSize - bufferOffset;
+        if (runWrite > spaceToEnd)
+        {
+            runWrite = spaceToEnd;
+        }
+
+        (VOID)FramePipeWriteFromDmaEx(
+            rt->Pipe,
+            rt->DmaBuffer + bufferOffset,
+            runWrite,
+            (PVOID)rt);
+
+        bufferOffset  = (bufferOffset + runWrite) % rt->DmaBufferSize;
+        bytesRemaining -= runWrite;
+    }
+}
+
+//-----------------------------------------------------------------------------
 // AoCableAdvanceByQpc — Y1B shadow body.
 //
 // Direct translation of VB FUN_140006320 per results/phase6_vb_verification.md
@@ -1146,6 +1256,19 @@ AoCableAdvanceByQpc(
     else
     {
         rt->DmaCursorFrames += (ULONGLONG)advance;
+    }
+
+    // --- Y2-1 render audible path (switch off by default) ---
+    // When RenderAudibleActive is TRUE, the helper owns the DMA ->
+    // FRAME_PIPE transfer for cable render streams. In Y2-1 this flag
+    // is never set, so the call is dead code for diagnostic build
+    // purposes — compiles, links, passes kernel verifier, but never
+    // executes. Y2-2 is the commit that flips the switch and retires
+    // legacy ReadBytes ownership. Gated on IsCable && !IsCapture so
+    // capture streams (which enter the same helper) skip it.
+    if (rt->RenderAudibleActive && rt->IsCable && !rt->IsCapture)
+    {
+        AoCableWriteRenderFromDma(rt, (ULONG)advance);
     }
 
     // --- Packet notification check (shadow only) ---

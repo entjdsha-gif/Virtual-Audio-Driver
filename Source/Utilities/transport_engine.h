@@ -174,6 +174,22 @@ typedef struct _AO_STREAM_RT {
     volatile LONG           DbgShadowAdvanceHits;
     volatile LONG           DbgShadowQueryHits;
     volatile LONG           DbgShadowTimerHits;
+
+    //=========================================================================
+    // Phase 6 Y2-1 audible switch (render path)
+    //
+    // When TRUE, AoCableAdvanceByQpc's render branch does the actual
+    // DMA -> scratch -> FRAME_PIPE write via AoCableWriteRenderFromDma
+    // and applies the fade envelope. When FALSE (Y2-1 default), the
+    // render branch stays in shadow mode and the legacy ReadBytes path
+    // (called from CMiniportWaveRTStream::UpdatePosition) remains the
+    // audible owner. Y2-2 flips this to TRUE and retires ReadBytes
+    // ownership for cable render streams.
+    //
+    // Capture has no equivalent flag yet — Y3 adds its own audible
+    // switch mirroring this pattern.
+    //=========================================================================
+    BOOLEAN                 RenderAudibleActive;
 } AO_STREAM_RT, *PAO_STREAM_RT;
 
 //=============================================================================
@@ -320,5 +336,29 @@ extern "C" VOID AoResetFadeCounter(AO_STREAM_RT* rt);
 // published frames, and fade state. Shared timer teardown is engine-
 // global and handled separately by AoTransportEngineCleanup.
 extern "C" VOID AoCableResetRuntimeFields(AO_STREAM_RT* rt);
+
+//=============================================================================
+// Phase 6 Y2-1 — render audible path API
+//
+// AoCableWriteRenderFromDma performs DMA-bytes -> scratch linearize ->
+// normalize -> fade envelope -> FRAME_PIPE write for cable render streams.
+// Called from AoCableAdvanceByQpc's render branch when RenderAudibleActive
+// is set (Y2-2 flips the switch). Matches VB 22b0 + 51a8 combined path.
+//
+// advanceFrames is the helper-authoritative frame count for this tick.
+// The function converts to bytes via rt->BlockAlign, computes the DMA
+// start offset from rt->DmaProducedMono, handles the circular wrap
+// across rt->DmaBufferSize boundaries, and calls FramePipeWriteFromDmaEx
+// for each contiguous run with rt passed through so the envelope can
+// be applied on scratch before pipe-write.
+extern "C" VOID AoCableWriteRenderFromDma(AO_STREAM_RT* rt, ULONG advanceFrames);
+
+// Opaque-pointer adapter called from loopback.cpp's FramePipeWriteFromDmaEx.
+// Wraps AoApplyFadeEnvelope with the stream's FadeSampleCounter so the
+// loopback TU does not need to know AO_STREAM_RT layout. Safe to call
+// with rtOpaque == NULL (no-op).
+extern "C" VOID AoCableApplyRenderFadeInScratch(PVOID rtOpaque,
+                                                 LONG* scratch,
+                                                 ULONG sampleCount);
 
 #endif // AO_TRANSPORT_ENGINE_H
