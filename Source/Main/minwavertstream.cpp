@@ -881,17 +881,25 @@ NTSTATUS CMiniportWaveRTStream::GetPosition
         LARGE_INTEGER ilQPC = KeQueryPerformanceCounter(NULL);
         UpdatePosition(ilQPC);
 
-        // Phase 6 Y2-2 render / Y3-v2 capture: invoke the canonical
-        // cable advance helper. For cable render this is the Y2-2
-        // shadow hook + helper actually owning the DMA -> FRAME_PIPE
-        // path. For cable mic this is now the authoritative advance
-        // call — UpdatePosition above early-exited for cable mic,
-        // so this is the only query-path advance.
+        // Phase 6 Y3-v3 / Y2-2 render asymmetry:
+        //
+        //   render = query-driven
+        //   capture = timer-driven
+        //   query on capture = informational only
+        //
+        // Cable render helper advances on every query (Y2-2 design —
+        // pos-query is the primary driver). Cable mic helper is
+        // TIMER-DRIVEN only; query path is read-only here and the
+        // cable mic return values below come straight from
+        // DmaProducedMono that the timer DPC has been publishing.
+        // Adding a query-path advance for cable mic races with the
+        // render helper on the same pipe and produces audible
+        // crackle, as observed in the Y3-v2 live call test. See
+        // results/phase6_vb_verification.md §9.5.2 for the VB
+        // runtime basis of this asymmetry.
         if (m_pTransportRt && m_pMiniport &&
             (m_pMiniport->m_DeviceType == eCableASpeaker ||
-             m_pMiniport->m_DeviceType == eCableBSpeaker ||
-             m_pMiniport->m_DeviceType == eCableAMic      ||
-             m_pMiniport->m_DeviceType == eCableBMic))
+             m_pMiniport->m_DeviceType == eCableBSpeaker))
         {
             AoCableAdvanceByQpc(m_pTransportRt,
                                 (ULONGLONG)ilQPC.QuadPart,
@@ -900,13 +908,13 @@ NTSTATUS CMiniportWaveRTStream::GetPosition
         }
     }
 
-    // Phase 6 Y3-v2 full literal — cable mic returns helper-owned
-    // cursor truth. rt->DmaProducedMono is the helper's monotonic
-    // produced-byte counter; modulo DmaBufferSize gives the current
-    // circular offset that the client should read up to. Both
-    // PlayOffset and WriteOffset report the same value for capture
-    // (they diverge for render in MSVAD pattern but not for the
-    // helper-owned cable mic path).
+    // Phase 6 Y3-v2 full literal / Y3-v3 query-informational:
+    // cable mic returns helper-owned cursor truth published by the
+    // shared 1 ms timer DPC (AoRunCaptureEvent ->
+    // AoCableAdvanceByQpc(TIMER_CAPTURE) -> AoCableReadCaptureToDma).
+    // PlayOffset and WriteOffset report the same value for capture —
+    // they diverge for render in MSVAD pattern but not on the
+    // helper-owned cable mic path.
     //
     // Other cable streams (render) and non-cable streams continue
     // to return legacy m_ullPlayPosition / m_ullWritePosition.
@@ -1199,15 +1207,13 @@ NTSTATUS CMiniportWaveRTStream::GetPositions(
         // fresh and stays under m_PositionSpinLock. No transport mutation.
         PumpToCurrentPositionFromQuery(ilQPC);
 
-        // Phase 6 Y2-2 render / Y3-v2 capture: canonical helper advance.
-        // For cable mic this is the only query-path advance because
-        // UpdatePosition early-exited for cable mic; returned values
-        // below come from helper state.
+        // Phase 6 Y3-v3 / Y2-2 render asymmetry: only cable render
+        // advances on query. Cable mic is timer-driven; query here is
+        // informational only. See GetPosition above and
+        // results/phase6_vb_verification.md §9.5.2.
         if (m_pTransportRt && m_pMiniport &&
             (m_pMiniport->m_DeviceType == eCableASpeaker ||
-             m_pMiniport->m_DeviceType == eCableBSpeaker ||
-             m_pMiniport->m_DeviceType == eCableAMic      ||
-             m_pMiniport->m_DeviceType == eCableBMic))
+             m_pMiniport->m_DeviceType == eCableBSpeaker))
         {
             AoCableAdvanceByQpc(m_pTransportRt,
                                 (ULONGLONG)ilQPC.QuadPart,
@@ -1216,12 +1222,11 @@ NTSTATUS CMiniportWaveRTStream::GetPositions(
         }
     }
 
-    // Phase 6 Y3-v2 full literal — cable mic returns helper-owned
-    // linear position. rt->DmaProducedMono is monotonic bytes the
-    // helper has written to DMA since stream RUN; this IS the
-    // LinearBufferPosition the client should see for cable capture.
-    // PresentationPosition mirrors LinearBufferPosition for capture
-    // (same value) since the helper does not track them separately.
+    // Phase 6 Y3-v2 full literal / Y3-v3 query-informational —
+    // cable mic returns helper-owned linear position published by
+    // the shared 1 ms timer DPC. PresentationPosition mirrors
+    // LinearBufferPosition for capture (the helper does not track
+    // them separately).
     BOOLEAN useHelperPosition =
         (m_pTransportRt && m_pMiniport && m_bCapture &&
          (m_pMiniport->m_DeviceType == eCableAMic ||
