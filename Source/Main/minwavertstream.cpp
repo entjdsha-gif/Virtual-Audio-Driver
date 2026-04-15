@@ -1534,6 +1534,8 @@ NTSTATUS CMiniportWaveRTStream::SetState
                         m_pWfExt->Format.nChannels,
                         m_pWfExt->Format.nBlockAlign,
                         isFloat);
+                    if (fpIsSpeaker)
+                        FramePipePrefillSilence(pFP);
                 }
             }
             // [OLD PATH DISABLED — LoopbackRegisterFormat, MicSink stash/register removed]

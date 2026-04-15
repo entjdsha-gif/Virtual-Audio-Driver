@@ -207,6 +207,14 @@ extern LOOPBACK_BUFFER g_CableBLoopback;
 #define FP_CAPACITY_MULTIPLIER      2       // CapacityFrames = TargetFill * 2
 #define FP_MIN_GATE_FRAMES          8       // skip sub-sample noise (VB reference)
 #define FP_MAX_CHANNELS             16      // static array sizing for SRC state
+// Startup headroom: small fixed silence cushion injected on speaker
+// RegisterFormat (!wasActive). Size in milliseconds; actual frame count
+// is derived from PipeSampleRate at fire time so it scales across
+// 44.1/48/96/192k. 40 ms gives reader ~40 × the ~1 ms Phone Link pull
+// cadence of breathing room while writer catches up — large enough to
+// absorb 20-ms WaveRT packet jitter, small enough that post-dial silence
+// latency is imperceptible.
+#define FP_STARTUP_HEADROOM_MS      40
 
 //=============================================================================
 // FRAME_PIPE structure
@@ -342,6 +350,12 @@ ULONG FramePipeReadFrames(
 
 // Reset (PASSIVE_LEVEL, after KeFlushQueuedDpcs)
 VOID FramePipeReset(PFRAME_PIPE pPipe);
+
+// Prefill ring with silence up to TargetFillFrames so reader sees headroom
+// immediately on speaker RUN transition. No-op if ring is not empty.
+// Called from SetState(KSSTATE_RUN) speaker branch. Any IRQL OK, but
+// designed for PASSIVE_LEVEL usage.
+VOID FramePipePrefillSilence(PFRAME_PIPE pPipe);
 
 // Query (any IRQL)
 ULONG FramePipeGetFillFrames(PFRAME_PIPE pPipe);

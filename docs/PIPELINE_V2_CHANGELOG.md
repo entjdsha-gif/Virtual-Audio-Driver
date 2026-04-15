@@ -1,5 +1,33 @@
 # Pipeline V2 Changelog
 
+## 2026-04-15 — Capture-side read instrumentation + startup headroom prefill
+
+**Files changed:**
+- `Source/Utilities/loopback.cpp` — `FramePipeReadFrames` DbgPrint per-call on STARTUP / UNDERRUN / PARTIAL / FULL paths (pipe pointer, QPC timestamp, req, fill, out, fillAfter). New `FramePipePrefillSilence` helper that injects a fixed 40 ms silence cushion into the ring when `FillFrames == 0`, using `PipeSampleRate * FP_STARTUP_HEADROOM_MS / 1000` (scales across sample rates). `FramePipeRegisterFormat` mic branch now re-arms the startup gate (`StartPhaseComplete = FALSE`, `StartThresholdFrames = headroom`) on `!wasActive` openings — intent is to make each new call wait for the speaker-side prefill cushion before returning data to Phone Link's 1 ms pulls.
+- `Source/Utilities/loopback.h` — declare `FramePipePrefillSilence`; add `FP_STARTUP_HEADROOM_MS = 40` constant.
+- `Source/Main/minwavertstream.cpp` — `SetState(KSSTATE_RUN)` cable branch calls `FramePipePrefillSilence(pFP)` immediately after `FramePipeRegisterFormat()` when `fpIsSpeaker == TRUE`.
+- `Source/Main/aocablea.inx`, `aocableb.inx` — `DriverVer` bumped 5.3.0.1 → 5.3.0.2 → 5.3.0.3 → 5.3.0.4 across the instrumentation / prefill v1 / prefill v2 rebuilds. (pnputil refuses to refresh DriverStore without a version bump.)
+
+**What:** Adds two things. (1) A low-overhead DbgPrint trace on every reader read call so we can measure Phone Link's actual pull cadence and classify outcomes. (2) A 40 ms silence prefill injected into the ring on each speaker RUN transition, paired with a startup gate re-arm on fresh mic opens, to give the reader immediate headroom on call start.
+
+**Why:** Baseline measurement (phase5c_instr_ed23271_run1) showed Cable B mic was being hit by Phone Link at ~1 ms period with ~50-frame reads, against a writer that delivers ~10 ms chunks via UpdatePosition — which left the ring running at a razor-thin ~5 ms steady state and produced 43.5% UNDERRUN rate (7,306 startup UNDERRUNs from empty ring before speaker RUN + 11,944 mid-call UNDERRUNs from writer-reader jitter). Large prefill alone is not sufficient; the Phase 5c hypothesis was that we needed to decouple writer cadence from reader cadence by giving the ring a guaranteed cushion.
+
+**Test results:**
+
+*phase5c_instr_ed23271_run1* (baseline, no prefill) — Cable B mic: 44,280 reads / 19,250 UNDERRUN (43.5%) / max_fill 244 frames / first data at read #7307. User: "녹음파일과 핸드폰 통화 음성에 괴리가있음. 녹음파일은 깨끗한데 통화음질은 깨끗하지 않았음."
+
+*phase5c_prefill_run1* (prefill = TargetFillFrames, which was 96,000 frames = 2 s — wrong size) — Cable B mic: 26,391 reads / 4,281 UNDERRUN (16.2%) / max_fill 96,101 / first data at read #1. Phone side better but the 2 s silence prefill injected ~2 s of dead air as latency. Front-chopping "accidentally" masked because the prefill silence happened to sit on top of the pre-speech burst. Codex review flagged this as wrong — we were injecting latency rather than building headroom.
+
+*phase5c_headroom_run1* (prefill = 40 ms fixed via `FP_STARTUP_HEADROOM_MS`) — Cable B mic: 30,274 reads / 10,999 UNDERRUN (36.3%) / max_fill 1,996 frames / first data at read #1. User: **"앞부분 스크립트는 다 들어옴 ai 는 아직 짤리는 구간들이있음."** Front-chopping perceptually resolved. Mid-call chopping remains.
+
+**Findings:**
+- Startup-side fix works as intended from the user's perspective — front of AI speech no longer lost.
+- Mid-call chopping is NOT a prefill/headroom problem. Both v1 (2 s cushion) and v2 (40 ms cushion) had significant mid-call UNDERRUNs, meaning writer-reader rate matching is breaking independent of initial cushion size.
+- Startup gate re-arm did NOT fire in v2 (STARTUP count = 0) — the `!wasActive` branch was never taken because the mic pipe retained `MicActive == TRUE` across sessions (`FramePipeUnregisterFormat` not reaching the branch, pipe persistent). Cosmetic only since prefill fixed the UX — but the classification bug needs a follow-up.
+- Next step: write-side instrumentation (`FramePipeWriteFromDma`) to cross-reference read-side gaps against writer cadence — determine whether mid-call UNDERRUNs are (a) WaveRT packet jitter, (b) upstream WASAPI handover delay, or (c) drop events from FramePipeWriteFromDma hitting capacity.
+
+---
+
 ## 2026-04-15 — Phase 5c: revert pump-driven render transport to UpdatePosition cadence
 
 **Files changed:**

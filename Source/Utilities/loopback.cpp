@@ -1482,6 +1482,58 @@ ULONG FramePipeWriteFrames(
 }
 
 //=============================================================================
+// FramePipePrefillSilence — Inject silence into ring up to TargetFillFrames
+//
+// Purpose: give the reader immediate headroom on speaker RUN transition so
+// Phone Link's ~1ms WASAPI pulls don't starve while the writer ramps.
+// Called from SetState(KSSTATE_RUN) speaker branch after RegisterFormat.
+// No-op if the ring is not empty — we respect persisted data across
+// STOP/RUN gaps and only cushion fresh openings.
+//=============================================================================
+VOID FramePipePrefillSilence(
+    PFRAME_PIPE     pPipe)
+{
+    if (!pPipe || !pPipe->Initialized || !pPipe->RingBuffer)
+        return;
+
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&pPipe->PipeLock, &oldIrql);
+
+    if (pPipe->FillFrames != 0)
+    {
+        KeReleaseSpinLock(&pPipe->PipeLock, oldIrql);
+        return;
+    }
+
+    ULONG capacity = pPipe->CapacityFrames;
+    ULONG channels = pPipe->PipeChannels;
+    // Fixed 40 ms silence cushion regardless of TargetFillFrames.
+    // Using TargetFillFrames would inject multi-second silence when
+    // the pipe is configured with large headroom, which is audible as
+    // a delay at the start of each speaker run.
+    ULONG toFill = (pPipe->PipeSampleRate * FP_STARTUP_HEADROOM_MS) / 1000;
+    if (toFill == 0)
+        toFill = FP_MIN_TARGET_FILL;
+    if (toFill > capacity - 1)
+        toFill = capacity - 1;
+
+    // Zero the prefill region — ring may contain stale samples from a
+    // previous session even though FillFrames == 0 marks it empty.
+    RtlZeroMemory(
+        pPipe->RingBuffer,
+        toFill * channels * sizeof(INT32));
+
+    pPipe->ReadFrame  = 0;
+    pPipe->WriteFrame = toFill % capacity;
+    pPipe->FillFrames = toFill;
+
+    ULONG prefillFrames = toFill;
+    KeReleaseSpinLock(&pPipe->PipeLock, oldIrql);
+
+    DbgPrint("[FP_PREFILL] pipe=%p frames=%u\n", pPipe, prefillFrames);
+}
+
+//=============================================================================
 // FramePipeReadFrames — Mic DPC reads INT32 frames from pipe
 //
 // Returns: number of frames read from ring (0 if silence-filled).
@@ -1496,6 +1548,8 @@ ULONG FramePipeReadFrames(
 {
     if (!pPipe || !pPipe->Initialized || !dstFrames || frameCount == 0)
         return 0;
+
+    LARGE_INTEGER qpc = KeQueryPerformanceCounter(NULL);
 
     KIRQL oldIrql;
     KeAcquireSpinLock(&pPipe->PipeLock, &oldIrql);
@@ -1512,6 +1566,8 @@ ULONG FramePipeReadFrames(
     {
         RtlZeroMemory(dstFrames, outputSamples * sizeof(INT32));
         KeReleaseSpinLock(&pPipe->PipeLock, oldIrql);
+        DbgPrint("[FP_READ] pipe=%p qpc=%lld req=%u fill=%u STARTUP\n",
+                 pPipe, qpc.QuadPart, frameCount, fill);
         return 0;  // startup silence, not counted as underrun
     }
 
@@ -1524,6 +1580,8 @@ ULONG FramePipeReadFrames(
         RtlZeroMemory(dstFrames, outputSamples * sizeof(INT32));
         pPipe->UnderrunCount += frameCount;
         KeReleaseSpinLock(&pPipe->PipeLock, oldIrql);
+        DbgPrint("[FP_READ] pipe=%p qpc=%lld req=%u fill=0 UNDERRUN\n",
+                 pPipe, qpc.QuadPart, frameCount);
         return 0;
     }
 
@@ -1567,7 +1625,14 @@ ULONG FramePipeReadFrames(
         pPipe->UnderrunCount += remainFrames;
     }
 
+    ULONG readOut = framesToRead;
+    ULONG fillAfter = pPipe->FillFrames;
+    BOOLEAN partial = (framesToRead < frameCount);
     KeReleaseSpinLock(&pPipe->PipeLock, oldIrql);
+
+    DbgPrint("[FP_READ] pipe=%p qpc=%lld req=%u fill=%u out=%u fillAfter=%u %s\n",
+             pPipe, qpc.QuadPart, frameCount, fill, readOut, fillAfter,
+             partial ? "PARTIAL" : "FULL");
 
     return framesToRead;
 }
@@ -1750,6 +1815,23 @@ VOID FramePipeRegisterFormat(
         pPipe->MicIsFloat           = isFloat;
         pPipe->MicActive            = TRUE;
         pPipe->MicSameRate          = (sampleRate == pPipe->PipeSampleRate);
+
+        // Re-arm startup gate on every fresh mic open (!wasActive).
+        // FramePipeInit sets StartPhaseComplete=TRUE so the first call
+        // after a reset skips the gate entirely — that is precisely the
+        // bug observed in phase5c_instr_ed23271 where Cable B mic's first
+        // ~7300 reads all returned UNDERRUN zero-fill. Rearming here with
+        // threshold = FP_STARTUP_HEADROOM_MS ensures each new call waits
+        // for the speaker-side prefill cushion to materialize before
+        // delivering data to the reader.
+        if (!wasActive)
+        {
+            ULONG threshold = (pPipe->PipeSampleRate * FP_STARTUP_HEADROOM_MS) / 1000;
+            if (threshold == 0)
+                threshold = FP_MIN_TARGET_FILL;
+            pPipe->StartThresholdFrames = threshold;
+            pPipe->StartPhaseComplete   = FALSE;
+        }
     }
 
     // Only increment if transitioning from inactive to active
