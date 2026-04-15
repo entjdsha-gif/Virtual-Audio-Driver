@@ -281,20 +281,34 @@ Called from 5634 (capture ring fill) with a **coefficient array** as arg4:
 
 The coefficient array comes from the **fade-in envelope table at +0x12a60** — see §7.6. Each sample gets multiplied by a per-sample gain, then `>> 7` (divide by 128).
 
-### 7.6 Envelope table at +0x12a60 (resolved)
+### 7.6 Envelope table at +0x12a60 (resolved — corrected 2026-04-16)
 
-**95-entry fade-in ramp, 4 bytes per entry (int32)**:
+**96-entry fade-in ramp, 4 bytes per entry (int32), valid indexes 0..95**:
+
+Previously documented as "95-entry" — that was imprecise. The VB code uses
+`add edx, 0x60` (0x60=96) to offset the counter, then clamps via `cmovg edx, r11d`
+where `r11d = 0x5F = 95` (max valid index). Array size is therefore 96 entries,
+max legal index 95. AO Y1B code (`g_aoFadeEnvelope[96]` in transport_engine.cpp)
+matches the VB memory layout byte-for-byte as captured via WinDbg `dps` on
+2026-04-16:
 
 ```
-index  0..27:  0          (silence prefix — 28 samples)
-index 28..29:  0, 1       (fade start)
-index 30..43:  1,1,1,2,2,3,4,5,6,7,8,9,10,11
-index 44..53:  12,14,16,18,20,22,25,28,32,36
-index 54..63:  40,45,50,57,64,71,80,90,101,114
-index 64..65:  128        (saturated)
+index  0..51: 0           (silence prefix — 52 samples, not 28)
+index 52..55: 0, 1, 1, 1
+index 56..59: 1, 1, 1, 2
+index 60..63: 2, 2, 2, 3
+index 64..67: 3, 4, 4, 5
+index 68..71: 5, 6, 7, 8
+index 72..75: 9, 10, 11, 12
+index 76..79: 14, 16, 18, 20
+index 80..83: 22, 25, 28, 32
+index 84..87: 36, 40, 45, 50
+index 88..91: 57, 64, 71, 80
+index 92..95: 90, 101, 114, 128  (saturated)
 ```
 
-Rising from 0 to 128 (max gain in 7-bit fixed point → `<<0 / 128 = 1.0x`). Indexed by `(sampleCounter + 96)` clamped to [0, 0x5F=95].
+Rising from 0 to 128 (max gain in 7-bit fixed point → unity). Indexed by
+`(sampleCounter + 96)` clamped to `[0, 95]`.
 
 **Purpose**: Smooth fade-in at packet boundaries to prevent click/pop during cursor discontinuities. Applied per-sample in 51a8's `imul eax, coef; sar eax, 7`.
 
@@ -425,6 +439,38 @@ args: (notifyCtx, 8=eventCode, position, boundaryByteOffset)
 | Ring allocation/size | **MOSTLY CLOSED** | per-stream at +0x170, formula approximate — re-verify if byte-exact parity demanded |
 | +0x7C boundary semantics | **CLOSED** | client-set via SetNotificationCount, bytes |
 | Packet notify shared-mode | **CLOSED** | VB doesn't notify shared-mode clients; AO already matches |
+| NotifyArmed STOP preservation | **PROVISIONAL** | AO Y1B preserves across STOP — NOT directly verified in VB. Must be confirmed or corrected before Y2 (see §9.6) |
+
+### 9.6. Provisional items tracked for Y2 pre-flight closure
+
+These items were noted during Y1B implementation review (Codex validation,
+2026-04-16) as NOT fully verified against VB. They are acceptable to carry
+through Y1C shadow mode, but must be resolved before Y2 promotes the helper
+to audible ownership.
+
+**P-1. NotifyArmed preservation across STOP**
+
+Current AO Y1B behavior (`AoCableResetRuntimeFields`): preserves
+`NotifyArmed` + `NotifyBoundaryBytes` across STOP, clears only `NotifyFired`.
+Rationale at the time: event-driven clients that called `SetNotificationCount`
+should not lose their arm state across a pause/resume pair.
+
+**Gap**: VB's actual STOP reset scope for the notify-related fields
+(+0x164 / +0x165 / +0x7C) was not directly captured. The Ghidra pass on
+`FUN_14000669c` only dumped the cursor/counter caller-side reset pattern
+(+0xD0..+0x108 for capture, +0x50..+0x88 for render, +0x180 anchor).
+
+**Closure plan before Y2**: one of —
+  (a) dump `FUN_14000669c`'s caller sites in Ghidra and check whether they
+      also zero `[rcx+0x164]` / `[rcx+0x7C]`; or
+  (b) WinDbg BP on `FUN_140004700` (`SetNotificationCount`) across a
+      stream stop/resume cycle to observe client re-arm behavior; or
+  (c) if unresolved, change AO Y1B to clear `NotifyArmed` on STOP and
+      require clients to re-arm via `SetNotificationCount` after resume.
+
+Until closed, treat the current behavior as a design choice, not a VB
+parity claim. The shared-mode live-call path is unaffected either way
+(NotifyArmed stays 0 for shared-mode clients regardless).
 
 ## 10. Verdict (updated after §7 closure)
 
