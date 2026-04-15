@@ -1938,6 +1938,39 @@ VOID CMiniportWaveRTStream::UpdatePosition
     _In_ LARGE_INTEGER ilQPC
 )
 {
+    // Phase 6 Y1C shadow shim — cable streams only.
+    //
+    // UpdatePosition is the common funnel for every legacy query path
+    // (GetPosition, GetPositions, GetPacketCount, and the per-stream
+    // MSVAD notification timer TimerNotifyRT). Hook it here so any
+    // path that bypasses the explicit GetPosition/GetPositions hooks
+    // still routes through the canonical helper in shadow mode. In
+    // particular this catches the TimerNotifyRT code path which is
+    // retired in Y4 but still active in Y1C.
+    //
+    // Intentional double-count with GetPosition/GetPositions hooks:
+    // when called from those entry points the helper will be invoked
+    // twice per call (once from this shim, once from the caller-site
+    // hook). This is acceptable for shadow diagnostics — the counters
+    // are observability-only, not authoritative. Y4 retires the
+    // caller-site hooks along with the legacy body, leaving only this
+    // shim as the single funnel.
+    //
+    // The legacy body below still runs unchanged. No externally
+    // visible truth moves into the helper yet — that is Y2 (render)
+    // and Y3 (capture).
+    if (m_pTransportRt && m_pMiniport &&
+        (m_pMiniport->m_DeviceType == eCableASpeaker ||
+         m_pMiniport->m_DeviceType == eCableBSpeaker ||
+         m_pMiniport->m_DeviceType == eCableAMic      ||
+         m_pMiniport->m_DeviceType == eCableBMic))
+    {
+        AoCableAdvanceByQpc(m_pTransportRt,
+                            (ULONGLONG)ilQPC.QuadPart,
+                            AO_ADVANCE_QUERY,
+                            0);
+    }
+
     // Convert ticks to 100ns units.
     LONGLONG  hnsCurrentTime = KSCONVERT_PERFORMANCE_TIME(m_ullPerformanceCounterFrequency.QuadPart, ilQPC);
     
