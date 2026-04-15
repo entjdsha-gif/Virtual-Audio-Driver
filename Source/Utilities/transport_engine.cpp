@@ -1258,6 +1258,44 @@ AoCableAdvanceByQpc(
         rt->DmaCursorFrames += (ULONGLONG)advance;
     }
 
+    // --- Y2-1.5 render byte diff diagnostic (cable render only) ---
+    // Bump helper's cumulative render-byte total and update the max
+    // |helper - legacy| diff observed so far. Legacy side is bumped by
+    // CMiniportWaveRTStream::UpdatePosition after its block-align step.
+    // See AO_STREAM_RT comments for interpretation rules. The helper
+    // runs for both query and timer reasons, so cumulative helper
+    // counter grows faster than legacy cumulative whenever a timer
+    // tick fires without a matching UpdatePosition — that is normal
+    // and reflected in the diff reading. The meaningful signal is
+    // whether the two cumulatives converge over multi-second windows,
+    // not whether they match on any single advance call.
+    if (rt->IsCable && !rt->IsCapture && rt->BlockAlign > 0)
+    {
+        LONGLONG advanceBytes = (LONGLONG)advance * (LONGLONG)rt->BlockAlign;
+        LONGLONG newHelper    =
+            InterlockedAdd64(&rt->DbgY2HelperRenderBytes, advanceBytes);
+
+        // Volatile read of the legacy counter — single 64-bit load on
+        // x64 is atomic enough for a diagnostic snapshot. We do not
+        // need a strict happens-before edge here; worst case the diff
+        // reads a slightly stale legacy total and the next helper
+        // entry records a more up-to-date one.
+        LONGLONG legacy  = rt->DbgY2LegacyRenderBytes;
+        LONGLONG diff    = newHelper - legacy;
+        LONGLONG absDiff = (diff < 0) ? -diff : diff;
+
+        // Max update is best-effort — a racing writer could overwrite
+        // with a smaller value, but over time the true max will land.
+        if (absDiff > rt->DbgY2RenderByteDiffMax)
+        {
+            rt->DbgY2RenderByteDiffMax = absDiff;
+        }
+        if (diff != 0)
+        {
+            InterlockedIncrement(&rt->DbgY2RenderMismatchHits);
+        }
+    }
+
     // --- Y2-1 render audible path (switch off by default) ---
     // When RenderAudibleActive is TRUE, the helper owns the DMA ->
     // FRAME_PIPE transfer for cable render streams. In Y2-1 this flag

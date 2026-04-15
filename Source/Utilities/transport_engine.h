@@ -190,6 +190,41 @@ typedef struct _AO_STREAM_RT {
     // switch mirroring this pattern.
     //=========================================================================
     BOOLEAN                 RenderAudibleActive;
+
+    //=========================================================================
+    // Phase 6 Y2-1.5 render byte diff diagnostic
+    //
+    // Tracks cumulative helper-computed vs legacy-computed render byte
+    // totals so Y2-2 switchover can validate that the two cursor sources
+    // agree before the audible path is handed over.
+    //
+    // Writer discipline:
+    //   - DbgY2HelperRenderBytes : bumped by AoCableAdvanceByQpc's render
+    //     branch. advanceBytes = advance * BlockAlign. InterlockedAdd64.
+    //   - DbgY2LegacyRenderBytes : bumped by CMiniportWaveRTStream::
+    //     UpdatePosition's cable-render branch AFTER block-align.
+    //     InterlockedAdd64.
+    //   - DbgY2RenderByteDiffMax : running max(|helper - legacy|),
+    //     updated best-effort by the helper after each advance bump.
+    //   - DbgY2RenderMismatchHits : count of helper entries where the
+    //     running diff was non-zero.
+    //
+    // Interpretation of readings:
+    //   - Bounded |diff| near `8 * BlockAlign` = 8-frame gate asymmetry,
+    //     expected and harmless.
+    //   - Unbounded growing diff = cursor calculation divergence between
+    //     QPC-delta math (helper) and ms-delta math (legacy). Y2-2 must
+    //     NOT flip the audible switch while this condition exists.
+    //   - Both totals moving in lockstep (diff stays near zero) = the
+    //     two sources agree and Y2-2 can safely switch DmaProducedMono
+    //     ownership from legacy to helper.
+    //
+    // Removed in Y4 with the rest of the DbgShadow* counters.
+    //=========================================================================
+    volatile LONGLONG       DbgY2HelperRenderBytes;
+    volatile LONGLONG       DbgY2LegacyRenderBytes;
+    volatile LONGLONG       DbgY2RenderByteDiffMax;
+    volatile LONG           DbgY2RenderMismatchHits;
 } AO_STREAM_RT, *PAO_STREAM_RT;
 
 //=============================================================================

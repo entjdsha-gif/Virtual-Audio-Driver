@@ -2004,6 +2004,20 @@ VOID CMiniportWaveRTStream::UpdatePosition
         m_ulBlockAlignCarryForward = totalBytes - ByteDisplacement;
     }
 
+    // Phase 6 Y2-1.5 diagnostic: accumulate post-block-align legacy
+    // ByteDisplacement into the transport runtime so the Y2 helper can
+    // compare its own cumulative advance-bytes total against the
+    // authoritative legacy total. Cable RENDER streams only — cable
+    // mic has no Y2 render path and non-cable streams have no
+    // transport rt attached.
+    if (m_pTransportRt && m_pMiniport && !m_bCapture &&
+        (m_pMiniport->m_DeviceType == eCableASpeaker ||
+         m_pMiniport->m_DeviceType == eCableBSpeaker))
+    {
+        InterlockedAdd64(&m_pTransportRt->DbgY2LegacyRenderBytes,
+                         (LONGLONG)ByteDisplacement);
+    }
+
     // [OLD PATH DISABLED — MicSink gap zero-fill removed.
     //  FRAME_PIPE handles underrun silence via FramePipeReadFrames zero-fill.]
 
