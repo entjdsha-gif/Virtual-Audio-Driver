@@ -74,10 +74,9 @@ typedef struct _AO_STREAM_RT {
     ULONG          Channels;
     ULONG          BlockAlign;
 
-    ULONG          FramesPerEvent;
-    ULONG          BytesPerEvent;
-    ULONG          EventPeriodMs;      // default 20
-    LONGLONG       EventPeriodQpc;
+    ULONG          FramesPerEvent;     // primary transport unit
+    ULONG          BytesPerEvent;      // derived: FramesPerEvent * BlockAlign
+    LONGLONG       EventPeriodQpc;     // derived from FramesPerEvent and SampleRate
     LONGLONG       NextEventQpc;
 
     BOOLEAN        StartupArmed;
@@ -246,6 +245,36 @@ VOID AoRunCaptureEvent(AO_STREAM_RT* rt, LONGLONG qpc)
 - **position path = reporting only**
 - **timer engine = transport only**
 
+## Latency Unit Policy — **samples only, never ms**
+
+> 규범: 드라이버/ControlPanel/Registry/IOCTL/test harness 어디에서도 latency 값으로 ms를 쓰지 않는다. 언제 어디서나 **samples (frames)** 만 쓴다.
+
+### 엄격 규칙
+
+1. **Primary storage unit = samples (frames)**. 모든 latency/cushion/period 필드는 frame count로 저장된다. `FramesPerEvent`, `StartupTargetFrames`, `StartupThresholdFrames`, `MinHeadroomFrames` 등.
+2. **QPC/bytes는 파생값**. `EventPeriodQpc = FramesPerEvent × qpc_freq / SampleRate`, `BytesPerEvent = FramesPerEvent × BlockAlign`. 저장할지 캐싱할지는 구현 자유.
+3. **ms는 어디에도 저장되지 않는다**. 구조체 필드 금지. 상수 이름에 ms 금지. 주석에 "20 ms @ 48k" 같은 설명이 들어가는 건 OK지만 **값 자체가 ms로 저장되는 필드는 존재 금지**.
+4. **Registry / ControlPanel / IOCTL 구성값도 samples**. 사용자 입력도 samples로 직접 받는다. 이전 ms 기반 설정이 있다면 마이그레이션 단계에서 1회 frames로 변환 후 그 값으로만 저장.
+5. **non-48k 정밀도 보존**. 44.1k / 96k / 192k 등에서 ms로 표현하면 정수로 안 떨어지는 값도 samples로 저장하면 그대로 보존. 예: 20 ms @ 44.1k = 882 samples (정수). samples를 primary로 두면 round-trip 손실 zero.
+6. **Bug A 재발 방지**. Bug A는 `bytes = ms_rounded × sample_rate × blockAlign / 1000` 식의 ms quantization이 원인이었다. Phase 6 core에는 `elapsed_qpc → frames` 직통 경로만 존재하고 ms quantization step 자체가 없으므로 구조적으로 같은 종류의 오차가 재발할 수 없다.
+7. **로그/표시도 frames 우선**. 사람이 읽는 로그도 가능한 한 samples 단위. 필요하면 표시 시점에 한 번 `frames × 1000 / SampleRate` 를 계산해서 `(≈X ms)` 보조 표기 추가 허용 — 단 저장값은 여전히 frames.
+
+### 금지 리스트 (Phase 6 진입 시 제거/리네임 대상)
+
+- `FP_STARTUP_HEADROOM_MS` 상수 → `FP_STARTUP_HEADROOM_FRAMES` 또는 제거
+- `EventPeriodMs` 필드 (초안에 있었음, 이미 제거됨)
+- `savedLatency` (ms 단위로 추정되는 이름) → `savedLatencyFrames`
+- `latencyMs`, `targetFillMs` 같은 이름 가진 기존 변수/함수
+- Registry key 중 ms 값이 있다면 frames 기반 key로 교체 (legacy key 유지 불가)
+
+### 영향 범위 (Phase 6 작업 동안 같이 정리)
+
+- `Source/Utilities/loopback.cpp` / `loopback.h` — 모든 latency 상수/필드 frames 기반으로
+- `Source/Main/adapter.cpp` — registry load/store 경로 frames로 교체
+- `Source/Main/ioctl.h` — 공유 구조체 latency 필드 frames로
+- `Source/ControlPanel/main.cpp` — 사용자 UI 단위 samples로 교체
+- `tests/` — 테스트 구성값도 frames 기반
+
 ## Pipe Contract
 
 ### 8. FRAME_PIPE Role
@@ -296,6 +325,9 @@ FRAME_PIPE는 그대로 **"유일한 transport ring"** 으로 유지한다.
 
 ## Success Criteria
 
+- deterministic local-in-Chrome repro shows no first-4-second 20ms stale replay signature
+  - practical gate: `AC[20ms] @ start+2s <= 0.20`
+
 - local loopback에서 VB 수준 clean
 - Phone Link live call에서 phone chopping 없음
 - Cable B mic read cadence가 1ms여도 steady-state underrun 없음
@@ -309,5 +341,188 @@ FRAME_PIPE는 그대로 **"유일한 transport ring"** 으로 유지한다.
 ---
 
 ## Next follow-up (pending)
+
+## Addendum — Working Baseline
+
+- `439bbcd` is the effective last-known-good baseline for the phone path.
+- `2c733f1` remains in history as the archived failed Phase 5 attempt.
+- Phase 6 starts from the Phase 4 baseline semantics, not from the Phase 5 transport hook.
+
+## Addendum — File-Level Breakdown (authoritative)
+
+This addendum pins the Phase 6 skeleton to the current AO file layout so Step 1
+implementation can begin without re-deciding ownership.
+
+### 1. New files
+
+Create a dedicated transport engine pair:
+
+- `Source/Utilities/transport_engine.h`
+- `Source/Utilities/transport_engine.cpp`
+
+Reason:
+
+- `loopback.cpp` remains the home of `FRAME_PIPE` ring semantics
+- `minwavertstream.cpp` remains stream-facing WaveRT glue
+- the shared timer engine is a third concern and should not be hidden inside
+  either ring code or stream code
+
+### 2. What stays in `loopback.cpp/.h`
+
+Keep `FRAME_PIPE` here, including:
+
+- ring storage and indices
+- normalize / denormalize
+- channel mapping
+- `FramePipeWriteFromDma`
+- `FramePipeReadToDma` and partial-read helpers
+- fill / drop / underrun accounting
+- format registration
+
+Do not place the shared transport scheduler or timer callback here.
+
+### 3. What goes in `transport_engine.cpp/.h`
+
+This file pair owns:
+
+- `AO_TRANSPORT_ENGINE`
+- `AO_STREAM_RT`
+- global shared timer creation / destruction
+- active stream list management
+- timer callback
+- due-stream scheduling
+- render event runner
+- capture event runner
+- startup arm / re-arm policy
+
+Suggested public surface:
+
+```c
+NTSTATUS AoTransportEngineInit();
+VOID     AoTransportEngineCleanup();
+
+NTSTATUS AoTransportRegisterStream(CMiniportWaveRTStream* stream);
+VOID     AoTransportUnregisterStream(CMiniportWaveRTStream* stream);
+VOID     AoTransportOnRun(CMiniportWaveRTStream* stream);
+VOID     AoTransportOnPause(CMiniportWaveRTStream* stream);
+VOID     AoTransportOnStop(CMiniportWaveRTStream* stream);
+```
+
+### 4. What changes in `adapter.cpp`
+
+`adapter.cpp` is the correct place to create and destroy the engine because it
+already owns global driver bring-up / teardown.
+
+Add:
+
+- engine init after global pipe init succeeds
+- engine cleanup during adapter teardown / uninstall path
+
+Do not hide engine creation inside first-stream-open lazy init unless later
+stability work proves that necessary.
+
+### 5. What changes in `minwavertstream.h`
+
+Add a per-stream transport pointer to `CMiniportWaveRTStream`:
+
+```c
+AO_STREAM_RT* m_pTransportRt;
+```
+
+Ownership model:
+
+- `CMiniportWaveRTStream` owns the pointer for its lifetime
+- the engine active list holds non-owning references
+- allocate once on first registration (or stream construction)
+- free on stream destruction
+
+Do not use a global map keyed by stream pointer unless later debugging proves
+it is necessary. A direct stream-owned pointer is simpler and fits the current
+architecture better.
+
+### 6. What changes in `minwavertstream.cpp`
+
+Use `SetState(RUN/PAUSE/STOP)` as the authoritative engine registration /
+activation bridge.
+
+Expected wiring:
+
+- `RUN`
+  - ensure `m_pTransportRt` exists
+  - register / activate stream in engine
+  - arm startup state for capture side
+- `PAUSE`
+  - mark stream inactive for scheduling
+  - keep runtime object attached to stream
+- `STOP`
+  - unregister from active scheduling
+  - reset transport-facing per-session state
+
+Important:
+
+- `GetPositions` and `UpdatePosition` must not move audio data
+- they remain reporting / bookkeeping only
+
+### 7. Locking rules
+
+Do **not** allow ad hoc nested locking. The Phase 6 engine should use this
+contract:
+
+- `m_PositionSpinLock`: stream-local position bookkeeping only
+- `EngineLock`: active stream list + scheduler metadata only
+- `PipeLock`: ring read/write only
+
+Preferred rule:
+
+- never hold `EngineLock` while taking `PipeLock`
+- never hold `m_PositionSpinLock` while taking `EngineLock`
+- never hold `m_PositionSpinLock` while taking `PipeLock`
+
+Implementation pattern:
+
+1. timer callback takes `EngineLock`
+2. snapshots due streams into a small local array
+3. releases `EngineLock`
+4. runs render/capture events per stream
+5. each event may briefly take that stream's `PipeLock`
+
+This snapshot-and-drop pattern is the default. If any future code needs a
+different order, it must document the exception explicitly.
+
+### 7.5. Unit discipline
+
+Phase 6 stores transport and latency state in **frames**, not milliseconds.
+
+Rules:
+
+- `FramesPerEvent` is the authoritative event size
+- `BytesPerEvent` is derived from `FramesPerEvent * BlockAlign`
+- `EventPeriodQpc` is derived from `FramesPerEvent` and stream sample rate
+- startup thresholds and headroom values are stored as frame counts
+- milliseconds are allowed only at UI / registry / display boundaries and must
+  be converted to frames immediately
+
+Practical implication:
+
+- remove `EventPeriodMs` from runtime state
+- avoid any `elapsed_ms -> bytes` transport math in the engine
+- keep scheduling and recovery math in frame/sample space end-to-end
+
+### 8. Explicit non-goals for Step 1
+
+Step 1 should **not** attempt to:
+
+- port every existing diagnostic counter
+- preserve Phase 5 rollback flags
+- add Phone Link specific special-casing
+- tune the final event size perfectly
+
+Step 1 only needs:
+
+- shared timer exists
+- streams can register/unregister
+- timer callback can schedule no-op or stub events safely
+
+That is enough to validate the skeleton before data movement is switched over.
 
 Codex는 이 skeleton을 현재 파일 구조(`loopback.cpp` / `minwavertstream.cpp` / `adapter.cpp`)에 어떻게 배치할지 파일 단위로 풀어줄 수 있다. Step 1 진입 전에 이 file-level 브레이크다운을 받아두는 것을 권장한다.
