@@ -28,7 +28,7 @@ from phone_link_dialer import dial
 from realtime_engine import RealtimeEngine, EndReason
 
 TEST_NUMBER = "01058289554"
-ANSWER_WAIT_SEC = 8  # seconds to wait after dial before starting AI
+ANSWER_WAIT_SEC = 3  # seconds to wait after dial before starting AI
 
 TEST_SCRIPT = {
     "name": "driver-test",
