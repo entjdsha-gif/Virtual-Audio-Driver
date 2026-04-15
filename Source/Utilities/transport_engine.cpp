@@ -50,6 +50,14 @@
 #define AO_TE_STARTUP_THRESHOLD_FRAMES_AT_REF  960U
 #define AO_TE_STARTUP_TARGET_FRAMES_AT_REF    1440U
 
+// Bounded catch-up: if the shared timer DPC is delivered late (system
+// load, hibernation resume, etc.) the callback will run multiple virtual
+// ticks per real tick to drain the backlog. This constant caps the per-
+// callback drain so one real tick can never spend an unbounded amount of
+// time at DISPATCH_LEVEL. 8 × 20 ms = 160 ms max catch-up per callback;
+// anything older than that rolls into the next callback.
+#define AO_TE_MAX_OVERDUE_TICKS                  8U
+
 //=============================================================================
 // Global singleton. Not exported — all access goes through the public API in
 // transport_engine.h so call sites never take a pointer to this directly.
@@ -220,6 +228,22 @@ AoTransportAllocStreamRt(CMiniportWaveRTStream* stream)
     return rt;
 }
 
+// Publish the stream's authoritative produced byte count into the runtime
+// struct so the render event runner can anchor its cursor against it.
+// Called from CMiniportWaveRTStream::UpdatePosition after LinearPosition
+// advances. Monotonic — callers must never pass a value smaller than the
+// previous publish. We store via InterlockedExchange64 so DISPATCH-level
+// readers see a consistent 64-bit value even on unusual alignments.
+extern "C" VOID
+AoTransportPublishProducedBytes(AO_STREAM_RT* rt, ULONGLONG producedBytesMono)
+{
+    if (rt == NULL)
+    {
+        return;
+    }
+    InterlockedExchange64(&rt->DmaProducedMono, (LONGLONG)producedBytesMono);
+}
+
 // Internal: drop one ref, free if zero. Caller must not touch rt after.
 // Safe to call at DISPATCH_LEVEL (no lock acquired, no paged memory access
 // beyond the pool free which is non-paged).
@@ -301,7 +325,14 @@ AoTransportOnRunEx(const AO_STREAM_SNAPSHOT* snapshot)
     rt->Pipe          = snapshot->Pipe;
     rt->DmaBuffer     = snapshot->DmaBuffer;
     rt->DmaBufferSize = snapshot->DmaBufferSize;
-    rt->DmaOffset     = 0;   // engine cursor starts at 0 on each RUN transition
+
+    // Fresh session → reset monotonic cursors. Both render and capture
+    // anchor their event runners against rt->DmaProducedMono, which is
+    // published by the stream side via AoTransportPublishProducedBytes
+    // from within CMiniportWaveRTStream::UpdatePosition whenever the
+    // stream's LinearPosition advances.
+    rt->DmaProducedMono  = 0;
+    rt->DmaConsumedMono  = 0;
 
     // Samples-only seeding: scale the reference frame constants to this
     // stream's actual rate. The engine period in QPC is the same for every
@@ -462,9 +493,24 @@ AoComputeFramesForEvent(AO_STREAM_RT* rt)
     return rt->FramesPerEvent;
 }
 
-// AoRunRenderEvent — push FramesPerEvent frames from the stream's DMA
-// buffer into its FRAME_PIPE ring. Mirrors the legacy ReadBytes loop:
-// splits into two chunks when the event straddles the DMA ring wrap.
+// AoRunRenderEvent — move produced-but-not-yet-consumed bytes from the
+// stream's DMA buffer into its FRAME_PIPE ring.
+//
+// Anchor: rt->DmaProducedMono is the monotonic byte count the stream side
+// has certified as actually produced by the WaveRT client. The engine
+// owns rt->DmaConsumedMono and advances it only by the delta it actually
+// moved this tick. The engine never re-reads DMA bytes that have already
+// been consumed, and never reads past what WaveRT has published — so
+// stale/future reads are impossible regardless of how far the engine
+// timer drifts from the WaveRT clock.
+//
+// Per-tick budget: AoComputeFramesForEvent(rt) frames. If the WaveRT
+// client has produced less than that since the previous tick (stream
+// briefly idle, or engine ran early), this tick moves whatever is
+// available and catches up next tick. If the client has produced more
+// (we ran late), this tick moves the budgeted chunk and the next tick
+// catches up. Either way no data is lost and no stale data is re-read,
+// because DmaConsumedMono only ever advances by "bytes actually moved".
 //
 // Runs at DISPATCH_LEVEL from the timer callback. Acquires PipeLock via
 // FramePipeWriteFromDma — never holds EngineLock while calling in.
@@ -478,46 +524,81 @@ AoRunRenderEvent(AO_STREAM_RT* rt, LONGLONG qpc)
         return;
     }
 
-    ULONG frames = AoComputeFramesForEvent(rt);
-    if (frames == 0)
+    // Volatile load of the authoritative produced counter. The stream
+    // side publishes monotonically so the only thing we can observe
+    // concurrently is a slightly-older value; we never see a torn write
+    // on a 64-bit aligned field on x64.
+    ULONGLONG produced = (ULONGLONG)rt->DmaProducedMono;
+    ULONGLONG consumed = rt->DmaConsumedMono;
+
+    if (produced <= consumed)
+    {
+        // Nothing new to move this tick. Not an underrun per se — the
+        // pipe just gets no fresh data until the next tick when WaveRT
+        // has progressed further. Counted as "late event" so we can
+        // tell over a run how often the engine outpaced the client.
+        rt->LateEventCount++;
+        return;
+    }
+
+    ULONGLONG availableBytes = produced - consumed;
+
+    ULONG budgetFrames = AoComputeFramesForEvent(rt);
+    if (budgetFrames == 0)
+    {
+        return;
+    }
+    ULONGLONG budgetBytes = (ULONGLONG)budgetFrames * rt->BlockAlign;
+
+    ULONGLONG moveBytes = (availableBytes < budgetBytes) ? availableBytes
+                                                         : budgetBytes;
+
+    ULONG bufSz = rt->DmaBufferSize;
+    if (bufSz == 0)
     {
         return;
     }
 
-    ULONG bytes  = frames * rt->BlockAlign;
-    ULONG offset = rt->DmaOffset;
-    ULONG bufSz  = rt->DmaBufferSize;
+    ULONG offset = (ULONG)(consumed % bufSz);
+    ULONGLONG remaining = moveBytes;
 
-    while (bytes > 0)
+    while (remaining > 0)
     {
-        ULONG chunk = bytes;
-        if (chunk > bufSz - offset)
-        {
-            chunk = bufSz - offset;
-        }
+        ULONG chunk = (remaining > (ULONGLONG)(bufSz - offset))
+                          ? (bufSz - offset)
+                          : (ULONG)remaining;
 
         FramePipeWriteFromDma(rt->Pipe, rt->DmaBuffer + offset, chunk);
 
         offset = (offset + chunk) % bufSz;
-        bytes -= chunk;
+        remaining -= chunk;
     }
 
-    rt->DmaOffset = offset;
+    rt->DmaConsumedMono = consumed + moveBytes;
 }
 
-// AoRunCaptureEvent — drain FramePipeReadToDma frames into the stream's
-// capture DMA buffer. Mirrors the legacy WriteBytes loop and handles the
-// startup state machine from PHASE6_PLAN.md §6.
+// AoRunCaptureEvent — fill the capture DMA with pipe content up to the
+// WaveRT-anchored target byte count. Same cursor contract as render: the
+// engine never free-runs a DmaOffset, never stomps bytes the client has
+// not yet read, and never leaves bytes the client expects unfilled.
 //
-// Startup: if rt->StartupArmed is TRUE we check the ring fill. If it hasn't
-// reached StartupThresholdFrames yet, the entire DMA chunk is zero-filled
-// and we skip the pipe read (so the reader does not advance). Once the
-// ring clears the threshold, StartupArmed is dropped and steady-state
-// reads take over. StartupArmed is re-armed per session in OnRunEx, so
-// every fresh mic stream gets its own cushion window.
+// Anchor: rt->DmaProducedMono for a capture stream carries the stream
+// side's "clock-target bytes" value — that is, LinearPosition, which
+// UpdatePosition advances based on elapsed QPC × sample rate. Engine
+// fills DMA bytes from its own DmaConsumedMono cursor up to whichever
+// of (anchor, cursor + per-tick budget) is smaller.
 //
-// Runs at DISPATCH_LEVEL from the timer callback. FramePipeReadToDma
-// takes PipeLock internally — we must never be holding EngineLock here.
+// Startup gate: if the ring fill hasn't reached StartupThresholdFrames
+// yet, the entire target region is zero-filled to DMA and the pipe read
+// cursor is NOT advanced. Once the cushion is ready, StartupArmed is
+// dropped.
+//
+// Partial read / tail zero fill: ring underruns are detected before the
+// read and counted in rt->UnderrunEvents. FramePipeReadToDma already
+// silence-fills any shortfall internally so the DMA tail is guaranteed
+// clean regardless.
+//
+// Runs at DISPATCH_LEVEL. Acquires PipeLock via FramePipeReadToDma.
 static VOID
 AoRunCaptureEvent(AO_STREAM_RT* rt, LONGLONG qpc)
 {
@@ -528,62 +609,85 @@ AoRunCaptureEvent(AO_STREAM_RT* rt, LONGLONG qpc)
         return;
     }
 
-    ULONG frames = AoComputeFramesForEvent(rt);
-    if (frames == 0)
+    ULONGLONG anchor = (ULONGLONG)rt->DmaProducedMono;
+    ULONGLONG cursor = rt->DmaConsumedMono;
+
+    if (anchor <= cursor)
+    {
+        // Clock target hasn't advanced since the last tick. Nothing to
+        // do — the client is not yet expecting new bytes in the DMA.
+        rt->LateEventCount++;
+        return;
+    }
+
+    ULONGLONG availableBytes = anchor - cursor;
+
+    ULONG budgetFrames = AoComputeFramesForEvent(rt);
+    if (budgetFrames == 0)
+    {
+        return;
+    }
+    ULONGLONG budgetBytes = (ULONGLONG)budgetFrames * rt->BlockAlign;
+
+    ULONGLONG fillBytes = (availableBytes < budgetBytes) ? availableBytes
+                                                         : budgetBytes;
+
+    ULONG bufSz = rt->DmaBufferSize;
+    if (bufSz == 0)
     {
         return;
     }
 
-    ULONG bytes  = frames * rt->BlockAlign;
-    ULONG offset = rt->DmaOffset;
-    ULONG bufSz  = rt->DmaBufferSize;
+    ULONG offset = (ULONG)(cursor % bufSz);
+    ULONGLONG remaining = fillBytes;
 
-    // Startup gate — see §6 of PHASE6_PLAN.md. While armed, emit silence
-    // to the DMA buffer and do NOT advance the pipe read cursor so the
-    // writer side can build up a cushion. StartupArmed is explicit state
-    // re-set on each OnRunEx so we never hit the sticky-flag bug that
-    // the old FramePipe gate had.
+    // Startup gate — while armed, emit silence and advance the DMA cursor
+    // but leave the pipe read cursor untouched. The ring fills up via
+    // the render side until it clears StartupThresholdFrames.
     if (rt->StartupArmed)
     {
         ULONG fill = FramePipeGetFillFrames(rt->Pipe);
         if (fill < rt->StartupThresholdFrames)
         {
-            while (bytes > 0)
+            while (remaining > 0)
             {
-                ULONG chunk = bytes;
-                if (chunk > bufSz - offset)
-                {
-                    chunk = bufSz - offset;
-                }
+                ULONG chunk = (remaining > (ULONGLONG)(bufSz - offset))
+                                  ? (bufSz - offset)
+                                  : (ULONG)remaining;
                 RtlZeroMemory(rt->DmaBuffer + offset, chunk);
                 offset = (offset + chunk) % bufSz;
-                bytes -= chunk;
+                remaining -= chunk;
             }
-            rt->DmaOffset = offset;
+            rt->DmaConsumedMono = cursor + fillBytes;
             return;
         }
-        // Cushion reached — leave startup mode.
         rt->StartupArmed = FALSE;
     }
 
-    // Steady-state read. FramePipeReadToDma guarantees the requested
-    // byteCount is fully filled (silence on underrun), so we do not need
-    // to track a partial-read count at this layer.
-    while (bytes > 0)
+    // Partial-read detection: if the pipe doesn't have the frames this
+    // event needs, count an underrun event but still let FramePipeReadToDma
+    // run — it zero-fills the shortfall internally so the DMA tail stays
+    // valid.
+    ULONG neededFramesForTick =
+        (ULONG)(fillBytes / (rt->BlockAlign ? rt->BlockAlign : 1));
+    if (FramePipeGetFillFrames(rt->Pipe) < neededFramesForTick)
     {
-        ULONG chunk = bytes;
-        if (chunk > bufSz - offset)
-        {
-            chunk = bufSz - offset;
-        }
+        rt->UnderrunEvents++;
+    }
+
+    while (remaining > 0)
+    {
+        ULONG chunk = (remaining > (ULONGLONG)(bufSz - offset))
+                          ? (bufSz - offset)
+                          : (ULONG)remaining;
 
         FramePipeReadToDma(rt->Pipe, rt->DmaBuffer + offset, chunk);
 
         offset = (offset + chunk) % bufSz;
-        bytes -= chunk;
+        remaining -= chunk;
     }
 
-    rt->DmaOffset = offset;
+    rt->DmaConsumedMono = cursor + fillBytes;
 }
 
 //=============================================================================
@@ -606,10 +710,28 @@ AoTransportTimerCallback(
     UNREFERENCED_PARAMETER(Timer);
     UNREFERENCED_PARAMETER(Context);
 
-    // ActiveStreams should be tiny (typically ≤ 4: Cable A/B render + capture
-    // for one client each). A fixed local array is safe.
-    AO_STREAM_RT* due[16];
-    ULONG         dueCount = 0;
+    // Per-stream catch-up entry. The snapshot under engine lock records
+    // how many virtual ticks each stream is overdue and the QPC time that
+    // corresponds to virtual tick #0 for that stream. The execution phase
+    // replays virtual ticks in per-tick render->capture order and passes
+    // each runner the QPC time that logically belongs to that virtual
+    // tick (not the real "now"). That keeps any future drift-correction
+    // or per-tick diagnostics meaningful — five replayed ticks should
+    // look like five distinct logical points on the timeline, not five
+    // events stamped with the same wall-clock time.
+    typedef struct _AO_TE_DUE_ENTRY {
+        AO_STREAM_RT* Rt;
+        ULONG         OverdueCount;   // >= 1 for every entry in due[]
+        LONGLONG      BaseTickQpc;    // QPC time of this stream's virtual tick #0
+        LONGLONG      PeriodQpc;      // per-stream tick period, copied so the
+                                      // execution loop does not chase rt->
+    } AO_TE_DUE_ENTRY;
+
+    // ActiveStreams should be tiny (typically ≤ 4: Cable A/B render +
+    // capture for one client each). A fixed local array is safe.
+    AO_TE_DUE_ENTRY due[16];
+    ULONG           dueCount   = 0;
+    ULONG           maxOverdue = 0;
 
     KIRQL old;
     KeAcquireSpinLock(&g_AoTransportEngine.Lock, &old);
@@ -626,46 +748,115 @@ AoTransportTimerCallback(
         {
             continue;
         }
+
+        // Defense: EventPeriodQpc must be a positive tick count for the
+        // divide-and-advance math below to be meaningful. A zero or
+        // negative period would be a construction-time bug in OnRunEx
+        // (SampleRate == 0, QPC frequency not yet known, etc.). Skip the
+        // stream entirely and leave NextEventQpc untouched — OnRunEx has
+        // another chance to populate the period on the next state change.
+        if (rt->EventPeriodQpc <= 0)
+        {
+            continue;
+        }
+
         if (now.QuadPart < rt->NextEventQpc)
         {
             continue;
         }
 
+        // Virtual tick #0 for this stream is the tick it was supposed to
+        // fire on — the current NextEventQpc value BEFORE we advance it.
+        // Save it now so the execution phase can compute each virtual
+        // tick's own QPC time as BaseTickQpc + tickIdx * PeriodQpc.
+        LONGLONG baseTickQpc = rt->NextEventQpc;
+
+        // Compute overdue ticks including the one we are about to run.
+        // `1 +` because at `now == NextEventQpc` exactly we still owe the
+        // stream one tick; anything past that is bonus catch-up.
+        LONGLONG behindQpc = now.QuadPart - rt->NextEventQpc;
+        ULONG    overdueTicks =
+            1U + (ULONG)(behindQpc / rt->EventPeriodQpc);
+
+        // Bounded catch-up — see AO_TE_MAX_OVERDUE_TICKS comment above.
+        // Anything past the cap is DROPPED from this callback's workload
+        // and will NOT be replayed in the next callback either (we
+        // advance NextEventQpc by the capped count, not by the true
+        // backlog). Count the dropped ticks in LateEventCount so the
+        // diagnostic path shows up in logs instead of vanishing.
+        if (overdueTicks > AO_TE_MAX_OVERDUE_TICKS)
+        {
+            rt->LateEventCount += (overdueTicks - AO_TE_MAX_OVERDUE_TICKS);
+            overdueTicks = AO_TE_MAX_OVERDUE_TICKS;
+        }
+
+        // Advance NextEventQpc by exactly the number of ticks we are
+        // taking responsibility for in this callback. The next real
+        // callback picks up from the new NextEventQpc; any remaining
+        // backlog beyond the cap is deferred (or, above, dropped with
+        // the clamp-hit counter bump).
+        rt->NextEventQpc += (LONGLONG)overdueTicks * rt->EventPeriodQpc;
+
         // Take a ref under the engine lock so the destructor cannot free
         // this rt while we still hold a pointer in due[].
         InterlockedIncrement(&rt->RefCount);
 
-        due[dueCount++] = rt;
-        rt->NextEventQpc += rt->EventPeriodQpc;
+        due[dueCount].Rt           = rt;
+        due[dueCount].OverdueCount = overdueTicks;
+        due[dueCount].BaseTickQpc  = baseTickQpc;
+        due[dueCount].PeriodQpc    = rt->EventPeriodQpc;
+        dueCount++;
+
+        if (overdueTicks > maxOverdue)
+        {
+            maxOverdue = overdueTicks;
+        }
     }
 
     KeReleaseSpinLock(&g_AoTransportEngine.Lock, old);
 
-    // Run events outside the engine lock. Order: render (speaker side)
-    // first, then capture, so that within a single tick Cable B mic reads
-    // the pipe content that Cable B speaker just wrote.
-    for (ULONG i = 0; i < dueCount; i++)
+    // Execution phase — always outside the engine lock. Iterate one
+    // virtual tick at a time and do the full render-then-capture pass
+    // for that virtual tick before moving on, so that within each
+    // virtual tick Cable B mic reads the same tick's render content.
+    // A stream with fewer overdue ticks than the maximum only
+    // participates until it runs out.
+    //
+    // The QPC time passed to each runner is the *virtual* tick's own
+    // time (BaseTickQpc + tickIdx * PeriodQpc), not the real "now"
+    // wall-clock. This is per-stream because EventPeriodQpc is per-
+    // stream even when the shared timer period is uniform today; it
+    // keeps diagnostics, drift correction, and future startup-window
+    // logging meaningful.
+    for (ULONG tickIdx = 0; tickIdx < maxOverdue; tickIdx++)
     {
-        AO_STREAM_RT* rt = due[i];
-        if (!rt->IsCapture)
+        // Render pass for this virtual tick
+        for (ULONG i = 0; i < dueCount; i++)
         {
-            AoRunRenderEvent(rt, now.QuadPart);
+            if (due[i].OverdueCount > tickIdx && !due[i].Rt->IsCapture)
+            {
+                LONGLONG tickQpc =
+                    due[i].BaseTickQpc + (LONGLONG)tickIdx * due[i].PeriodQpc;
+                AoRunRenderEvent(due[i].Rt, tickQpc);
+            }
         }
-    }
-    // Capture pass — Step 4. Mic DMA is filled from the pipe at the same
-    // cadence the render side pushed new frames, so pipe fill oscillation
-    // per tick is minimized.
-    for (ULONG i = 0; i < dueCount; i++)
-    {
-        AO_STREAM_RT* rt = due[i];
-        if (rt->IsCapture)
+        // Capture pass for this virtual tick (same tick — cable pair
+        // causal order: write to pipe first, then read from pipe).
+        for (ULONG i = 0; i < dueCount; i++)
         {
-            AoRunCaptureEvent(rt, now.QuadPart);
+            if (due[i].OverdueCount > tickIdx && due[i].Rt->IsCapture)
+            {
+                LONGLONG tickQpc =
+                    due[i].BaseTickQpc + (LONGLONG)tickIdx * due[i].PeriodQpc;
+                AoRunCaptureEvent(due[i].Rt, tickQpc);
+            }
         }
     }
 
+    // Release refs. Any rt whose final owner released after we snapshotted
+    // it will be freed here.
     for (ULONG i = 0; i < dueCount; i++)
     {
-        AoTeReleaseRt(due[i]);
+        AoTeReleaseRt(due[i].Rt);
     }
 }

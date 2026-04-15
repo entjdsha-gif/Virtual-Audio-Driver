@@ -2016,6 +2016,25 @@ VOID CMiniportWaveRTStream::UpdatePosition
     // so m_ullLinearPosition needs to be updated accordingly here
     //
     m_ullLinearPosition += ByteDisplacement;
+
+    // Phase 6 Step 3/4: publish the new monotonic position to the engine
+    // runtime. For cable speaker (render) this is WaveRT's "bytes the
+    // client has produced" count; the render event runner anchors its
+    // DmaConsumedMono cursor against it and never reads past it. For
+    // cable mic (capture) this is the clock-target "bytes the client
+    // expects" count; the capture event runner fills DMA up to it.
+    //
+    // Non-cable streams skip this entirely — they still run on the
+    // legacy ReadBytes/WriteBytes diagnostic path and have no engine
+    // runtime attached.
+    if (m_pTransportRt && m_pMiniport &&
+        (m_pMiniport->m_DeviceType == eCableASpeaker ||
+         m_pMiniport->m_DeviceType == eCableBSpeaker ||
+         m_pMiniport->m_DeviceType == eCableAMic      ||
+         m_pMiniport->m_DeviceType == eCableBMic))
+    {
+        AoTransportPublishProducedBytes(m_pTransportRt, m_ullLinearPosition);
+    }
     
     // Update the DMA time stamp for the next call to GetPosition()
     //

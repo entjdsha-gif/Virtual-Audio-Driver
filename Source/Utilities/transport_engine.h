@@ -77,6 +77,18 @@ typedef struct _AO_STREAM_RT {
     BYTE*                   DmaBuffer;
     ULONG                   DmaBufferSize;
 
+    // Render-side DMA cursor anchoring. The render event runner is NOT
+    // allowed to free-run a DmaOffset that drifts away from what WaveRT
+    // has actually produced into the DMA — that makes the engine re-read
+    // stale or future bytes on every cadence skew, which is what the
+    // Step 3-alone live-call showed as screechy audio. Instead, the
+    // stream side publishes the authoritative produced byte count
+    // (monotonic LinearPosition for cable render streams) into
+    // DmaProducedMono from CMiniportWaveRTStream::UpdatePosition. The
+    // render runner moves only the produced->consumed delta.
+    volatile LONGLONG       DmaProducedMono;
+    ULONGLONG               DmaConsumedMono;
+
     // Event sizing — frame-count authoritative.
     ULONG                   FramesPerEvent;
     ULONG                   BytesPerEvent;
@@ -94,10 +106,9 @@ typedef struct _AO_STREAM_RT {
     ULONG                   UnderrunEvents;
     ULONG                   DropEvents;
 
-    // DMA-side cursor advanced by each event and sub-sample carry for
-    // non-integer event sizes (44.1k etc, Step 3 scope covers integer
-    // multiples only).
-    ULONG                   DmaOffset;
+    // Sub-sample carry for non-integer event sizes (44.1k family etc.).
+    // Still zero until the GCD SRC step lands; kept here so the later
+    // work doesn't have to widen the runtime struct.
     ULONG                   CarryFrames;
 } AO_STREAM_RT, *PAO_STREAM_RT;
 
@@ -178,5 +189,15 @@ extern "C" VOID          AoTransportFreeStreamRt(AO_STREAM_RT* rt);
 extern "C" VOID          AoTransportOnRunEx(const AO_STREAM_SNAPSHOT* snapshot);
 extern "C" VOID          AoTransportOnPauseEx(AO_STREAM_RT* rt);
 extern "C" VOID          AoTransportOnStopEx(AO_STREAM_RT* rt);
+
+// Publish the stream side's authoritative "bytes produced so far" count
+// (monotonic LinearPosition for a cable render stream) into the engine's
+// runtime struct. Called from UpdatePosition whenever the render stream
+// advances its byte displacement. The render event runner reads this
+// value under a plain volatile load and moves only the delta between it
+// and its own DmaConsumedMono cursor. Safe at DISPATCH_LEVEL; does not
+// take any engine locks.
+extern "C" VOID          AoTransportPublishProducedBytes(AO_STREAM_RT* rt,
+                                                          ULONGLONG producedBytesMono);
 
 #endif // AO_TRANSPORT_ENGINE_H
