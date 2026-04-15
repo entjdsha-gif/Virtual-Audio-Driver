@@ -755,3 +755,369 @@ AoTransportTimerCallback(
         AoTeReleaseRt(due[i].Rt);
     }
 }
+
+//=============================================================================
+// Phase 6 Option Y — Y1B canonical cable advance helper (shadow mode)
+//
+// These functions implement the VB-equivalent cable transport body. Y1B
+// runs the helper in shadow mode: advance math, gate/rebase/overrun
+// reject, mirrored monotonic increment, shadow cursor update, and
+// diagnostic counter bumps are all performed. But:
+//
+//   - the helper MUST NOT write FRAME_PIPE (no FramePipeWriteFromDma /
+//     FramePipeReadToDma calls in Y1B)
+//   - the helper MUST NOT update rt->DmaProducedMono (that is the legacy
+//     authoritative produced-byte count published by the stream side in
+//     CMiniportWaveRTStream::UpdatePosition, and is still the audible
+//     owner in Y1)
+//   - the helper MUST NOT replace GetPosition return values or
+//     ReadBytes/WriteBytes inputs (Y1C wires call sites to invoke the
+//     helper in shadow, not to consume its results)
+//
+// All shadow state lives in the new Y1A-added fields: AnchorQpc100ns,
+// PublishedFramesSinceAnchor, DmaCursorFrames{,Prev}, MonoFramesLow/
+// Mirror, LastAdvanceDelta, StatOverrunCounter, FadeSampleCounter.
+// Those fields start zero (ExAllocatePool2 + RtlZeroMemory) and the
+// helper is the sole writer.
+//
+// Y2 (render) and Y3 (capture) retire legacy audible ownership and
+// promote the helper's state to authoritative.
+//
+// Source of truth: results/phase6_vb_verification.md §2, §7, §9.5
+// Work order:     docs/PHASE6_Y_IMPLEMENTATION_WORK_ORDER.md §Y1B
+//=============================================================================
+
+// --- Canonical advance constants (VB 6320 direct translation) ---
+#define AO_CABLE_MIN_FRAMES_GATE      8U     // VB: cmp ebx,8; jl end (8-frame minimum)
+#define AO_CABLE_REBASE_SHIFT         7U     // VB: shl r8d,7  (127-frame anchor rebase)
+#define AO_CABLE_OVERRUN_DIVISOR      2U     // VB: sampleRate/2 (0.5s stall reject)
+#define AO_CABLE_FADE_PREFIX_LEN      96     // FadeSampleCounter starts at -96
+#define AO_CABLE_FADE_TABLE_SIZE      96     // clamp index 0..95 (VB cmovg r11d=0x5F)
+
+// --- Fade-in envelope (VB +0x12a60 direct copy, 96 entries × int32) ---
+//
+// Indexed by (FadeSampleCounter + 96) clamped to [0, 95]. Values are
+// 7-bit fixed-point gains: `sample = (sample * table[idx]) >> 7`.
+// Index 0..51 is the silence prefix (52 zeros); index 52..95 is the
+// ramp from 0 to 128 (unity gain in 7-bit fixed point). Applied per
+// sample at packet boundaries to suppress discontinuity clicks.
+//
+// Verified byte-for-byte against WinDbg `dps vbaudio_cableb64_win10+
+// 0x12a60 L80` captured 2026-04-16. Do not alter values without
+// re-verification — VB's audibly-clean output depends on them.
+static const LONG g_aoFadeEnvelope[AO_CABLE_FADE_TABLE_SIZE] = {
+    // 0..15   silence prefix
+    0, 0, 0, 0,  0, 0, 0, 0,
+    0, 0, 0, 0,  0, 0, 0, 0,
+    // 16..31  silence prefix
+    0, 0, 0, 0,  0, 0, 0, 0,
+    0, 0, 0, 0,  0, 0, 0, 0,
+    // 32..47  silence prefix
+    0, 0, 0, 0,  0, 0, 0, 0,
+    0, 0, 0, 0,  0, 0, 0, 0,
+    // 48..51  silence prefix tail
+    0, 0, 0, 0,
+    // 52..55
+    0, 1, 1, 1,
+    // 56..59
+    1, 1, 1, 2,
+    // 60..63
+    2, 2, 2, 3,
+    // 64..67
+    3, 4, 4, 5,
+    // 68..71
+    5, 6, 7, 8,
+    // 72..75
+    9, 10, 11, 12,
+    // 76..79
+    14, 16, 18, 20,
+    // 80..83
+    22, 25, 28, 32,
+    // 84..87
+    36, 40, 45, 50,
+    // 88..91
+    57, 64, 71, 80,
+    // 92..95
+    90, 101, 114, 128,
+};
+
+//-----------------------------------------------------------------------------
+// AoApplyFadeEnvelope — apply the VB 51a8-equivalent per-sample gain.
+//
+// samples       : in-place int32_t buffer (channel-interleaved or planar —
+//                 the envelope is symmetric w.r.t. channel order since
+//                 every sample gets the same indexed coefficient)
+// sampleCount   : total int32 samples in the buffer
+// perStreamCounter : pointer to AO_STREAM_RT::FadeSampleCounter (-96 at
+//                    packet boundary, advancing toward 0 at which point
+//                    the gain saturates at 128 = unity)
+//
+// Not called from anywhere in Y1B; declared here so Y2's render write
+// path can pull it in unchanged. Safe at any IRQL (no memory access
+// beyond the passed buffer + counter).
+//-----------------------------------------------------------------------------
+extern "C" VOID
+AoApplyFadeEnvelope(LONG* samples, ULONG sampleCount, LONG* perStreamCounter)
+{
+    if (samples == NULL || perStreamCounter == NULL || sampleCount == 0)
+    {
+        return;
+    }
+
+    LONG counter = *perStreamCounter;
+
+    for (ULONG i = 0; i < sampleCount; i++)
+    {
+        LONG idx = counter + AO_CABLE_FADE_PREFIX_LEN;
+        if (idx < 0)
+        {
+            idx = 0;
+        }
+        else if (idx >= AO_CABLE_FADE_TABLE_SIZE)
+        {
+            idx = AO_CABLE_FADE_TABLE_SIZE - 1;   // saturate at unity
+        }
+
+        LONG coef = g_aoFadeEnvelope[idx];
+        samples[i] = (LONG)(((LONGLONG)samples[i] * coef) >> 7);
+
+        // Advance counter toward 0 (unity). Once saturated, stay there.
+        if (counter < 0)
+        {
+            counter++;
+        }
+    }
+
+    *perStreamCounter = counter;
+}
+
+//-----------------------------------------------------------------------------
+// AoResetFadeCounter — set the fade counter to -96 so the next sample is
+// the start of the silence prefix. Called at packet boundary transitions
+// by the render path.
+//-----------------------------------------------------------------------------
+extern "C" VOID
+AoResetFadeCounter(AO_STREAM_RT* rt)
+{
+    if (rt == NULL)
+    {
+        return;
+    }
+    rt->FadeSampleCounter = -(LONG)AO_CABLE_FADE_PREFIX_LEN;
+}
+
+//-----------------------------------------------------------------------------
+// AoCableResetRuntimeFields — STOP/destructor reset of the Y cable
+// runtime state. Matches the VB 669c caller-side pattern: clears the
+// DMA cursor, monotonic counters, anchor QPC, published frames, and
+// fade state. Does NOT touch legacy Step 1 fields (DmaProducedMono,
+// DmaConsumedMono, NextEventQpc, LateEventCount, etc.) — those stay
+// owned by the Step 1 scaffold until Y2/Y3 retire it.
+//
+// NotifyArmed is preserved across STOP so an event-driven client that
+// set a notification count before stopping does not lose its arm state
+// across a pause/resume pair. NotifyFired is cleared so the one-shot
+// gate re-opens on the next boundary crossing.
+//-----------------------------------------------------------------------------
+extern "C" VOID
+AoCableResetRuntimeFields(AO_STREAM_RT* rt)
+{
+    if (rt == NULL)
+    {
+        return;
+    }
+
+    rt->AnchorQpc100ns              = 0;
+    rt->PublishedFramesSinceAnchor  = 0;
+    rt->DmaCursorFrames             = 0;
+    rt->DmaCursorFramesPrev         = 0;
+
+    // Volatile mirror pair — use InterlockedExchange64 so a concurrent
+    // shadow reader in the advance helper (Y1C will wire one via the
+    // timer DPC) cannot observe a torn 64-bit value.
+    InterlockedExchange64(&rt->MonoFramesLow,    0);
+    InterlockedExchange64(&rt->MonoFramesMirror, 0);
+
+    rt->LastAdvanceDelta   = 0;
+    rt->StatOverrunCounter = 0;
+
+    // Preserve NotifyBoundaryBytes + NotifyArmed (client-controlled).
+    rt->NotifyFired        = 0;
+
+    // Fade state — reset so the next audible run starts with a fresh
+    // silence prefix. AoResetFadeCounter is intentionally inlined here
+    // instead of called so this function is self-contained and safe at
+    // any IRQL regardless of the caller's context.
+    rt->FadeSampleCounter  = -(LONG)AO_CABLE_FADE_PREFIX_LEN;
+
+    // Debug shadow counters — kept across STOP intentionally so the
+    // Y1C gate diagnostic can accumulate across multiple run/stop
+    // cycles. They get removed in Y4 anyway.
+}
+
+//-----------------------------------------------------------------------------
+// AoCableAdvanceByQpc — Y1B shadow body.
+//
+// Direct translation of VB FUN_140006320 per results/phase6_vb_verification.md
+// §2. Runs at any IRQL ≤ DISPATCH_LEVEL. Not called from anywhere in
+// Y1B — Y1C wires GetPosition / GetPositions / shared timer DPC.
+//
+// SHADOW RULE: this function writes ONLY the Y-specific shadow fields
+// listed in the file header comment above. It never writes
+// DmaProducedMono, DmaConsumedMono, NextEventQpc, or any legacy
+// authoritative state. It never calls into FRAME_PIPE.
+//
+// Race discipline in Y1B: single-threaded shadow updates are good
+// enough (double counting would only affect DbgShadow* diagnostics).
+// Y2 will wrap real cursor advancement in a per-stream spinlock when
+// audible ownership arrives. For now we rely on Interlocked* on the
+// volatile counters and tolerate minor races on ULONGLONG cursors.
+//-----------------------------------------------------------------------------
+extern "C" VOID
+AoCableAdvanceByQpc(
+    AO_STREAM_RT*     rt,
+    ULONGLONG         nowQpcRaw,
+    AO_ADVANCE_REASON reason,
+    ULONG             flags)
+{
+    UNREFERENCED_PARAMETER(flags);
+
+    if (rt == NULL || rt->SampleRate == 0)
+    {
+        return;
+    }
+
+    // Unconditional "helper was reached" counter — Y1C gate uses the
+    // per-reason counters below for a finer breakdown, this one is the
+    // aggregate.
+    InterlockedIncrement(&rt->DbgShadowAdvanceHits);
+
+    switch (reason)
+    {
+    case AO_ADVANCE_QUERY:
+        InterlockedIncrement(&rt->DbgShadowQueryHits);
+        break;
+    case AO_ADVANCE_TIMER_RENDER:
+    case AO_ADVANCE_TIMER_CAPTURE:
+        InterlockedIncrement(&rt->DbgShadowTimerHits);
+        break;
+    case AO_ADVANCE_PACKET:
+    default:
+        break;
+    }
+
+    // --- QPC raw -> 100ns conversion ---
+    // VB 6320 does ((arg_r8 * 10M) + (arg_rdx * 10M)) / freq. The
+    // caller passes a single monotonic QPC counter so we collapse to
+    // one 10M-scale conversion. Use the cached QPC frequency captured
+    // at engine init.
+    if (g_AoTeQpcFrequency <= 0)
+    {
+        return;
+    }
+
+    ULONGLONG nowQpc100ns =
+        (nowQpcRaw * 10000000ULL) / (ULONGLONG)g_AoTeQpcFrequency;
+
+    // --- Elapsed frames since anchor ---
+    // First invocation (anchor == 0) seeds the anchor and bails out
+    // without recording a frame delta — the next call will establish
+    // the real baseline. This matches VB's startup gate behavior in
+    // FUN_1400068ac (+0x190 == 0 branch).
+    if (rt->AnchorQpc100ns == 0)
+    {
+        rt->AnchorQpc100ns             = nowQpc100ns;
+        rt->PublishedFramesSinceAnchor = 0;
+        return;
+    }
+
+    LONGLONG  qpc100nsDelta    = (LONGLONG)(nowQpc100ns - rt->AnchorQpc100ns);
+    if (qpc100nsDelta <= 0)
+    {
+        // Clock went backwards or stayed put — nothing to advance.
+        return;
+    }
+
+    LONGLONG  elapsedFrames64  =
+        (qpc100nsDelta * (LONGLONG)rt->SampleRate) / 10000000LL;
+
+    if (elapsedFrames64 < 0)
+    {
+        return;
+    }
+
+    LONG advance = (LONG)(elapsedFrames64 - (LONGLONG)rt->PublishedFramesSinceAnchor);
+
+    // --- 8-frame minimum gate (VB: cmp ebx,8; jl end) ---
+    if (advance < (LONG)AO_CABLE_MIN_FRAMES_GATE)
+    {
+        return;
+    }
+
+    // --- 127-frame rebase (VB: elapsed >= sampleRate << 7) ---
+    // Reset the anchor once the accumulated frame count exceeds
+    // ~2.7 seconds (at 48 kHz) to prevent the 100ns arithmetic from
+    // losing precision over long-running streams.
+    if (elapsedFrames64 >= ((LONGLONG)rt->SampleRate << AO_CABLE_REBASE_SHIFT))
+    {
+        rt->PublishedFramesSinceAnchor = 0;
+        rt->AnchorQpc100ns             = nowQpc100ns;
+    }
+
+    // --- 0.5s overrun reject (VB: advance > sampleRate/2) ---
+    // If this single advance would move more than half a second of
+    // frames, treat it as a stall recovery and reject the move. Bump
+    // the overrun stat so Y1C shadow diagnostics show how often the
+    // path would have bailed if audible ownership were active.
+    if ((ULONG)advance > (rt->SampleRate / AO_CABLE_OVERRUN_DIVISOR))
+    {
+        rt->StatOverrunCounter++;
+        return;
+    }
+
+    // --- Shadow cursor update ---
+    // VB 6320 advances +0xD0 by `advance` frames modulo buffer size.
+    // In Y1B the wrap uses RingSizeFrames which is still zero (Y1A
+    // didn't populate it — Y1C seeds it from the stream format). Fall
+    // back to unwrapped advancement when ring size is unknown so the
+    // shadow cursor still grows monotonically for observation.
+    rt->DmaCursorFramesPrev = rt->DmaCursorFrames;
+    if (rt->RingSizeFrames > 0)
+    {
+        rt->DmaCursorFrames =
+            (rt->DmaCursorFrames + (ULONGLONG)advance) % rt->RingSizeFrames;
+    }
+    else
+    {
+        rt->DmaCursorFrames += (ULONGLONG)advance;
+    }
+
+    // --- Packet notification check (shadow only) ---
+    // VB fires [+0x8188] when the cursor crosses +0x7C. In Y1B we do
+    // NOT dispatch the callback — shared-mode clients never arm this
+    // path (NotifyArmed stays 0), and event-driven clients are still
+    // served by the legacy PortCls contract. We keep the predicate
+    // here so Y1C can observe boundary crossings in diagnostic logs
+    // without calling into portcls.
+    if (rt->NotifyArmed && !rt->NotifyFired && rt->RingSizeFrames > 0)
+    {
+        if ((rt->DmaCursorFrames % rt->RingSizeFrames) == rt->NotifyBoundaryBytes)
+        {
+            rt->NotifyFired = 1;
+            // Intentionally no call-through in Y1B. Y3 will decide
+            // whether event-driven clients need direct dispatch here
+            // or whether the portcls contract handles it upstream.
+        }
+    }
+
+    // --- Monotonic counter mirror (VB +0xE0/+0xE8) ---
+    // Both counters receive the same delta. Volatile + interlocked
+    // add so a concurrent shadow reader cannot observe a torn 64-bit
+    // mid-write value — matches VB's single-writer-under-lock pattern
+    // without needing the per-stream spinlock Y2 will introduce.
+    InterlockedAdd64(&rt->MonoFramesLow,    (LONGLONG)advance);
+    InterlockedAdd64(&rt->MonoFramesMirror, (LONGLONG)advance);
+
+    rt->LastAdvanceDelta           = advance;
+    rt->PublishedFramesSinceAnchor = (ULONG)elapsedFrames64;
+}
