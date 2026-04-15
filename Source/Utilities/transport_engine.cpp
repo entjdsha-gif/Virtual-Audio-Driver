@@ -357,8 +357,29 @@ AoTransportOnRunEx(const AO_STREAM_SNAPSHOT* snapshot)
     // published by the stream side via AoTransportPublishProducedBytes
     // from within CMiniportWaveRTStream::UpdatePosition whenever the
     // stream's LinearPosition advances.
+    //
+    // Phase 6 Y2-2: for cable render the writer of DmaProducedMono is
+    // now AoCableWriteRenderFromDma (helper-owned). Legacy publish is
+    // retired for cable render; cable capture still publishes here
+    // until Y3. Zero-reset on RUN is still correct — both writers
+    // expect a fresh 0 baseline per stream session.
     rt->DmaProducedMono  = 0;
     rt->DmaConsumedMono  = 0;
+
+    // Phase 6 Y2-2: flip the render audible switch on cable render
+    // streams. This promotes AoCableWriteRenderFromDma to the sole
+    // owner of DMA -> FRAME_PIPE transfer for cable render, replacing
+    // the legacy ReadBytes path in CMiniportWaveRTStream::UpdatePosition.
+    // Cleared on STOP via AoCableResetRuntimeFields so pause/resume
+    // cycles re-enable the switch on the next RUN.
+    if (rt->IsCable && !rt->IsCapture)
+    {
+        rt->RenderAudibleActive = TRUE;
+    }
+    else
+    {
+        rt->RenderAudibleActive = FALSE;
+    }
 
     // Samples-only seeding: scale the reference frame constants to this
     // stream's actual rate. The engine period in QPC is the same for every
@@ -1031,6 +1052,14 @@ AoCableResetRuntimeFields(AO_STREAM_RT* rt)
     // are intentionally NOT reset here — see function header comment for
     // the VB parity verification that led to this rule.
 
+    // Phase 6 Y2-2: clear the render audible switch on STOP. OnRunEx
+    // re-sets it for cable render streams on the next RUN. Also zero
+    // DmaProducedMono — helper is the sole writer for cable render in
+    // Y2-2, and a stale post-STOP value would make the helper read
+    // wrong DMA offsets after resume.
+    rt->RenderAudibleActive = FALSE;
+    InterlockedExchange64(&rt->DmaProducedMono, 0);
+
     // Fade state — reset so the next audible run starts with a fresh
     // silence prefix. AoResetFadeCounter is intentionally inlined here
     // instead of called so this function is self-contained and safe at
@@ -1073,33 +1102,34 @@ AoCableApplyRenderFadeInScratch(
 // transfer for cable render streams. Called from the render branch of
 // AoCableAdvanceByQpc when rt->RenderAudibleActive is TRUE.
 //
-// advanceFrames is the helper-authoritative per-tick frame count
-// (already subject to the 8-frame gate and 127-rebase + 0.5s overrun
-// reject in the caller). This function:
+// Phase 6 Y2-2 cursor semantics (helper is sole writer of
+// DmaProducedMono for cable render):
 //
-//   1. Converts advanceFrames to bytes via rt->BlockAlign
-//   2. Computes the DMA start offset from rt->DmaProducedMono
-//      (published by legacy UpdatePosition tail — this is the current
-//      monotonic "bytes ever written by the WaveRT client")
-//   3. Loops over the DMA circular buffer wrap boundary, calling
-//      FramePipeWriteFromDmaEx for each contiguous run with rtOpaque
-//      set so the fade envelope is applied on scratch during the
-//      normalize-to-pipe step
+//   1. Read oldProduced = rt->DmaProducedMono (entry value = pre-
+//      advance produced-byte count). At RUN this is 0 (OnRunEx
+//      reset), and advances monotonically as the helper writes.
+//   2. bufferOffset = oldProduced % DmaBufferSize — this is where
+//      the NEXT byte to copy lives in the circular DMA buffer
+//      (client just wrote there, helper consumes).
+//   3. advanceBytes = advanceFrames * BlockAlign is the request.
+//      Loop over DMA wrap boundary, calling FramePipeWriteFromDmaEx
+//      with rtOpaque so the fade envelope is applied on scratch
+//      during the normalize-to-pipe step (VB 5634 -> 51a8 order).
+//   4. FramePipeWriteFromDmaEx returns pipe frames actually written.
+//      For same-rate passthrough (AO's current live-call path),
+//      pipe frames == client frames, so writtenBytes =
+//      writtenFrames * BlockAlign. Accumulate into totalWritten.
+//   5. If a chunk returns fewer frames than requested, the pipe is
+//      full (backpressure). Stop the loop; bytes not written stay in
+//      DMA and will be re-attempted next advance call.
+//   6. Publish newProduced = oldProduced + totalWritten atomically.
+//      The helper is the sole writer, so a simple InterlockedExchange64
+//      is safe against concurrent readers (legacy UpdatePosition tail
+//      no longer touches DmaProducedMono for cable render).
 //
-// Cursor semantics for Y2-1 (switch off): DmaProducedMono still comes
-// from legacy UpdatePosition, so advanceBytes computed from
-// advanceFrames × BlockAlign must equal the legacy ByteDisplacement for
-// this call to be cursor-consistent. Y2-2 validates this invariant at
-// the switchover and, if necessary, re-homes DmaProducedMono publish
-// into the helper.
-//
-// DMA start offset math: the legacy path computes
-// `bufferOffset = LinearPosition_old % DmaBufferSize` where
-// LinearPosition_old is the value BEFORE the legacy UpdatePosition
-// advance. The legacy publish puts LinearPosition_new into
-// DmaProducedMono after the advance, so we recover the old offset via
-// `(DmaProducedMono - advanceBytes) % DmaBufferSize`. This is correct
-// as long as advanceBytes matches the legacy displacement.
+// Runs at any IRQL <= DISPATCH_LEVEL. Does not hold the engine lock
+// while calling into FRAME_PIPE (pipe lock is acquired internally by
+// FramePipeWriteFromDmaEx / FramePipeWriteFrames).
 extern "C" VOID
 AoCableWriteRenderFromDma(AO_STREAM_RT* rt, ULONG advanceFrames)
 {
@@ -1121,16 +1151,13 @@ AoCableWriteRenderFromDma(AO_STREAM_RT* rt, ULONG advanceFrames)
         advanceBytes = rt->DmaBufferSize;
     }
 
-    // Start offset from the legacy-published produced byte count.
-    // DmaProducedMono is the NEW (post-advance) LinearPosition value,
-    // so we back off by advanceBytes to find where this tick's data
-    // begins in the circular DMA buffer.
-    ULONGLONG producedNew = (ULONGLONG)rt->DmaProducedMono;
-    ULONGLONG producedOld = producedNew - advanceBytes;
-    ULONG     startOffset = (ULONG)(producedOld % (ULONGLONG)rt->DmaBufferSize);
-
-    ULONG bytesRemaining = (ULONG)advanceBytes;
-    ULONG bufferOffset   = startOffset;
+    // Y2-2: helper-owned writer. oldProduced is the entry value; we
+    // read DMA starting at oldProduced % DmaBufferSize and advance
+    // forward by totalWritten after the loop.
+    ULONGLONG oldProduced  = (ULONGLONG)rt->DmaProducedMono;
+    ULONG     bufferOffset = (ULONG)(oldProduced % (ULONGLONG)rt->DmaBufferSize);
+    ULONG     bytesRemaining = (ULONG)advanceBytes;
+    ULONG     totalWritten   = 0;
 
     while (bytesRemaining > 0)
     {
@@ -1141,14 +1168,46 @@ AoCableWriteRenderFromDma(AO_STREAM_RT* rt, ULONG advanceFrames)
             runWrite = spaceToEnd;
         }
 
-        (VOID)FramePipeWriteFromDmaEx(
+        ULONG writtenFrames = FramePipeWriteFromDmaEx(
             rt->Pipe,
             rt->DmaBuffer + bufferOffset,
             runWrite,
             (PVOID)rt);
 
-        bufferOffset  = (bufferOffset + runWrite) % rt->DmaBufferSize;
-        bytesRemaining -= runWrite;
+        // Convert pipe-frame return into client-DMA bytes. AO's
+        // current live-call path is same-rate passthrough so
+        // pipe frames == client frames. Mixed-rate support will
+        // need to re-derive writtenBytes from FramePipeWriteFrames'
+        // own block-align.
+        ULONG writtenBytes = writtenFrames * rt->BlockAlign;
+        if (writtenBytes > runWrite)
+        {
+            // Defensive clamp against a theoretical over-report.
+            writtenBytes = runWrite;
+        }
+
+        totalWritten  += writtenBytes;
+        bufferOffset   = (bufferOffset + writtenBytes) % rt->DmaBufferSize;
+        bytesRemaining -= writtenBytes;
+
+        if (writtenBytes < runWrite)
+        {
+            // Pipe full / backpressure. Stop the loop so the
+            // unwritten tail stays in DMA for the next advance
+            // call to retry. Helper's DmaProducedMono only
+            // advances by what actually made it into the pipe.
+            break;
+        }
+    }
+
+    // Publish the new produced-byte total. Helper is the sole writer
+    // for cable render in Y2-2, so a single atomic exchange is enough.
+    // Skip publish if nothing was written to keep the counter exactly
+    // monotonic under pipe-full conditions.
+    if (totalWritten > 0)
+    {
+        ULONGLONG newProduced = oldProduced + totalWritten;
+        InterlockedExchange64(&rt->DmaProducedMono, (LONGLONG)newProduced);
     }
 }
 

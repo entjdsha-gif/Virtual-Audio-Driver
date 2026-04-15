@@ -2063,23 +2063,21 @@ VOID CMiniportWaveRTStream::UpdatePosition
         }
 
         {
-            // Phase 6 "Option Z" revert: restore Phase 4 legacy behavior.
-            // Cable speaker transport runs synchronously from UpdatePosition
-            // via ReadBytes, matching the coupled update-chain-and-transport
-            // invariant VB-Cable relies on. The Step 3/4 detour that moved
-            // render transport onto the engine timer broke that invariant
-            // (update chain in UpdatePosition, transport on independent
-            // DPC) and caused static overlay on the phone side. See
-            // PHASE6_PLAN.md and docs/CURRENT_STATE.md for the Option Y
-            // rework that will replace this legacy path properly.
+            // Phase 6 Y2-2: cable render audible ownership now lives in
+            // AoCableAdvanceByQpc -> AoCableWriteRenderFromDma inside the
+            // transport engine. The helper reads DMA bytes via its own
+            // DmaProducedMono cursor, applies the fade envelope on the
+            // scratch buffer, and publishes to FRAME_PIPE. Skip the
+            // legacy ReadBytes path for cable render streams.
             //
-            // Non-cable streams continue to use ReadBytes for the file-save
-            // diagnostic path when g_DoNotCreateDataFiles is clear, same as
-            // Phase 4 baseline.
+            // Non-cable streams (file-save diagnostic) keep ReadBytes
+            // when g_DoNotCreateDataFiles is FALSE, same as Phase 4
+            // baseline — their transport and the file-save path are
+            // unrelated to the cable audible switch.
             CMiniportWaveRT* pMp = m_pMiniport;
             BOOL isCable = (pMp && (pMp->m_DeviceType == eCableASpeaker ||
                                      pMp->m_DeviceType == eCableBSpeaker));
-            if (isCable || !g_DoNotCreateDataFiles)
+            if (!isCable && !g_DoNotCreateDataFiles)
             {
                 ReadBytes(ByteDisplacement);
             }
@@ -2097,20 +2095,22 @@ VOID CMiniportWaveRTStream::UpdatePosition
     //
     m_ullLinearPosition += ByteDisplacement;
 
-    // Phase 6 Step 3/4: publish the new monotonic position to the engine
-    // runtime. For cable speaker (render) this is WaveRT's "bytes the
-    // client has produced" count; the render event runner anchors its
-    // DmaConsumedMono cursor against it and never reads past it. For
-    // cable mic (capture) this is the clock-target "bytes the client
-    // expects" count; the capture event runner fills DMA up to it.
+    // Phase 6 Y2-2: publish the new monotonic position for cable
+    // CAPTURE streams only. Cable render DmaProducedMono is now
+    // helper-owned (AoCableWriteRenderFromDma publishes after each
+    // successful pipe write), so the legacy publish must NOT touch
+    // it or we create a dual-writer race on the render cursor.
+    //
+    // Cable capture is still legacy-owned until Y3 — WriteBytes runs
+    // in the m_bCapture branch above and the capture runner (still
+    // a no-op under Option Z) needs the published linear position
+    // to drive its DMA fill logic.
     //
     // Non-cable streams skip this entirely — they still run on the
     // legacy ReadBytes/WriteBytes diagnostic path and have no engine
     // runtime attached.
     if (m_pTransportRt && m_pMiniport &&
-        (m_pMiniport->m_DeviceType == eCableASpeaker ||
-         m_pMiniport->m_DeviceType == eCableBSpeaker ||
-         m_pMiniport->m_DeviceType == eCableAMic      ||
+        (m_pMiniport->m_DeviceType == eCableAMic ||
          m_pMiniport->m_DeviceType == eCableBMic))
     {
         AoTransportPublishProducedBytes(m_pTransportRt, m_ullLinearPosition);
