@@ -1,6 +1,8 @@
 # AO Virtual Cable - Claude Instructions (Fixed Pipe Rewrite)
 
 > **Current state and roadmap: `docs/CURRENT_STATE.md`** — single source of truth for where we are (Phase 5c, about to start Phase 6) and what's next. Read this first if resuming cold.
+>
+> **Phase 6 authoritative plan: `docs/PHASE6_PLAN.md`** (Codex-owned). Do not act on Phase 6 design hints from elsewhere — this file is the source of truth for the VB-equivalent shared-timer transport core.
 
 ## Opinion Rule (엄수)
 

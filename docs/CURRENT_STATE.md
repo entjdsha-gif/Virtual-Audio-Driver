@@ -36,57 +36,40 @@ Reverse engineering (see `results/vbcable_pipeline_analysis.md`, `VB_CABLE_AO_CO
 
 ## Where we are going — Phase 6
 
-Phase 6 replaces Phase 5's failed GetPositions-driven approach with a **dedicated 1 ms high-resolution timer** as the cadence owner, while keeping the rest of the AO scaffold (install, service, PnP, ControlPanel, IOCTL, test harness) intact.
+**Authoritative plan: `docs/PHASE6_PLAN.md` (Codex, 2026-04-15).** Per CLAUDE.md "플랜은 Codex, 실행은 Claude" rule, that file is the source of truth for Phase 6 design. This section is a summary only.
 
-### P6 steps
+### One-line definition
 
-**P6-0 — Frames-based unit normalization**
-- `minwavertstream.cpp` position math: byte displacement + hns → frame displacement
-- Commit Bug A Option 2 (`hns-precision` position math) which is currently uncommitted
-- Prerequisite for clean P6-1
+Phase 6은 AO 위 patch가 아니라, **VB-equivalent shared-timer transport core replacement**이다.
 
-**P6-1 — Cadence timer** *(the big step)*
-- `FramePipeCadenceTimer` — `ExAllocateTimer(EX_TIMER_HIGH_RESOLUTION)` per pipe (Cable A, Cable B independent)
-- Period 1 ms, due time 1 ms (matches VB)
-- Armed on first `FramePipeRegisterFormat` (either direction)
-- DPC callback:
-  - Elapsed frames since last fire via QPC diff
-  - 8-frame minimum gate (skip sub-sample noise)
-  - 63/64 drift correction, 100-tick rebase
-  - Speaker active → pull from upstream DMA into ring
-  - Mic active → push ring content to downstream DMA
-- Disarmed on last `UnregisterFormat` via `KeFlushQueuedDpcs` + reset
+### What changes vs the current codebase
 
-**P6-2 — Decouple UpdatePosition from transport**
-- `UpdatePosition` becomes position-counter-only (WaveRT contract still satisfied)
-- All data movement via cadence timer
-- Remove `ReadBytes` / `WriteBytes` coupling to FRAME_PIPE
+- A global `AO_TRANSPORT_ENGINE` with a single high-resolution timer owns transport cadence for *all* active streams (render + capture, Cable A + B). No per-pipe timers.
+- Each stream gets an `AO_STREAM_RT` runtime struct tracking `NextEventQpc`, `FramesPerEvent`, `StartupArmed`, `CarryFrames` etc.
+- Transport is **event-driven** (`now >= NextEventQpc`), not query-driven.
+- `GetPositions` / `UpdatePosition` become reporting-only. They never touch FRAME_PIPE.
+- `StartPhaseComplete` sticky flag is removed; startup is re-armed per session via an explicit state machine.
+- Phase 5 scaffold (`IOCTL_AO_SET_PUMP_FEATURE_FLAGS`, `RenderPumpDriveCount`, query-driven pump helpers) is deleted in the final step.
 
-**P6-3 — Remove Phase 5 scaffold**
-- `PumpToCurrentPositionFromQuery`, `pumpOwnsRender` dual-gate, Phase 5 IOCTL, feature flags, Phase 5 counters — delete
-- Phase 5c comments cleaned up
+### Six implementation steps
 
-**P6-4 — Cable A + B live-call validation**
-- **Pre-experiment cable check mandatory** (default playback = AO Cable A, default recording = AO Cable B; see CLAUDE.md § Pre-Experiment Cable Check)
-- 4-point soundcard capture + user perceptual judgment vs VB
-- Iterate until both cables match VB quality
+1. Add `AO_TRANSPORT_ENGINE` + `AO_STREAM_RT` structures (no behavior change)
+2. Register/unregister streams in engine at RUN/PAUSE/STOP (legacy transport still active)
+3. Move **render** side to engine event transport; drop legacy render path
+4. Move **capture** side to engine event transport; apply startup/recovery state machine
+5. Finish position-path decouple; remove all legacy transport coupling
+6. Delete Phase 5 scaffold (IOCTLs, feature flags, pump helpers, rollback infra)
 
-**P6-5 — Diagnosis cleanup**
-- `FP_READ` / `FP_WRITE` / `FP_PREFILL` DbgPrint → rate-limited or #ifdef
-- `FP_STARTUP_HEADROOM_MS`, `FramePipePrefillSilence` — remove (timer owns cadence, prefill unnecessary)
-
-**P6-6 — GCD linear-interp SRC** *(Principle 6)*
-- Replace current rate-mismatch drop with resampling
-- Enables arbitrary sample-rate input
-
-**P6-7 — Phase 6 commit + phase-number consolidation**
-- Changelog entry
-- Update `CURRENT_STATE.md` (this file)
-- Update memory `project_remaining_tasks.md`
+See `docs/PHASE6_PLAN.md` for full pseudo-code of `AoTransportTimerCallback`, `AoRunRenderEvent`, `AoRunCaptureEvent`, and the success criteria.
 
 ### Phase 6 keystone
 
-**P6-1 (cadence timer)** is the keystone. Every other step is straightforward once it works. If the cadence timer goes in cleanly and live-call chopping disappears, the rest of Phase 6 is mechanical cleanup + SRC addition.
+Steps 1–2 are mechanical. Step 3 (render move) is the first behavior change. **Step 4 (capture move + startup state machine) is the actual chopping fix** — this is where the mid-call chopping must disappear. Steps 5–6 are cleanup.
+
+### Pending before Step 1 kickoff
+
+- Request file-level breakdown from Codex: where `AO_TRANSPORT_ENGINE` lives, how the engine links into `adapter.cpp` init and `minwavertstream.cpp` RUN/STOP, whether Step 1 is a new source file or an addition to `loopback.*`. Recorded as a followup in `PHASE6_PLAN.md` § "Next follow-up".
+- Commit or revert the uncommitted Bug A Option 2 hns-precision math so Phase 6 starts from a clean working tree.
 
 ---
 
