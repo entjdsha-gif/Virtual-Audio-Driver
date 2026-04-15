@@ -581,6 +581,37 @@ AoRunRenderEvent(AO_STREAM_RT* rt, LONGLONG qpc)
     if (rt != NULL && rt->IsCable)
     {
         AoCableAdvanceByQpc(rt, (ULONGLONG)qpc, AO_ADVANCE_TIMER_RENDER, 0);
+
+        // Phase 6 Y2-1.5 rate-limited byte diff DbgPrint.
+        // Fires once per second per cable render stream so DebugView
+        // can show whether helper vs legacy cumulative byte totals
+        // are converging. Last-second deltas (dH, dL) make it easy
+        // to tell whether a non-zero cumulative diff is historical
+        // leftover or an active drift. Removed in Y4 with the rest
+        // of the Y2 diagnostic counters.
+        if (!rt->IsCapture && rt->BlockAlign > 0 && g_AoTeQpcFrequency > 0)
+        {
+            LONGLONG elapsedQpc = qpc - rt->DbgY2LastPrintQpc;
+            if (elapsedQpc >= g_AoTeQpcFrequency ||
+                rt->DbgY2LastPrintQpc == 0)
+            {
+                LONGLONG helperNow   = rt->DbgY2HelperRenderBytes;
+                LONGLONG legacyNow   = rt->DbgY2LegacyRenderBytes;
+                LONGLONG helperDelta = helperNow - rt->DbgY2HelperPrevSnapshot;
+                LONGLONG legacyDelta = legacyNow - rt->DbgY2LegacyPrevSnapshot;
+                LONGLONG diffMax     = rt->DbgY2RenderByteDiffMax;
+                LONG     mismatchHits = rt->DbgY2RenderMismatchHits;
+
+                DbgPrint("[AoY2.5] rt=%p H=%lld L=%lld dH=%lld dL=%lld "
+                         "diffMax=%lld miss=%d\n",
+                         rt, helperNow, legacyNow, helperDelta, legacyDelta,
+                         diffMax, mismatchHits);
+
+                rt->DbgY2HelperPrevSnapshot = helperNow;
+                rt->DbgY2LegacyPrevSnapshot = legacyNow;
+                rt->DbgY2LastPrintQpc       = qpc;
+            }
+        }
     }
 }
 

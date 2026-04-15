@@ -225,6 +225,14 @@ typedef struct _AO_STREAM_RT {
     volatile LONGLONG       DbgY2LegacyRenderBytes;
     volatile LONGLONG       DbgY2RenderByteDiffMax;
     volatile LONG           DbgY2RenderMismatchHits;
+
+    // Snapshots used by the 1 Hz DbgPrint in AoRunRenderEvent so the
+    // log can show per-second helper/legacy byte deltas in addition to
+    // cumulative totals. Written only by the timer DPC while holding
+    // its per-stream reference, so no atomics required.
+    LONGLONG                DbgY2LastPrintQpc;
+    LONGLONG                DbgY2HelperPrevSnapshot;
+    LONGLONG                DbgY2LegacyPrevSnapshot;
 } AO_STREAM_RT, *PAO_STREAM_RT;
 
 //=============================================================================
