@@ -1942,19 +1942,12 @@ VOID CMiniportWaveRTStream::UpdatePosition
 
     if (m_bCapture)
     {
-        // Phase 6 Step 4: cable mic capture transport now runs from the
-        // AO_TRANSPORT_ENGINE timer callback via AoRunCaptureEvent. Do
-        // NOT call WriteBytes for cable mic streams — that path would
-        // double-fill the DMA with pipe content and fight the engine
-        // event runner. Non-cable mic streams (file-playback / tone
-        // generator paths) still reach WriteBytes unchanged.
-        CMiniportWaveRT* pMp = m_pMiniport;
-        BOOL isCableMic = (pMp && (pMp->m_DeviceType == eCableAMic ||
-                                    pMp->m_DeviceType == eCableBMic));
-        if (!isCableMic)
-        {
-            WriteBytes(ByteDisplacement);
-        }
+        // Phase 6 "Option Z" revert: restore Phase 4 legacy behavior.
+        // Cable mic capture transport runs synchronously from
+        // UpdatePosition via WriteBytes — same reason as the cable
+        // speaker ReadBytes path above. Engine-owned transport is
+        // deferred to the Option Y rework.
+        WriteBytes(ByteDisplacement);
     }
     else
     {
@@ -1986,20 +1979,23 @@ VOID CMiniportWaveRTStream::UpdatePosition
         }
 
         {
-            // Phase 6 Step 3: cable speaker transport now runs exclusively
-            // from the AO_TRANSPORT_ENGINE timer callback via
-            // AoRunRenderEvent. Do NOT call ReadBytes for cable speakers
-            // from UpdatePosition any more — that path is the legacy
-            // query-driven writer and would double-write the ring alongside
-            // the engine event runner, which in turn would produce overflow
-            // reject counts and corrupt audio.
+            // Phase 6 "Option Z" revert: restore Phase 4 legacy behavior.
+            // Cable speaker transport runs synchronously from UpdatePosition
+            // via ReadBytes, matching the coupled update-chain-and-transport
+            // invariant VB-Cable relies on. The Step 3/4 detour that moved
+            // render transport onto the engine timer broke that invariant
+            // (update chain in UpdatePosition, transport on independent
+            // DPC) and caused static overlay on the phone side. See
+            // PHASE6_PLAN.md and docs/CURRENT_STATE.md for the Option Y
+            // rework that will replace this legacy path properly.
             //
-            // Non-cable streams still call ReadBytes for the file-save
-            // diagnostic path when g_DoNotCreateDataFiles is clear.
+            // Non-cable streams continue to use ReadBytes for the file-save
+            // diagnostic path when g_DoNotCreateDataFiles is clear, same as
+            // Phase 4 baseline.
             CMiniportWaveRT* pMp = m_pMiniport;
             BOOL isCable = (pMp && (pMp->m_DeviceType == eCableASpeaker ||
                                      pMp->m_DeviceType == eCableBSpeaker));
-            if (!isCable && !g_DoNotCreateDataFiles)
+            if (isCable || !g_DoNotCreateDataFiles)
             {
                 ReadBytes(ByteDisplacement);
             }

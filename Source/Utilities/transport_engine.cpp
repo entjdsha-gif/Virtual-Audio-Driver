@@ -491,14 +491,18 @@ AoTransportOnStopEx(AO_STREAM_RT* rt)
 // integer cases (44.1 kHz family) will use rt->CarryFrames in a later step;
 // for now they still land on the integer floor and the carry is updated
 // so the error averages to zero over time.
+//
+// Unused during "Option Z" revert (both event runners are no-ops), kept
+// here so the Option Y re-implementation can call it unchanged.
+// NOLINTNEXTLINE — intentionally unreferenced during revert.
+#pragma warning(push)
+#pragma warning(disable: 4505)   // unreferenced local function has been removed
 static ULONG
 AoComputeFramesForEvent(AO_STREAM_RT* rt)
 {
-    // Step 3: return FramesPerEvent directly. The CarryFrames field is
-    // wired so a later SRC step can replace this body without touching the
-    // call site.
     return rt->FramesPerEvent;
 }
+#pragma warning(pop)
 
 // AoRunRenderEvent — move produced-but-not-yet-consumed bytes from the
 // stream's DMA buffer into its FRAME_PIPE ring.
@@ -525,63 +529,19 @@ static VOID
 AoRunRenderEvent(AO_STREAM_RT* rt, LONGLONG qpc)
 {
     UNREFERENCED_PARAMETER(qpc);
+    UNREFERENCED_PARAMETER(rt);
 
-    if (rt->Pipe == NULL || rt->DmaBuffer == NULL || rt->DmaBufferSize == 0)
-    {
-        return;
-    }
-
-    // Volatile load of the authoritative produced counter. The stream
-    // side publishes monotonically so the only thing we can observe
-    // concurrently is a slightly-older value; we never see a torn write
-    // on a 64-bit aligned field on x64.
-    ULONGLONG produced = (ULONGLONG)rt->DmaProducedMono;
-    ULONGLONG consumed = rt->DmaConsumedMono;
-
-    if (produced <= consumed)
-    {
-        // Nothing new to move this tick. Not an underrun per se — the
-        // pipe just gets no fresh data until the next tick when WaveRT
-        // has progressed further. Counted as "late event" so we can
-        // tell over a run how often the engine outpaced the client.
-        rt->LateEventCount++;
-        return;
-    }
-
-    ULONGLONG availableBytes = produced - consumed;
-
-    ULONG budgetFrames = AoComputeFramesForEvent(rt);
-    if (budgetFrames == 0)
-    {
-        return;
-    }
-    ULONGLONG budgetBytes = (ULONGLONG)budgetFrames * rt->BlockAlign;
-
-    ULONGLONG moveBytes = (availableBytes < budgetBytes) ? availableBytes
-                                                         : budgetBytes;
-
-    ULONG bufSz = rt->DmaBufferSize;
-    if (bufSz == 0)
-    {
-        return;
-    }
-
-    ULONG offset = (ULONG)(consumed % bufSz);
-    ULONGLONG remaining = moveBytes;
-
-    while (remaining > 0)
-    {
-        ULONG chunk = (remaining > (ULONGLONG)(bufSz - offset))
-                          ? (bufSz - offset)
-                          : (ULONG)remaining;
-
-        FramePipeWriteFromDma(rt->Pipe, rt->DmaBuffer + offset, chunk);
-
-        offset = (offset + chunk) % bufSz;
-        remaining -= chunk;
-    }
-
-    rt->DmaConsumedMono = consumed + moveBytes;
+    // Phase 6 "Option Z" revert: render transport runs from
+    // CMiniportWaveRTStream::UpdatePosition's legacy ReadBytes path,
+    // to restore the coupled update-chain-and-transport invariant that
+    // VB-Cable relies on. The engine scaffold stays wired (timer, due
+    // list, snapshot, refcount) so Option Y (full VB-equivalent
+    // structure — UpdatePosition no-op for cable streams, engine 1 ms
+    // timer owning position + transport + cursor together) can be
+    // dropped in without touching the rest of the lifecycle plumbing.
+    //
+    // Prior body of this function (DmaProducedMono anchored render
+    // transport) preserved in git history at commit a8ac0fb.
 }
 
 // AoRunCaptureEvent — fill the capture DMA with pipe content up to the
@@ -610,91 +570,17 @@ static VOID
 AoRunCaptureEvent(AO_STREAM_RT* rt, LONGLONG qpc)
 {
     UNREFERENCED_PARAMETER(qpc);
+    UNREFERENCED_PARAMETER(rt);
 
-    if (rt->Pipe == NULL || rt->DmaBuffer == NULL || rt->DmaBufferSize == 0)
-    {
-        return;
-    }
-
-    ULONGLONG anchor = (ULONGLONG)rt->DmaProducedMono;
-    ULONGLONG cursor = rt->DmaConsumedMono;
-
-    if (anchor <= cursor)
-    {
-        // Clock target hasn't advanced since the last tick. Nothing to
-        // do — the client is not yet expecting new bytes in the DMA.
-        rt->LateEventCount++;
-        return;
-    }
-
-    ULONGLONG availableBytes = anchor - cursor;
-
-    ULONG budgetFrames = AoComputeFramesForEvent(rt);
-    if (budgetFrames == 0)
-    {
-        return;
-    }
-    ULONGLONG budgetBytes = (ULONGLONG)budgetFrames * rt->BlockAlign;
-
-    ULONGLONG fillBytes = (availableBytes < budgetBytes) ? availableBytes
-                                                         : budgetBytes;
-
-    ULONG bufSz = rt->DmaBufferSize;
-    if (bufSz == 0)
-    {
-        return;
-    }
-
-    ULONG offset = (ULONG)(cursor % bufSz);
-    ULONGLONG remaining = fillBytes;
-
-    // Startup gate — while armed, emit silence and advance the DMA cursor
-    // but leave the pipe read cursor untouched. The ring fills up via
-    // the render side until it clears StartupThresholdFrames.
-    if (rt->StartupArmed)
-    {
-        ULONG fill = FramePipeGetFillFrames(rt->Pipe);
-        if (fill < rt->StartupThresholdFrames)
-        {
-            while (remaining > 0)
-            {
-                ULONG chunk = (remaining > (ULONGLONG)(bufSz - offset))
-                                  ? (bufSz - offset)
-                                  : (ULONG)remaining;
-                RtlZeroMemory(rt->DmaBuffer + offset, chunk);
-                offset = (offset + chunk) % bufSz;
-                remaining -= chunk;
-            }
-            rt->DmaConsumedMono = cursor + fillBytes;
-            return;
-        }
-        rt->StartupArmed = FALSE;
-    }
-
-    // Partial-read detection: if the pipe doesn't have the frames this
-    // event needs, count an underrun event but still let FramePipeReadToDma
-    // run — it zero-fills the shortfall internally so the DMA tail stays
-    // valid.
-    ULONG neededFramesForTick =
-        (ULONG)(fillBytes / (rt->BlockAlign ? rt->BlockAlign : 1));
-    if (FramePipeGetFillFrames(rt->Pipe) < neededFramesForTick)
-    {
-        rt->UnderrunEvents++;
-    }
-
-    while (remaining > 0)
-    {
-        ULONG chunk = (remaining > (ULONGLONG)(bufSz - offset))
-                          ? (bufSz - offset)
-                          : (ULONG)remaining;
-
-        FramePipeReadToDma(rt->Pipe, rt->DmaBuffer + offset, chunk);
-
-        offset = (offset + chunk) % bufSz;
-        remaining -= chunk;
-    }
-
-    rt->DmaConsumedMono = cursor + fillBytes;
+    // Phase 6 "Option Z" revert: capture transport runs from
+    // CMiniportWaveRTStream::UpdatePosition's legacy WriteBytes path.
+    // See AoRunRenderEvent above for rationale — Option Y will replace
+    // both runners with a VB-equivalent implementation that couples
+    // update chain and transport in the engine itself.
+    //
+    // Prior body (DmaProducedMono-anchored capture runner with startup
+    // state machine and underrun counter) preserved in git history at
+    // commit a8ac0fb.
 }
 
 //=============================================================================
