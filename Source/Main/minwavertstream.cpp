@@ -1831,70 +1831,18 @@ VOID CMiniportWaveRTStream::PumpToCurrentPositionFromQuery
         m_ulPumpProcessedFrames += newFrames;
         m_ullPumpFramesProcessed += newFrames;
 
-        // 9b. Phase 5 (2026-04-14): render transport block.
-        //     Pump takes ownership of FramePipeWriteFromDma for cable
-        //     speaker endpoints when AO_PUMP_FLAG_DISABLE_LEGACY_RENDER
-        //     is set. Legacy ReadBytes() cable branch is gated on the
-        //     complement of this flag, so the two sites are mutually
-        //     exclusive for cable render (dual-gate pattern).
-        //     - uses the pump-owned buffer offset, NOT
-        //       m_ullLinearPosition, to avoid long-run drift vs WaveRT
-        //       contract accounting;
-        //     - on first accepted call after RUN, syncs the pump offset
-        //       to the current WaveRT view so the first chunk lands at
-        //       the same byte the legacy path would have written;
-        //     - wraps the DMA buffer in chunks just like ReadBytes();
-        //     - does NOT touch m_ullLinearPosition, m_ullWritePosition,
-        //       m_ullPresentationPosition, or m_ullDmaTimeStamp. Those
-        //       stay UpdatePosition's responsibility per the WaveRT
-        //       packet-mode contract.
-        //     - FramePipeWriteFromDma return value is intentionally
-        //       unused: overflow is tracked by the pipe's DropCount and
-        //       is not a pump-side retry signal (reject, not overwrite).
-        if ((m_ulPumpFeatureFlags & AO_PUMP_FLAG_DISABLE_LEGACY_RENDER) != 0 &&
-            !m_bCapture &&
-            (m_pMiniport->m_DeviceType == eCableASpeaker ||
-             m_pMiniport->m_DeviceType == eCableBSpeaker) &&
-            pFP != NULL && pFP->Initialized &&
-            m_pDmaBuffer != NULL && m_ulDmaBufferSize > 0 &&
-            newFrames > 0)
-        {
-            ULONG bytesToMove = newFrames * nBlockAlign;
-
-            // First-call sync: if the pump has no prior offset but
-            // UpdatePosition's linear position has advanced, catch up to
-            // the current WaveRT view. After this first sync the pump's
-            // offset advances independently.
-            if (m_ulPumpLastBufferOffset == 0 && m_ullLinearPosition > 0)
-            {
-                m_ulPumpLastBufferOffset =
-                    (ULONG)(m_ullLinearPosition % m_ulDmaBufferSize);
-            }
-
-            ULONG bufferOffset = m_ulPumpLastBufferOffset;
-            ULONG remaining    = bytesToMove;
-            while (remaining > 0)
-            {
-                ULONG chunk = remaining;
-                ULONG room  = m_ulDmaBufferSize - bufferOffset;
-                if (chunk > room)
-                {
-                    chunk = room;
-                }
-                FramePipeWriteFromDma(
-                    pFP,
-                    m_pDmaBuffer + bufferOffset,
-                    chunk);
-                bufferOffset = (bufferOffset + chunk) % m_ulDmaBufferSize;
-                remaining   -= chunk;
-            }
-            m_ulPumpLastBufferOffset = bufferOffset;
-
-            // Phase 5 one-owner evidence: increment render pump drive
-            // counter exactly once per helper invocation that actually
-            // executed the transport block. Not per chunk.
-            pFP->RenderPumpDriveCount++;
-        }
+        // 9b. Phase 5c (2026-04-15): REMOVED pump-driven render transport.
+        //     Phase 5 original placed FramePipeWriteFromDma here, inside a
+        //     query-driven helper. GetPositions fire rate (~130ms measured)
+        //     is far slower than WASAPI reader period (~10ms), producing a
+        //     burst+gap pattern at the pipe output. Phone Link reads during
+        //     the gap returned silence and phone-side audio chopped.
+        //     Transport is restored to the legacy UpdatePosition path below
+        //     which runs on WaveRT packet cadence, matching Phase 4 timing.
+        //     Phase 5 scaffold (flags, counters, register map, IOCTL) is
+        //     preserved but AO_PUMP_FLAG_DISABLE_LEGACY_RENDER becomes a
+        //     dead flag; RenderPumpDriveCount freezes at 0. Kept for
+        //     future Phase 5b (dedicated DPC timer) re-design.
 
         // 10. Rolling-window shadow compare vs. same-call legacy bytes.
         m_ullPumpShadowWindowPumpFrames  += newFrames;
@@ -1978,20 +1926,35 @@ VOID CMiniportWaveRTStream::UpdatePosition
     // may cause us to lose some of the time, so we will carry the remainder forward 
     // to the next GetPosition() call.
     //
-    ULONG TimeElapsedInMS = (ULONG)(hnsCurrentTime - m_ullDmaTimeStamp + m_hnsElapsedTimeCarryForward)/10000;
-    
-    // Carry forward the remainder of this division so we don't fall behind with our position too much.
+    // EXPERIMENT A (2026-04-14) — hns-level precision byte displacement.
     //
-    m_hnsElapsedTimeCarryForward = (hnsCurrentTime - m_ullDmaTimeStamp + m_hnsElapsedTimeCarryForward) % 10000;
-    
-    // Calculate how many bytes in the DMA buffer would have been processed in the elapsed
-    // time.  Note that the division by 1000 to convert to milliseconds may cause us to 
-    // lose some bytes, so we will carry the remainder forward to the next GetPosition() call.
+    // Replaces the two-step (hns → integer ms → bytes) math with a direct
+    // totalHns × rate / 10^7 calculation. The old path quantized elapsed
+    // time at 1 ms boundaries via integer division, producing a bimodal
+    // {0, 192, 384} per-call emission pattern when timer ticks landed
+    // slightly under / slightly over 1 ms. Speaker and mic DPCs drifting
+    // out of phase under that pattern left the ring momentarily empty,
+    // producing the observed 1-2 ms silence gaps in loopback.
     //
-    // need to divide by 1000 because m_ulDmaMovementRate is average bytes per sec.
-
-    ULONG ByteDisplacement = ((m_ulDmaMovementRate * TimeElapsedInMS) + m_byteDisplacementCarryForward) / 1000 ;
-    m_byteDisplacementCarryForward = ((m_ulDmaMovementRate * TimeElapsedInMS) + m_byteDisplacementCarryForward) % 1000;
+    // Option 2 preserves QPC delta and multi-call semantics (sub-ms calls
+    // emit sub-ms bytes, exactly as before) but removes the integer-ms
+    // quantization step. Carry is held in rate-scaled hns units (< 10^7)
+    // inside m_byteDisplacementCarryForward, reusing the existing field
+    // because the old semantics (rate × ms residual, < 1000) is no longer
+    // needed. m_hnsElapsedTimeCarryForward is forced to 0 on every call
+    // because every hns is fully accounted for by the scaled math, so the
+    // sub-ms hns residue concept does not apply in this formulation;
+    // GetLinearPosition's L984 read of that field yields 0 byte correction.
+    //
+    // Uncommitted experiment. See results/g8_dropout_origin_notes.md.
+    ULONGLONG totalHns = hnsCurrentTime - m_ullDmaTimeStamp;
+    ULONGLONG scaledTotal =
+        (ULONGLONG)m_ulDmaMovementRate * totalHns
+        + (ULONGLONG)m_byteDisplacementCarryForward;
+    ULONG ByteDisplacement = (ULONG)(scaledTotal / 10000000ULL);
+    m_byteDisplacementCarryForward =
+        (ULONG)(scaledTotal - (ULONGLONG)ByteDisplacement * 10000000ULL);
+    m_hnsElapsedTimeCarryForward = 0;
 
     // Phase 1: Block-align ByteDisplacement to prevent sample boundary misalignment.
     // Carry forward sub-block remainder to avoid long-term drift.
@@ -2045,21 +2008,15 @@ VOID CMiniportWaveRTStream::UpdatePosition
         {
             // Cable A/B always calls ReadBytes for loopback.
             // Non-cable devices only call ReadBytes when saving to file.
-            // Phase 5 (2026-04-14): render ownership dual-gate.
-            // Cable render transport is handled by the Phase 3 pump
-            // helper (PumpToCurrentPositionFromQuery) when
-            // AO_PUMP_FLAG_DISABLE_LEGACY_RENDER is set. The legacy
-            // ReadBytes() call below is gated on the complement, so the
-            // pump and ReadBytes never fire simultaneously for the same
-            // cable render stream. Clearing the flag via
-            // IOCTL_AO_SET_PUMP_FEATURE_FLAGS returns transport to this
-            // legacy path within 1-2 position queries.
+            // Phase 5c (2026-04-15): dual-gate removed. The Phase 5 pump
+            // transport block was at query cadence (too slow). Transport
+            // is back on UpdatePosition packet cadence for cable render.
+            // AO_PUMP_FLAG_DISABLE_LEGACY_RENDER has no effect now;
+            // scaffold kept for future Phase 5b (dedicated timer) design.
             CMiniportWaveRT* pMp = m_pMiniport;
             BOOL isCable = (pMp && (pMp->m_DeviceType == eCableASpeaker ||
                                      pMp->m_DeviceType == eCableBSpeaker));
-            BOOL pumpOwnsRender = isCable &&
-                ((m_ulPumpFeatureFlags & AO_PUMP_FLAG_DISABLE_LEGACY_RENDER) != 0);
-            if ((isCable && !pumpOwnsRender) || !g_DoNotCreateDataFiles)
+            if (isCable || !g_DoNotCreateDataFiles)
             {
                 ReadBytes(ByteDisplacement);
             }

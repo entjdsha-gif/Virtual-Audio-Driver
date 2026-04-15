@@ -1,5 +1,43 @@
 # Pipeline V2 Changelog
 
+## 2026-04-15 — Phase 5c: revert pump-driven render transport to UpdatePosition cadence
+
+**Files changed:**
+- `Source/Main/minwavertstream.cpp` — removed Phase 5 sub-3 pump transport block (was inside GetPositions-triggered `PumpToCurrentPositionFromQuery` helper). Removed `pumpOwnsRender` dual-gate in `UpdatePosition` and restored unconditional legacy `ReadBytes(ByteDisplacement)` for cable speaker render. Phase 5 scaffolding (flags, counters, IOCTL, register map) kept intact; only the cadence of actual DMA→ring transport reverts to WaveRT packet cadence.
+- `Source/Main/aocablea.inx`, `Source/Main/aocableb.inx` — `DriverVer` bumped to `04/15/2026, 5.3.0.1` so pnputil treats build as new package and refreshes DriverStore (otherwise staged signed .sys would be silently replaced by old cached copy on re-install).
+- `CLAUDE.md` — new "Experiment Commit Rule" section: commit experiments incrementally, tag result filenames with phase+shorthash, mirror results in memory.
+
+**What:** Phase 5 original (commit `2c733f1`) moved cable render transport (`FramePipeWriteFromDma`) from UpdatePosition packet cadence (~10 ms) into a query-driven helper called from GetPositions. Observed GetPositions fire rate in practice was ~130 ms — 13× slower than WASAPI reader period — producing a burst+gap output pattern at the pipe. Phase 5c keeps all Phase 5 infrastructure (runtime rollback IOCTL, diag counters, ownership bookkeeping) but reverts the actual transport call-site back to UpdatePosition packet cadence.
+
+**Why:** The live-call regression user reported for Phase 5 matched a burst+gap pattern: Phone Link reads Cable B via WASAPI shared at a much shorter period than our transport refresh and sees silence packets during the gap. Reverting the transport site is the smallest-surface fix while retaining the Phase 5 scaffold for future experiments.
+
+**Test result (Phase 5c run1, 2026-04-15 18:42):**
+- Driver: signed .sys `81e020f0...` (= signtool output from build `cb9160...`)
+- 4-point capture saved as `results/bugb_runtime/livecall/phase5c_wip_run1_{A,B}_{spk,mic}.wav`
+- Cable fidelity (recording): clean on all four points
+- Phone-side subjective: **"녹음파일은 깨끗한데 통화음질은 깨끗하지 않았음"** — phone chopping still present
+- Conclusion: Phase 5c does NOT fix pre-existing phone-side chopping. Same pattern as Phase 1 (06751aa) and Phase 4 (439bbcd). Phase 5 series (render ownership cadence) is not the right surface for this bug. Next probe direction: Cable B mic capture side / Phone Link read cadence vs our write burst pattern mismatch.
+
+---
+
+## 2026-04-14 — G4 B1: Render prefill diagnostic gate (UNCOMMITTED, working tree only)
+
+**Files changed:**
+- `Source/Utilities/loopback.h` — new `FramePipePrefillIfEmpty()` declaration in a dedicated "G4 B1" comment block, physically separated from Phase 1/3/5 sections so independent `git restore` works against the G2 instrumentation block.
+- `Source/Utilities/loopback.cpp` — new `FramePipePrefillIfEmpty()` helper placed right after `FramePipeUnregisterFormat()`. Guards on `FillFrames == 0` under `PipeLock` (empty-ring only; Speaker STOP/RUN ring persistence is respected — no stacking on existing data). Prefill size = `max(TargetFillFrames/2, PipeSampleRate/8)`, clamped to `CapacityFrames - 1`. Content is zero (silence cushion). Wrap-safe ring write mirrors `FramePipeWriteFrames` layout. One DbgPrint on successful prefill. PASSIVE_LEVEL entry, locks internally.
+- `Source/Main/minwavertstream.cpp` — `SetState(KSSTATE_RUN)` cable branch: call `FramePipePrefillIfEmpty(pFP)` immediately after `FramePipeRegisterFormat()` for the speaker direction only (`fpIsSpeaker == TRUE`). Capture direction untouched.
+- `results/g4_b1_prefill_proposal.md` — proposal locked before implementation; §§1-10 filled, §11 measurement results pending.
+
+**What:** G4 B1 adds a one-shot zero-fill silence cushion of ~125 ms (at 48 kHz default) on each cable speaker `SetState(KSSTATE_RUN)` transition where the pipe ring is empty. Positioned as a **diagnostic gate**, not a fix: its purpose is to resolve whether the near-zero trough / occasional `dUnderrun` pattern from G2 (Cable B trough 17 frames, dUnderrun 2 and 9) is recoverable with a standing cushion, or whether it requires a structural change to `FP_DEFAULT_TARGET_FILL` (B2).
+
+**Why:** G3 §12 established pump ownership (`Flags=0x00000007`, `LegacyDrv=0`) and order-of-magnitude pump fire rate (~7-8 Hz → ~130 ms inter-fire interval). Against a 1 ms reader drain, that gives ~6240 frames drained per pump cycle, which is larger than the default `TargetFillFrames = 3584`. A `TargetFillFrames/2 = 1792` frame prefill would be too small to cover even one cycle and would produce an ambiguous B1 result. Raising the floor to `SampleRate/8 = 6000` frames (~125 ms) sizes the cushion to approximately one pump inter-fire interval, making B1's result a crisp yes/no on B2 necessity.
+
+**Empty-ring guard rationale:** `FramePipeRegisterFormat` explicitly does not reset the ring on Speaker re-register (persistent ring across STOP/RUN gaps per VB-Cable behavior). Unconditional prefill would stack on top of persisted data. `StartPhaseComplete` is initialized to `TRUE` in `FramePipeInit` and therefore cannot be used as a first-RUN flag. `FillFrames == 0` under `PipeLock` is the correct guard.
+
+**Commit posture:** UNCOMMITTED. B1 stays in the working tree alongside the existing G2 1s-window instrumentation until the B1 measurement run (§ 11 of the proposal) resolves the go/no-go for B2. Phase 6 remains BLOCKED.
+
+**Physical separation from G2 instrumentation:** B1 code lives in its own header block (new comment section after `FramePipeUnregisterFormat`) and its own function block in `loopback.cpp` (new `#pragma code_seg("PAGE")` stanza after `FramePipeUnregisterFormat`). It does not touch `DbgQpcTicksPerSecond`, `DbgFillAtLastPrint`, `DbgDropAtLastPrint`, or `DbgUnderrunAtLastPrint`, so G2 can be `git restore`-d independently.
+
 ## 2026-04-14 — Phase 5: Pump owns cable render transport (IOCTL-gated runtime rollback)
 
 **Files changed:**

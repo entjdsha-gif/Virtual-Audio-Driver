@@ -1,5 +1,12 @@
 # AO Virtual Cable - Claude Instructions (Fixed Pipe Rewrite)
 
+## Opinion Rule (엄수)
+
+- 사용자가 실행을 지시해도, Claude에게 **더 나은 의견 또는 개선안이 있다면 반드시 실행 전에 먼저 말할 것**.
+- 침묵하고 시키는 대로만 실행하지 말 것. 개선 여지가 보이면 짧게라도 대안을 제시한 뒤, 사용자의 판단을 받고 진행.
+- 개선안이 없다면 바로 진행해도 됨. 즉 이 규칙은 "의견이 있을 때 감추지 말라"는 규칙이지, 매번 의견을 억지로 만들라는 규칙이 아님.
+- 적용 범위: 설계, 계측, 수정, 빌드, 설치, 테스트, commit, 어떤 단계든.
+
 ## Current Branching Rule
 
 - Current implementation branch: `feature/ao-fixed-pipe-rewrite`
@@ -92,6 +99,17 @@ When changing stream-status diagnostics, update these together:
 - `test_stream_monitor.py`
 
 Do not trust hardcoded struct offsets without re-verifying layout.
+
+## Experiment Commit Rule (엄수)
+
+모든 실험은 진행하면서 commit 한다. 나중에 어느 phase/commit에서 어떤 결과가 나왔는지 찾아야 하므로:
+
+- **Source/test/config 변경은 실험 단위로 commit** — batch하지 말고 한 실험 끝나면 바로 commit
+- **실험 결과 파일명에 commit 식별자 붙이기**: `<phase>_<shorthash>_<test>_<point>.<ext>`
+  - 예: `phase5c_wip_run1_A_spk.wav` (commit이 없는 WIP은 `wip`, 또는 `<phase>_<shorthash>_...`)
+- **결과 파일도 commit** — wav/log/md 전부 repo에 포함 (대용량 우려 시 사용자에게 먼저 확인)
+- **memory에도 요약**: `project_remaining_tasks.md`에 phase별 결과 섹션 추가 (어느 commit에서 어떤 판정을 받았는지)
+- **git merge policy 병행**: 브랜치 생성/merge/rebase/push는 여전히 사전 보고 필요. 단순 commit은 이 규칙 아래서 proactive로 진행 가능.
 
 ## Changelog Rule
 
