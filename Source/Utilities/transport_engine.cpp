@@ -65,6 +65,16 @@
 // cap-hit diagnostic; it is not a "dropped frames" counter.
 #define AO_TE_MAX_OVERDUE_TICKS                  8U
 
+// --- Phase 6 Option Y cable advance constants ---
+// Defined up here (not next to the Y1B helper body below) because
+// AoTransportAllocStreamRt seeds rt->FadeSampleCounter with
+// AO_CABLE_FADE_PREFIX_LEN in Y1C and needs the symbol visible.
+#define AO_CABLE_MIN_FRAMES_GATE      8U     // VB: cmp ebx,8; jl end
+#define AO_CABLE_REBASE_SHIFT         7U     // VB: shl r8d,7 (127-frame rebase)
+#define AO_CABLE_OVERRUN_DIVISOR      2U     // VB: sampleRate/2 (0.5s stall reject)
+#define AO_CABLE_FADE_PREFIX_LEN      96     // FadeSampleCounter starts at -96
+#define AO_CABLE_FADE_TABLE_SIZE      96     // clamp index 0..95 (VB cmovg r11d=0x5F)
+
 //=============================================================================
 // Global singleton. Not exported — all access goes through the public API in
 // transport_engine.h so call sites never take a pointer to this directly.
@@ -232,6 +242,15 @@ AoTransportAllocStreamRt(CMiniportWaveRTStream* stream)
     rt->Stream = stream;
     rt->Active = FALSE;
     rt->RefCount = 1;   // stream owner holds the initial ref
+
+    // Phase 6 Y1C: explicit fade counter init. RtlZeroMemory already
+    // leaves this at 0, but the helper interprets 0 as "saturated unity"
+    // (idx = 0 + 96 clamped to 95 = full gain). Seeding to -AO_CABLE_FADE_
+    // PREFIX_LEN so the first audible packet boundary (Y2) starts at the
+    // silence prefix and ramps up cleanly. Harmless while the helper is
+    // shadow-only, makes the intent explicit.
+    rt->FadeSampleCounter = -(LONG)AO_CABLE_FADE_PREFIX_LEN;
+
     return rt;
 }
 
@@ -470,6 +489,20 @@ AoTransportOnStopEx(AO_STREAM_RT* rt)
 
     KeReleaseSpinLock(&g_AoTransportEngine.Lock, old);
 
+    // Phase 6 Y1C: reset Y cable runtime fields on STOP. Matches the VB
+    // 669c caller-side pattern — clears DMA cursor, monotonic counters,
+    // anchor QPC, published frames, and fade state, while preserving
+    // notify fields (NotifyBoundaryBytes/NotifyArmed/NotifyFired) across
+    // STOP/resume cycles per VB parity (verified in §9.6).
+    //
+    // Only cable streams have Y runtime fields populated — non-cable
+    // Step 1 streams use a disjoint field set, so the reset is harmless
+    // for them too, but gated on IsCable to keep intent clear.
+    if (rt->IsCable)
+    {
+        AoCableResetRuntimeFields(rt);
+    }
+
     // Cancel the timer outside the spinlock. ExCancelTimer is safe at
     // PASSIVE_LEVEL and must not hold another spinlock.
     if (shouldCancelTimer && g_AoTransportEngine.Timer != NULL)
@@ -528,9 +561,6 @@ AoComputeFramesForEvent(AO_STREAM_RT* rt)
 static VOID
 AoRunRenderEvent(AO_STREAM_RT* rt, LONGLONG qpc)
 {
-    UNREFERENCED_PARAMETER(qpc);
-    UNREFERENCED_PARAMETER(rt);
-
     // Phase 6 "Option Z" revert: render transport runs from
     // CMiniportWaveRTStream::UpdatePosition's legacy ReadBytes path,
     // to restore the coupled update-chain-and-transport invariant that
@@ -542,6 +572,16 @@ AoRunRenderEvent(AO_STREAM_RT* rt, LONGLONG qpc)
     //
     // Prior body of this function (DmaProducedMono anchored render
     // transport) preserved in git history at commit a8ac0fb.
+
+    // Phase 6 Y1C shadow hook-up: invoke the canonical helper in
+    // shadow mode so the shared timer path is a visible call source
+    // for the Y1C gate. The helper updates only shadow state; legacy
+    // render transport (ReadBytes via UpdatePosition) remains the
+    // audible owner until Y2 retires it.
+    if (rt != NULL && rt->IsCable)
+    {
+        AoCableAdvanceByQpc(rt, (ULONGLONG)qpc, AO_ADVANCE_TIMER_RENDER, 0);
+    }
 }
 
 // AoRunCaptureEvent — fill the capture DMA with pipe content up to the
@@ -569,9 +609,6 @@ AoRunRenderEvent(AO_STREAM_RT* rt, LONGLONG qpc)
 static VOID
 AoRunCaptureEvent(AO_STREAM_RT* rt, LONGLONG qpc)
 {
-    UNREFERENCED_PARAMETER(qpc);
-    UNREFERENCED_PARAMETER(rt);
-
     // Phase 6 "Option Z" revert: capture transport runs from
     // CMiniportWaveRTStream::UpdatePosition's legacy WriteBytes path.
     // See AoRunRenderEvent above for rationale — Option Y will replace
@@ -581,6 +618,16 @@ AoRunCaptureEvent(AO_STREAM_RT* rt, LONGLONG qpc)
     // Prior body (DmaProducedMono-anchored capture runner with startup
     // state machine and underrun counter) preserved in git history at
     // commit a8ac0fb.
+
+    // Phase 6 Y1C shadow hook-up: invoke the canonical helper in
+    // shadow mode so the shared timer capture path is a visible call
+    // source for the Y1C gate. Shadow bookkeeping only; legacy capture
+    // transport (WriteBytes via UpdatePosition) remains the audible
+    // owner until Y3 retires it.
+    if (rt != NULL && rt->IsCable)
+    {
+        AoCableAdvanceByQpc(rt, (ULONGLONG)qpc, AO_ADVANCE_TIMER_CAPTURE, 0);
+    }
 }
 
 //=============================================================================
@@ -787,14 +834,10 @@ AoTransportTimerCallback(
 // Work order:     docs/PHASE6_Y_IMPLEMENTATION_WORK_ORDER.md §Y1B
 //=============================================================================
 
-// --- Canonical advance constants (VB 6320 direct translation) ---
-#define AO_CABLE_MIN_FRAMES_GATE      8U     // VB: cmp ebx,8; jl end (8-frame minimum)
-#define AO_CABLE_REBASE_SHIFT         7U     // VB: shl r8d,7  (127-frame anchor rebase)
-#define AO_CABLE_OVERRUN_DIVISOR      2U     // VB: sampleRate/2 (0.5s stall reject)
-#define AO_CABLE_FADE_PREFIX_LEN      96     // FadeSampleCounter starts at -96
-#define AO_CABLE_FADE_TABLE_SIZE      96     // clamp index 0..95 (VB cmovg r11d=0x5F)
-
 // --- Fade-in envelope (VB +0x12a60 direct copy, 96 entries × int32) ---
+// Advance constants (AO_CABLE_MIN_FRAMES_GATE etc.) are defined near the
+// top of this file next to the Step 1 AO_TE_* constants, so Y1C's
+// AoTransportAllocStreamRt can reference AO_CABLE_FADE_PREFIX_LEN.
 //
 // Indexed by (FadeSampleCounter + 96) clamped to [0, 95]. Values are
 // 7-bit fixed-point gains: `sample = (sample * table[idx]) >> 7`.

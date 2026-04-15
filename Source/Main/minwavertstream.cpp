@@ -880,6 +880,25 @@ NTSTATUS CMiniportWaveRTStream::GetPosition
         //
         LARGE_INTEGER ilQPC = KeQueryPerformanceCounter(NULL);
         UpdatePosition(ilQPC);
+
+        // Phase 6 Y1C shadow hook-up: invoke the canonical cable advance
+        // helper in shadow mode so GetPosition becomes a visible Y1C
+        // call source. Cable streams only; non-cable MSVAD streams have
+        // no Y runtime fields populated. The helper's return values are
+        // intentionally NOT consumed — Position_->PlayOffset / WriteOffset
+        // below still reflect the legacy UpdatePosition output (legacy
+        // authoritative until Y2/Y3 retire the legacy path).
+        if (m_pTransportRt && m_pMiniport &&
+            (m_pMiniport->m_DeviceType == eCableASpeaker ||
+             m_pMiniport->m_DeviceType == eCableBSpeaker ||
+             m_pMiniport->m_DeviceType == eCableAMic      ||
+             m_pMiniport->m_DeviceType == eCableBMic))
+        {
+            AoCableAdvanceByQpc(m_pTransportRt,
+                                (ULONGLONG)ilQPC.QuadPart,
+                                AO_ADVANCE_QUERY,
+                                0);
+        }
     }
 
     Position_->PlayOffset = m_ullPlayPosition;
@@ -888,7 +907,7 @@ NTSTATUS CMiniportWaveRTStream::GetPosition
     KeReleaseSpinLock(&m_PositionSpinLock, oldIrql);
 
     ntStatus = STATUS_SUCCESS;
-    
+
     return ntStatus;
 }
 
@@ -1157,6 +1176,24 @@ NTSTATUS CMiniportWaveRTStream::GetPositions(
         // Same-call placement keeps m_ulLastUpdatePositionByteDisplacement
         // fresh and stays under m_PositionSpinLock. No transport mutation.
         PumpToCurrentPositionFromQuery(ilQPC);
+
+        // Phase 6 Y1C shadow hook-up: GetPositions is the confirmed hot
+        // query path. Invoke the canonical helper in shadow mode so Y1C
+        // diagnostic counters register this call source. Return values
+        // (*_pullLinearBufferPosition etc.) below still come from the
+        // legacy m_ullLinearPosition that UpdatePosition just updated —
+        // legacy authoritative until Y2/Y3 retire it.
+        if (m_pTransportRt && m_pMiniport &&
+            (m_pMiniport->m_DeviceType == eCableASpeaker ||
+             m_pMiniport->m_DeviceType == eCableBSpeaker ||
+             m_pMiniport->m_DeviceType == eCableAMic      ||
+             m_pMiniport->m_DeviceType == eCableBMic))
+        {
+            AoCableAdvanceByQpc(m_pTransportRt,
+                                (ULONGLONG)ilQPC.QuadPart,
+                                AO_ADVANCE_QUERY,
+                                0);
+        }
     }
     if (_pullLinearBufferPosition)
     {
