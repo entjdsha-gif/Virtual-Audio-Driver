@@ -18,7 +18,36 @@
 #include "transport_engine.h"
 
 #define AO_TE_POOL_TAG              'eTOA'      // 'AOTe' little-endian
-#define AO_TE_DEFAULT_EVENT_PERIOD_100NS  (200000LL)   // 20 ms in 100ns units
+
+//
+// Unit discipline: internal constants are expressed as frame counts at a
+// reference sample rate. Per-stream values are scaled from the reference
+// using the stream's actual SampleRate — never via a millisecond step.
+//
+// The Windows kernel timer API (ExSetTimer) requires 100ns units on its
+// boundary, so the reference frame count is converted to 100ns exactly once
+// during Init. That is the only place a 100ns-valued literal appears in the
+// engine, and it is derived from the frame constant, not the other way
+// around.
+//
+// AO_TE_REFERENCE_RATE is the reference rate used to express the other
+// constants below. 48000 Hz is chosen because the vast majority of AO cable
+// clients negotiate 48 kHz; the engine scales to non-48k streams at RUN time.
+//
+// AO_TE_EVENT_FRAMES_AT_REF is the shared-timer event quantum at the
+// reference rate. 960 frames @ 48000 Hz is the VB-Cable-equivalent cadence
+// step; expressing it as frames keeps the constant invariant under rate
+// changes.
+//
+// AO_TE_STARTUP_THRESHOLD_FRAMES_AT_REF / AO_TE_STARTUP_TARGET_FRAMES_AT_REF
+// are the capture startup cushion values from PHASE6_PLAN.md §6, also in
+// frames. Step 4 will tune these; Step 1 seeds them so the runtime has
+// sensible defaults for the no-op callback path.
+//
+#define AO_TE_REFERENCE_RATE                 48000U
+#define AO_TE_EVENT_FRAMES_AT_REF              960U   // 20 ms-equivalent @ 48k, stored as frames
+#define AO_TE_STARTUP_THRESHOLD_FRAMES_AT_REF  960U
+#define AO_TE_STARTUP_TARGET_FRAMES_AT_REF    1440U
 
 //=============================================================================
 // Global singleton. Not exported — all access goes through the public API in
@@ -36,18 +65,30 @@ static EXT_CALLBACK AoTransportTimerCallback;
 // once on init and reuse it for all period conversions.
 //=============================================================================
 static LONGLONG g_AoTeQpcFrequency = 0;
+static LONGLONG g_AoTeEventPeriod100ns = 0;    // derived from frames at boundary
 
+// frames_at_rate -> QPC ticks (samples-only, no ms step)
 static LONGLONG
-AoTePeriod100nsToQpc(LONGLONG period100ns)
+AoTeFramesToQpc(ULONG frames, ULONG sampleRate)
 {
-    // period_qpc = period_100ns * qpc_freq / 10_000_000
-    // Guard: if qpc_freq isn't known yet, return the period as-is so caller
-    // can still do a sane comparison without dividing by zero.
-    if (g_AoTeQpcFrequency <= 0)
+    if (g_AoTeQpcFrequency <= 0 || sampleRate == 0)
     {
-        return period100ns;
+        return 0;
     }
-    return (period100ns * g_AoTeQpcFrequency) / 10000000LL;
+    return ((LONGLONG)frames * g_AoTeQpcFrequency) / (LONGLONG)sampleRate;
+}
+
+// Scale a frame count from the engine's reference rate to an arbitrary
+// stream rate. Used to translate AO_TE_*_FRAMES_AT_REF constants into the
+// per-stream FramesPerEvent / StartupThresholdFrames values. No ms step.
+static ULONG
+AoTeScaleFramesToStreamRate(ULONG refFrames, ULONG streamSampleRate)
+{
+    if (streamSampleRate == 0 || AO_TE_REFERENCE_RATE == 0)
+    {
+        return refFrames;
+    }
+    return (ULONG)(((ULONGLONG)refFrames * streamSampleRate) / AO_TE_REFERENCE_RATE);
 }
 
 //=============================================================================
@@ -70,8 +111,18 @@ AoTransportEngineInit(VOID)
     KeQueryPerformanceCounter(&qpcFreq);
     g_AoTeQpcFrequency = qpcFreq.QuadPart;
 
+    // Derive the engine period in QPC ticks from the reference frame count.
+    // This is the authoritative period in the engine's scheduling domain.
     g_AoTransportEngine.PeriodQpc =
-        AoTePeriod100nsToQpc(AO_TE_DEFAULT_EVENT_PERIOD_100NS);
+        AoTeFramesToQpc(AO_TE_EVENT_FRAMES_AT_REF, AO_TE_REFERENCE_RATE);
+
+    // Also derive the 100ns equivalent of that period for ExSetTimer, which
+    // only accepts 100ns units. This is the *only* place in the engine that
+    // a 100ns literal appears, and it is computed from the frame constant —
+    // never hard-coded. Rounded up to the nearest 100ns to avoid under-period
+    // ticks that would accumulate drift.
+    g_AoTeEventPeriod100ns =
+        ((LONGLONG)AO_TE_EVENT_FRAMES_AT_REF * 10000000LL) / AO_TE_REFERENCE_RATE;
 
     // EX_TIMER_HIGH_RESOLUTION is Win8.1+. Our minimum target is already
     // Win10 so this is safe unconditionally.
@@ -133,72 +184,14 @@ AoTransportEngineCleanup(VOID)
 }
 
 //=============================================================================
-// AoTransportRegisterStream — allocate and attach a per-stream runtime. The
-// caller (CMiniportWaveRTStream) stores the returned pointer in its own
-// m_pTransportRt member and owns its lifetime.
-//
-// Step 1 does NOT start the timer from here — see AoTransportOnRun.
-//=============================================================================
-NTSTATUS
-AoTransportRegisterStream(CMiniportWaveRTStream* stream)
-{
-    if (stream == NULL)
-    {
-        return STATUS_INVALID_PARAMETER;
-    }
-    if (!g_AoTransportEngine.Initialized)
-    {
-        return STATUS_DEVICE_NOT_READY;
-    }
-
-    AO_STREAM_RT* rt = (AO_STREAM_RT*)ExAllocatePool2(
-        POOL_FLAG_NON_PAGED,
-        sizeof(AO_STREAM_RT),
-        AO_TE_POOL_TAG);
-
-    if (rt == NULL)
-    {
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-
-    RtlZeroMemory(rt, sizeof(*rt));
-    InitializeListHead(&rt->Link);
-    rt->Stream = stream;
-    rt->Active = FALSE;
-
-    // We do NOT link into ActiveStreams yet — OnRun is the entry point for
-    // scheduling visibility. Register just allocates and attaches ownership
-    // to the stream.
-
-    // Step 2 will extend this to reach into the stream object (via a public
-    // accessor) to set the pointer. For Step 1 the caller is expected to
-    // receive the pointer via its own m_pTransportRt assignment path.
-
-    DbgPrint("[AoTransport] register stream=%p rt=%p\n", stream, rt);
-
-    // Hand the allocation back to the caller via the stream's own field —
-    // see minwavertstream.cpp wiring. We return STATUS_SUCCESS here and
-    // trust the caller to install the pointer. If the caller doesn't, the
-    // allocation leaks until driver teardown; Step 2 tightens this contract.
-    //
-    // NOTE: a true public setter would be cleaner. Step 1 keeps the wiring
-    // minimal so the skeleton is easy to bisect if something goes wrong.
-
-    // We can't access the stream object's private members from here without
-    // pulling in the full miniport header, and that header pulls half the
-    // WDM world in. For Step 1 we use an out-parameter shim instead — see
-    // the companion AoTransportAllocStreamRt helper below.
-    ExFreePoolWithTag(rt, AO_TE_POOL_TAG);
-    return STATUS_NOT_IMPLEMENTED;
-}
-
-//=============================================================================
 // AoTransportAllocStreamRt / AoTransportFreeStreamRt — low-level helpers the
 // stream class uses to allocate and free its own AO_STREAM_RT without the
 // engine needing to touch private stream members.
 //
 // Rationale: keeps include graph clean. transport_engine.cpp only knows
 // about AO_STREAM_RT and a forward-declared CMiniportWaveRTStream pointer.
+// The non-"Ex" stream-pointer façade from the Step 1 draft was removed —
+// the Ex surface is now the only public lifecycle API.
 //=============================================================================
 extern "C" AO_STREAM_RT*
 AoTransportAllocStreamRt(CMiniportWaveRTStream* stream)
@@ -254,30 +247,19 @@ AoTransportFreeStreamRt(AO_STREAM_RT* rt)
 }
 
 //=============================================================================
-// AoTransportUnregisterStream — remove the stream from engine view. The
-// stream's AO_STREAM_RT buffer is freed here.
-//=============================================================================
-VOID
-AoTransportUnregisterStream(CMiniportWaveRTStream* stream)
-{
-    // The engine only holds a non-owning link via the AO_STREAM_RT. Callers
-    // wanting to actually free the allocation must call AoTransportFreeStreamRt
-    // on their own m_pTransportRt. This function exists as a symmetry to
-    // Register and is a placeholder for Step 2+ bookkeeping.
-    UNREFERENCED_PARAMETER(stream);
-}
-
-//=============================================================================
-// AoTransportOnRun — stream transitioned to KSSTATE_RUN. Step 1 action:
-//   - snapshot format fields from the stream (via accessors, not direct)
+// AoTransportOnRunEx — stream transitioned to KSSTATE_RUN.
+//
+// Actions:
+//   - snapshot format fields into the runtime struct
+//   - compute FramesPerEvent at the stream's own sample rate from the
+//     reference frame-per-event constant (samples-only, no ms step)
 //   - link into ActiveStreams
-//   - arm StartupArmed = TRUE (for capture)
-//   - first active stream starts the timer
+//   - arm StartupArmed for capture direction
+//   - first active stream arms the shared timer
+//
+// AO_STREAM_SNAPSHOT is declared in transport_engine.h so stream-side
+// callers and the engine share the definition.
 //=============================================================================
-
-// AO_STREAM_SNAPSHOT is declared in transport_engine.h — stream-side callers
-// and the engine share the same definition via that header.
-
 extern "C" VOID
 AoTransportOnRunEx(const AO_STREAM_SNAPSHOT* snapshot)
 {
@@ -298,13 +280,15 @@ AoTransportOnRunEx(const AO_STREAM_SNAPSHOT* snapshot)
     rt->Channels      = snapshot->Channels;
     rt->BlockAlign    = snapshot->BlockAlign;
 
-    // Step 1: event-size tuning is a non-goal. We seed FramesPerEvent at
-    // (SampleRate * 20 / 1000) so the field has a reasonable default for
-    // Step 3/4 to start from, but it is NOT used for anything yet because
-    // the callback is a no-op.
+    // Samples-only seeding: scale the reference frame constants to this
+    // stream's actual rate. The engine period in QPC is the same for every
+    // stream (shared timer), but each stream may have a different
+    // FramesPerEvent count because the stream rate can differ from the
+    // reference rate (e.g. 44.1k cable consumer reading a 48k pipe).
     if (rt->SampleRate > 0)
     {
-        rt->FramesPerEvent = (rt->SampleRate * 20) / 1000;
+        rt->FramesPerEvent =
+            AoTeScaleFramesToStreamRate(AO_TE_EVENT_FRAMES_AT_REF, rt->SampleRate);
         rt->BytesPerEvent  = rt->FramesPerEvent * rt->BlockAlign;
         rt->EventPeriodQpc = g_AoTransportEngine.PeriodQpc;
 
@@ -313,12 +297,16 @@ AoTransportOnRunEx(const AO_STREAM_SNAPSHOT* snapshot)
     }
 
     // Arm startup for capture side. Render side does not use the startup
-    // gate. Threshold is a placeholder that Step 4 will tune.
+    // gate. Thresholds come from the reference frame constants, scaled to
+    // the stream's sample rate. Step 4 tunes the actual numbers; Step 1
+    // just seeds them so the runtime struct has sensible defaults.
     if (rt->IsCapture)
     {
         rt->StartupArmed = TRUE;
-        rt->StartupThresholdFrames = (rt->SampleRate * 20) / 1000;
-        rt->StartupTargetFrames    = (rt->SampleRate * 30) / 1000;
+        rt->StartupThresholdFrames =
+            AoTeScaleFramesToStreamRate(AO_TE_STARTUP_THRESHOLD_FRAMES_AT_REF, rt->SampleRate);
+        rt->StartupTargetFrames    =
+            AoTeScaleFramesToStreamRate(AO_TE_STARTUP_TARGET_FRAMES_AT_REF, rt->SampleRate);
     }
     else
     {
@@ -336,16 +324,18 @@ AoTransportOnRunEx(const AO_STREAM_SNAPSHOT* snapshot)
     rt->Active = TRUE;
 
     // First active stream arms the timer. Subsequent streams just link in.
+    // g_AoTeEventPeriod100ns was computed from the reference frame constant
+    // during Init — it is the single boundary where the engine interacts
+    // with the Windows 100ns unit system. Everything upstream/downstream of
+    // this line is in frames or QPC ticks.
     if (!g_AoTransportEngine.Running && g_AoTransportEngine.Timer != NULL)
     {
-        // ExSetTimer takes the due time in negative 100ns units (relative).
-        // Period is positive 100ns units.
         LARGE_INTEGER dueTime;
-        dueTime.QuadPart = -AO_TE_DEFAULT_EVENT_PERIOD_100NS;
+        dueTime.QuadPart = -g_AoTeEventPeriod100ns;
         (VOID)ExSetTimer(
             g_AoTransportEngine.Timer,
             dueTime.QuadPart,
-            AO_TE_DEFAULT_EVENT_PERIOD_100NS,
+            g_AoTeEventPeriod100ns,
             NULL);
         g_AoTransportEngine.Running = TRUE;
         DbgPrint("[AoTransport] timer armed\n");
@@ -358,20 +348,8 @@ AoTransportOnRunEx(const AO_STREAM_SNAPSHOT* snapshot)
         rt->SampleRate, rt->FramesPerEvent);
 }
 
-// Thin wrapper kept for public API symmetry — real work is in OnRunEx which
-// takes the accessor snapshot.
-VOID
-AoTransportOnRun(CMiniportWaveRTStream* stream)
-{
-    // Step 1: OnRun is called from minwavertstream.cpp via OnRunEx directly
-    // with the snapshot already filled. The stream-pointer overload exists
-    // only because the public header declares it; it is a no-op here so the
-    // caller contract stays header-only.
-    UNREFERENCED_PARAMETER(stream);
-}
-
 //=============================================================================
-// AoTransportOnPause — stream paused. Flip Active flag off, keep link.
+// AoTransportOnPauseEx — stream paused. Flip Active flag off, keep link.
 //=============================================================================
 extern "C" VOID
 AoTransportOnPauseEx(AO_STREAM_RT* rt)
@@ -389,16 +367,14 @@ AoTransportOnPauseEx(AO_STREAM_RT* rt)
     DbgPrint("[AoTransport] OnPause rt=%p\n", rt);
 }
 
-VOID
-AoTransportOnPause(CMiniportWaveRTStream* stream)
-{
-    UNREFERENCED_PARAMETER(stream);
-}
-
 //=============================================================================
-// AoTransportOnStop — stream fully stopped. Detach from active list, clear
+// AoTransportOnStopEx — stream fully stopped. Detach from active list, clear
 // Active flag. Does NOT free the AO_STREAM_RT — that is the stream
 // destructor's responsibility via AoTransportFreeStreamRt.
+//
+// If this was the last active stream, cancel the shared timer so we don't
+// churn DPCs indefinitely after all streams are gone. The timer is re-armed
+// on the next OnRunEx via the same Running flag check.
 //=============================================================================
 extern "C" VOID
 AoTransportOnStopEx(AO_STREAM_RT* rt)
@@ -407,6 +383,8 @@ AoTransportOnStopEx(AO_STREAM_RT* rt)
     {
         return;
     }
+
+    BOOLEAN shouldCancelTimer = FALSE;
 
     KIRQL old;
     KeAcquireSpinLock(&g_AoTransportEngine.Lock, &old);
@@ -423,19 +401,23 @@ AoTransportOnStopEx(AO_STREAM_RT* rt)
         InitializeListHead(&rt->Link);
     }
 
-    // If this was the last active stream, we could cancel the timer here to
-    // save power. Step 1 keeps the timer running once armed; Step 2 or later
-    // can add graceful cancel.
+    if (g_AoTransportEngine.ActiveStreamCount == 0 && g_AoTransportEngine.Running)
+    {
+        shouldCancelTimer = TRUE;
+        g_AoTransportEngine.Running = FALSE;
+    }
 
     KeReleaseSpinLock(&g_AoTransportEngine.Lock, old);
 
-    DbgPrint("[AoTransport] OnStop rt=%p\n", rt);
-}
+    // Cancel the timer outside the spinlock. ExCancelTimer is safe at
+    // PASSIVE_LEVEL and must not hold another spinlock.
+    if (shouldCancelTimer && g_AoTransportEngine.Timer != NULL)
+    {
+        (VOID)ExCancelTimer(g_AoTransportEngine.Timer, NULL);
+        DbgPrint("[AoTransport] timer cancelled (last stream stopped)\n");
+    }
 
-VOID
-AoTransportOnStop(CMiniportWaveRTStream* stream)
-{
-    UNREFERENCED_PARAMETER(stream);
+    DbgPrint("[AoTransport] OnStop rt=%p\n", rt);
 }
 
 //=============================================================================

@@ -111,35 +111,35 @@ NTSTATUS AoTransportEngineInit(VOID);
 // ExDeleteTimer's Wait parameter, and zeros the engine. Idempotent.
 VOID     AoTransportEngineCleanup(VOID);
 
-// Allocate (if needed) and register a stream's runtime state with the engine.
-// The stream takes ownership of the returned AO_STREAM_RT via its own
-// m_pTransportRt member — the engine only holds a non-owning link pointer.
-NTSTATUS AoTransportRegisterStream(CMiniportWaveRTStream* stream);
-
-// Detach the stream from the engine and free its runtime state. Safe to call
-// even if the stream was never registered.
-VOID     AoTransportUnregisterStream(CMiniportWaveRTStream* stream);
-
-// Lifecycle hooks called from CMiniportWaveRTStream::SetState transitions.
-// Step 1: these set the Active flag and update the active list; no data
-// movement, no timer tick scheduling side effects beyond engine registration.
-VOID     AoTransportOnRun(CMiniportWaveRTStream* stream);
-VOID     AoTransportOnPause(CMiniportWaveRTStream* stream);
-VOID     AoTransportOnStop(CMiniportWaveRTStream* stream);
-
 //=============================================================================
-// Stream accessor shims
-//
-// The public API above takes CMiniportWaveRTStream* so adapter-side / test
-// code can use it without knowing the runtime struct layout. The stream
-// class itself owns AO_STREAM_RT and needs direct access to it during RUN /
-// PAUSE / STOP and in the destructor. The "Ex" variants below take the
-// runtime pointer directly and skip the stream lookup.
+// Per-stream lifecycle API
 //
 // AO_STREAM_SNAPSHOT is the minimum set of stream facts the engine needs to
-// populate a new AO_STREAM_RT on first RUN, kept separate so the stream
-// class does not have to expose its internals through a header pulled into
-// the engine TU.
+// populate a new AO_STREAM_RT on first RUN. The stream owns its AO_STREAM_RT
+// allocation via its own m_pTransportRt member; the engine only holds a
+// non-owning Link pointer.
+//
+// Usage from CMiniportWaveRTStream::SetState:
+//
+//   // on RUN:
+//   if (m_pTransportRt == NULL)
+//       m_pTransportRt = AoTransportAllocStreamRt(this);
+//   AoTransportOnRunEx(&snapshotWithRt);
+//
+//   // on PAUSE:
+//   AoTransportOnPauseEx(m_pTransportRt);
+//
+//   // on STOP:
+//   AoTransportOnStopEx(m_pTransportRt);
+//
+//   // on destructor (after KeFlushQueuedDpcs):
+//   AoTransportOnStopEx(m_pTransportRt);
+//   AoTransportFreeStreamRt(m_pTransportRt);
+//
+// This "Ex" surface is the only lifecycle API Phase 6 exposes. An earlier
+// Step 1 draft had a stream-pointer variant that looked up the runtime via
+// the stream, but that caused the engine TU to need private miniport
+// internals; the snapshot-and-rt-pointer pattern avoids that entirely.
 //=============================================================================
 typedef struct _AO_STREAM_SNAPSHOT {
     AO_STREAM_RT*  Rt;
