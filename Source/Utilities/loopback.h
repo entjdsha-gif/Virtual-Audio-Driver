@@ -387,6 +387,21 @@ VOID FramePipeReadToDma(
     ULONG           byteCount
 );
 
+// Phase 6 Y3: Ex variant with optional per-stream runtime hook for
+// fade envelope application on capture scratch. rtOpaque is an
+// AO_STREAM_RT* passed through as void*. When non-NULL, the callee
+// invokes AoCableApplyCaptureFadeInScratch(rtOpaque, scratch, ...)
+// between the pipe-read (normalized INT32) and the denormalize-to-DMA
+// step. Legacy FramePipeReadToDma is kept as a thin forward to this
+// function with rtOpaque == NULL so any remaining legacy caller is
+// byte-identical.
+VOID FramePipeReadToDmaEx(
+    PFRAME_PIPE     pPipe,
+    BYTE*           dmaData,
+    ULONG           byteCount,
+    PVOID           rtOpaque        // AO_STREAM_RT* or NULL
+);
+
 //=============================================================================
 // Frame Pipe — Global instances
 //=============================================================================
