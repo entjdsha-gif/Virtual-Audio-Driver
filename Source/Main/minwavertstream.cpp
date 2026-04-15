@@ -2026,23 +2026,12 @@ VOID CMiniportWaveRTStream::UpdatePosition
 
     if (m_bCapture)
     {
-        // Phase 6 Y3: cable mic capture audible ownership now lives
-        // in AoCableAdvanceByQpc -> AoCableReadCaptureToDma inside
-        // the transport engine. The helper reads FRAME_PIPE into its
-        // own scratch, applies the fade envelope, denormalizes to the
-        // client DMA buffer, and publishes DmaProducedMono. Skip the
-        // legacy WriteBytes path for cable mic.
-        //
-        // Non-cable capture streams keep WriteBytes — it zero-fills
-        // the DMA buffer (silence output) for the MSVAD sample / test
-        // device types, same as Phase 4 baseline.
-        CMiniportWaveRT* pMp = m_pMiniport;
-        BOOL isCable = (pMp && (pMp->m_DeviceType == eCableAMic ||
-                                 pMp->m_DeviceType == eCableBMic));
-        if (!isCable)
-        {
-            WriteBytes(ByteDisplacement);
-        }
+        // Phase 6 "Option Z" revert: restore Phase 4 legacy behavior.
+        // Cable mic capture transport runs synchronously from
+        // UpdatePosition via WriteBytes — same reason as the cable
+        // speaker ReadBytes path above. Engine-owned transport is
+        // deferred to the Option Y rework.
+        WriteBytes(ByteDisplacement);
     }
     else
     {
@@ -2106,18 +2095,26 @@ VOID CMiniportWaveRTStream::UpdatePosition
     //
     m_ullLinearPosition += ByteDisplacement;
 
-    // Phase 6 Y3: both cable render (Y2-2) and cable capture (Y3)
-    // DmaProducedMono are now helper-owned. AoCableWriteRenderFromDma
-    // publishes on the render side; AoCableReadCaptureToDma publishes
-    // on the capture side. Legacy must NOT publish here or a dual-
-    // writer race would corrupt the cursor.
+    // Phase 6 Y2-2: publish the new monotonic position for cable
+    // CAPTURE streams only. Cable render DmaProducedMono is now
+    // helper-owned (AoCableWriteRenderFromDma publishes after each
+    // successful pipe write), so the legacy publish must NOT touch
+    // it or we create a dual-writer race on the render cursor.
     //
-    // Non-cable streams never reached this call site and don't have
-    // a transport rt attached anyway, so no special-case needed.
+    // Cable capture is still legacy-owned until Y3 — WriteBytes runs
+    // in the m_bCapture branch above and the capture runner (still
+    // a no-op under Option Z) needs the published linear position
+    // to drive its DMA fill logic.
     //
-    // (Previously this block published for all 4 cable device types;
-    // Y2-2 narrowed it to cable mic only; Y3 removes the remaining
-    // cable mic publish.)
+    // Non-cable streams skip this entirely — they still run on the
+    // legacy ReadBytes/WriteBytes diagnostic path and have no engine
+    // runtime attached.
+    if (m_pTransportRt && m_pMiniport &&
+        (m_pMiniport->m_DeviceType == eCableAMic ||
+         m_pMiniport->m_DeviceType == eCableBMic))
+    {
+        AoTransportPublishProducedBytes(m_pTransportRt, m_ullLinearPosition);
+    }
     
     // Update the DMA time stamp for the next call to GetPosition()
     //

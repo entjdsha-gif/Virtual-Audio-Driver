@@ -366,25 +366,19 @@ AoTransportOnRunEx(const AO_STREAM_SNAPSHOT* snapshot)
     rt->DmaProducedMono  = 0;
     rt->DmaConsumedMono  = 0;
 
-    // Phase 6 Y2-2 / Y3: flip the audible switches for cable streams.
-    // Render migrates in Y2-2 (helper owns DMA -> FRAME_PIPE path).
-    // Capture migrates in Y3 (helper owns FRAME_PIPE -> DMA path).
-    // Both flags are cleared on STOP by AoCableResetRuntimeFields so
-    // pause/resume cycles re-enable them cleanly on the next RUN.
+    // Phase 6 Y2-2: flip the render audible switch on cable render
+    // streams. This promotes AoCableWriteRenderFromDma to the sole
+    // owner of DMA -> FRAME_PIPE transfer for cable render, replacing
+    // the legacy ReadBytes path in CMiniportWaveRTStream::UpdatePosition.
+    // Cleared on STOP via AoCableResetRuntimeFields so pause/resume
+    // cycles re-enable the switch on the next RUN.
     if (rt->IsCable && !rt->IsCapture)
     {
-        rt->RenderAudibleActive  = TRUE;
-        rt->CaptureAudibleActive = FALSE;
-    }
-    else if (rt->IsCable && rt->IsCapture)
-    {
-        rt->RenderAudibleActive  = FALSE;
-        rt->CaptureAudibleActive = TRUE;
+        rt->RenderAudibleActive = TRUE;
     }
     else
     {
-        rt->RenderAudibleActive  = FALSE;
-        rt->CaptureAudibleActive = FALSE;
+        rt->RenderAudibleActive = FALSE;
     }
 
     // Samples-only seeding: scale the reference frame constants to this
@@ -1058,15 +1052,12 @@ AoCableResetRuntimeFields(AO_STREAM_RT* rt)
     // are intentionally NOT reset here — see function header comment for
     // the VB parity verification that led to this rule.
 
-    // Phase 6 Y2-2 / Y3: clear the audible switches on STOP. OnRunEx
-    // re-sets the appropriate one on the next RUN (render for cable
-    // speaker streams, capture for cable mic streams). Also zero
-    // DmaProducedMono — helper is the sole writer for both cable
-    // render (Y2-2) and cable capture (Y3), and a stale post-STOP
-    // value would make the helper read/write wrong DMA offsets after
-    // resume.
-    rt->RenderAudibleActive  = FALSE;
-    rt->CaptureAudibleActive = FALSE;
+    // Phase 6 Y2-2: clear the render audible switch on STOP. OnRunEx
+    // re-sets it for cable render streams on the next RUN. Also zero
+    // DmaProducedMono — helper is the sole writer for cable render in
+    // Y2-2, and a stale post-STOP value would make the helper read
+    // wrong DMA offsets after resume.
+    rt->RenderAudibleActive = FALSE;
     InterlockedExchange64(&rt->DmaProducedMono, 0);
 
     // Fade state — reset so the next audible run starts with a fresh
@@ -1095,24 +1086,6 @@ AoCableResetRuntimeFields(AO_STREAM_RT* rt)
 // know AO_STREAM_RT layout. Safe with NULL rtOpaque.
 extern "C" VOID
 AoCableApplyRenderFadeInScratch(
-    PVOID   rtOpaque,
-    LONG*   scratch,
-    ULONG   sampleCount)
-{
-    if (rtOpaque == NULL)
-    {
-        return;
-    }
-    AO_STREAM_RT* rt = (AO_STREAM_RT*)rtOpaque;
-    AoApplyFadeEnvelope(scratch, sampleCount, &rt->FadeSampleCounter);
-}
-
-// AoCableApplyCaptureFadeInScratch — Y3 symmetric adapter for capture.
-// Called from loopback.cpp's FramePipeReadToDmaEx between the pipe-read
-// and the denormalize-to-DMA steps, so the envelope is applied on
-// capture samples the same way VB 5634 does.
-extern "C" VOID
-AoCableApplyCaptureFadeInScratch(
     PVOID   rtOpaque,
     LONG*   scratch,
     ULONG   sampleCount)
@@ -1231,77 +1204,6 @@ AoCableWriteRenderFromDma(AO_STREAM_RT* rt, ULONG advanceFrames)
     // for cable render in Y2-2, so a single atomic exchange is enough.
     // Skip publish if nothing was written to keep the counter exactly
     // monotonic under pipe-full conditions.
-    if (totalWritten > 0)
-    {
-        ULONGLONG newProduced = oldProduced + totalWritten;
-        InterlockedExchange64(&rt->DmaProducedMono, (LONGLONG)newProduced);
-    }
-}
-
-// AoCableReadCaptureToDma — Y3 capture audible helper.
-//
-// Mirror of AoCableWriteRenderFromDma for the capture direction.
-// Reads advanceFrames worth of samples from the FRAME_PIPE into the
-// client DMA buffer via FramePipeReadToDmaEx (which handles pipe read
-// -> channel map -> envelope -> denormalize -> DMA write in one call).
-//
-// Differences from the render helper:
-//   1. No backpressure. FramePipeReadToDma[Ex] always fills the
-//      requested byte count — underruns are zero-filled internally
-//      by FramePipeReadFrames. So the DMA wrap loop never needs to
-//      break early for partial writes.
-//   2. DmaProducedMono advances by the requested byte count every
-//      tick (no writtenFrames return check), because the client is
-//      the reader and the driver always hands it the full window.
-//   3. Envelope is applied on the pipe-read scratch, same as render.
-//
-// Still reads oldProduced from rt->DmaProducedMono as the entry
-// value and publishes newProduced = oldProduced + advanceBytes at
-// the end via InterlockedExchange64.
-extern "C" VOID
-AoCableReadCaptureToDma(AO_STREAM_RT* rt, ULONG advanceFrames)
-{
-    if (rt == NULL || advanceFrames == 0 || rt->BlockAlign == 0 ||
-        rt->DmaBuffer == NULL || rt->DmaBufferSize == 0 ||
-        rt->Pipe == NULL)
-    {
-        return;
-    }
-
-    ULONGLONG advanceBytes = (ULONGLONG)advanceFrames * rt->BlockAlign;
-
-    // Defensive clamp identical to the render path.
-    if (advanceBytes > rt->DmaBufferSize)
-    {
-        advanceBytes = rt->DmaBufferSize;
-    }
-
-    ULONGLONG oldProduced  = (ULONGLONG)rt->DmaProducedMono;
-    ULONG     bufferOffset = (ULONG)(oldProduced % (ULONGLONG)rt->DmaBufferSize);
-    ULONG     bytesRemaining = (ULONG)advanceBytes;
-    ULONG     totalWritten   = 0;
-
-    while (bytesRemaining > 0)
-    {
-        ULONG runWrite = bytesRemaining;
-        ULONG spaceToEnd = rt->DmaBufferSize - bufferOffset;
-        if (runWrite > spaceToEnd)
-        {
-            runWrite = spaceToEnd;
-        }
-
-        // Always fills runWrite bytes (silence on underrun).
-        FramePipeReadToDmaEx(
-            rt->Pipe,
-            rt->DmaBuffer + bufferOffset,
-            runWrite,
-            (PVOID)rt);
-
-        totalWritten  += runWrite;
-        bufferOffset   = (bufferOffset + runWrite) % rt->DmaBufferSize;
-        bytesRemaining -= runWrite;
-    }
-
     if (totalWritten > 0)
     {
         ULONGLONG newProduced = oldProduced + totalWritten;
@@ -1484,22 +1386,17 @@ AoCableAdvanceByQpc(
         }
     }
 
-    // --- Y2-2 / Y3 audible path ---
-    // Render and capture each go to their own helper based on stream
-    // direction. Both helpers now own the DMA <-> FRAME_PIPE transfer
-    // and the DmaProducedMono publish. The IsCable guard protects the
-    // helper calls from being invoked on any hypothetical non-cable
-    // stream that ends up with a transport rt attached.
-    if (rt->IsCable)
+    // --- Y2-1 render audible path (switch off by default) ---
+    // When RenderAudibleActive is TRUE, the helper owns the DMA ->
+    // FRAME_PIPE transfer for cable render streams. In Y2-1 this flag
+    // is never set, so the call is dead code for diagnostic build
+    // purposes — compiles, links, passes kernel verifier, but never
+    // executes. Y2-2 is the commit that flips the switch and retires
+    // legacy ReadBytes ownership. Gated on IsCable && !IsCapture so
+    // capture streams (which enter the same helper) skip it.
+    if (rt->RenderAudibleActive && rt->IsCable && !rt->IsCapture)
     {
-        if (!rt->IsCapture && rt->RenderAudibleActive)
-        {
-            AoCableWriteRenderFromDma(rt, (ULONG)advance);
-        }
-        else if (rt->IsCapture && rt->CaptureAudibleActive)
-        {
-            AoCableReadCaptureToDma(rt, (ULONG)advance);
-        }
+        AoCableWriteRenderFromDma(rt, (ULONG)advance);
     }
 
     // --- Packet notification check (shadow only) ---

@@ -1972,38 +1972,15 @@ ULONG FramePipeWriteFromDmaEx(
 }
 
 //=============================================================================
-// FramePipeReadToDma / FramePipeReadToDmaEx
+// FramePipeReadToDma — Mic DPC batch: pipe read → channel map →
+//                      denormalize → DMA bytes (DISPATCH_LEVEL)
 //
-// Mic DPC batch: pipe read → channel map → optional Y3 fade envelope
-// (Ex variant only) → denormalize → DMA bytes. Runs at DISPATCH_LEVEL.
-// Always fills byteCount bytes; underruns are zero-filled inside
-// FramePipeReadFrames.
-//
-// Phase 6 Y3: Ex variant takes an opaque AO_STREAM_RT* for fade hook.
-// Legacy non-Ex entry is a thin forward with rtOpaque == NULL,
-// preserving byte-identical behavior for any legacy caller.
+// Always fills byteCount bytes. Underrun → silence (handled by ReadFrames).
 //=============================================================================
-
-// Forward decl: Y3 capture fade adapter defined in transport_engine.cpp.
-extern "C" VOID AoCableApplyCaptureFadeInScratch(
-    PVOID   rtOpaque,
-    LONG*   scratch,
-    ULONG   sampleCount);
-
 VOID FramePipeReadToDma(
     PFRAME_PIPE     pPipe,
     BYTE*           dmaData,
     ULONG           byteCount)
-{
-    // Legacy path — byte-identical to pre-Y3 behavior.
-    FramePipeReadToDmaEx(pPipe, dmaData, byteCount, NULL);
-}
-
-VOID FramePipeReadToDmaEx(
-    PFRAME_PIPE     pPipe,
-    BYTE*           dmaData,
-    ULONG           byteCount,
-    PVOID           rtOpaque)
 {
     if (!pPipe || !pPipe->Initialized || !dmaData || byteCount == 0)
     {
@@ -2056,19 +2033,6 @@ VOID FramePipeReadToDmaEx(
 
         // Read chunk from pipe (zero-fills on underrun/startup)
         FramePipeReadFrames(pPipe, scratch, chunk);
-
-        // Phase 6 Y3 fade envelope hook. Applied on the scratch buffer
-        // AFTER pipe-read (normalized INT32) and BEFORE the denormalize-
-        // to-DMA step. rtOpaque is NULL on the legacy path (pre-Y3
-        // byte-identical behavior) and non-NULL on the Y3 capture
-        // audible path.
-        if (rtOpaque)
-        {
-            AoCableApplyCaptureFadeInScratch(
-                rtOpaque,
-                (LONG*)scratch,
-                chunk * pipeChannels);
-        }
 
         // Channel map + denormalize into DMA
         for (ULONG f = 0; f < chunk; f++)
