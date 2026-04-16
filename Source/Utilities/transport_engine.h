@@ -269,6 +269,21 @@ typedef struct _AO_TRANSPORT_ENGINE {
     LONGLONG                NextTickQpc;
     ULONG                   ActiveStreamCount;
     LIST_ENTRY              ActiveStreams;
+
+    // Phase 6 Y3-v5: 63/64 drift correction state
+    //
+    // VB FUN_140005cc0 timer DPC maintains a baseline/tick/target
+    // accumulator (fields +0x298/+0x2A0/+0x2A8 on the instance ctx).
+    // Each timer callback advances the accumulator and computes a
+    // target QPC value that the per-stream advance helpers consume.
+    // Every 100 ticks an extra qpcFreq is added to the baseline as
+    // the 63/64 phase correction.
+    //
+    // See results/phase6_vb_verification.md §4 for the verbatim
+    // formula captured from VB disasm.
+    ULONGLONG               BaselineQpc;
+    ULONGLONG               TickCountMod100;
+    ULONGLONG               TargetQpc;
 } AO_TRANSPORT_ENGINE, *PAO_TRANSPORT_ENGINE;
 
 //=============================================================================

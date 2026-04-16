@@ -772,6 +772,43 @@ AoTransportTimerCallback(
     UNREFERENCED_PARAMETER(Timer);
     UNREFERENCED_PARAMETER(Context);
 
+    // Phase 6 Y3-v5: 63/64 drift correction, VB FUN_140005cc0 verbatim.
+    //
+    // Each timer callback advances a baseline + tick accumulator. Every
+    // 100 ticks the baseline gets an extra qpcFreq added (the "63/64
+    // phase correction" — actually `freq` every 100 ticks = +1 second
+    // per 100 * period seconds, which compensates for timer period
+    // quantization drift). Target QPC is baseline + (tickCount * freq /
+    // 100), matching VB's imul with the 0xA3D70A3D70A3D70B magic
+    // integer-division constant.
+    //
+    // The target QPC is stored on the engine singleton so the per-
+    // stream advance helpers can consume it as the authoritative "now"
+    // value instead of raw KeQueryPerformanceCounter. Y3-v5 does not
+    // yet wire TargetQpc into AoCableAdvanceByQpc — that is the #3
+    // tick accumulator follow-up. Landing drift correction first
+    // gives us the anchor state for the follow-up without double-
+    // touching helper semantics.
+    {
+        LARGE_INTEGER qpcFreq;
+        KeQueryPerformanceCounter(&qpcFreq);
+
+        g_AoTransportEngine.TickCountMod100++;
+        if (g_AoTransportEngine.TickCountMod100 > 100)
+        {
+            g_AoTransportEngine.BaselineQpc     += (ULONGLONG)qpcFreq.QuadPart;
+            g_AoTransportEngine.TickCountMod100  = 1;
+        }
+
+        // target = baseline + (tickCount * freq / 100)
+        // VB uses imul+sar via magic constant; direct 64-bit division
+        // is equivalent and simpler at the cost of one divide per tick,
+        // which is cheap at DISPATCH_LEVEL.
+        g_AoTransportEngine.TargetQpc =
+            g_AoTransportEngine.BaselineQpc +
+            ((g_AoTransportEngine.TickCountMod100 * (ULONGLONG)qpcFreq.QuadPart) / 100);
+    }
+
     // Per-stream catch-up entry. The snapshot under engine lock records
     // how many virtual ticks each stream is overdue and the QPC time that
     // corresponds to virtual tick #0 for that stream. The execution phase
