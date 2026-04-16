@@ -240,6 +240,19 @@ typedef struct _AO_STREAM_RT {
     LONGLONG                DbgY2LastPrintQpc;
     LONGLONG                DbgY2HelperPrevSnapshot;
     LONGLONG                DbgY2LegacyPrevSnapshot;
+
+    //=========================================================================
+    // Phase 6 Y3-v4 — per-stream stream-level lock (VB parity, +0x160)
+    //
+    // VB 5420 / 6320 / 68ac all acquire a per-stream spinlock at stream
+    // offset +0x160 before touching cursor / monotonic / anchor state
+    // (see results/phase6_vb_verification.md §2 5420 pseudocode:
+    // AcquireSpinLock(+0x160) ... ReleaseSpinLock). The AO canonical
+    // advance helper needs the same serialization so query-path and
+    // timer-path invocations on the same stream cannot race on the
+    // shadow+audible state writes.
+    //=========================================================================
+    KSPIN_LOCK              StreamLock;
 } AO_STREAM_RT, *PAO_STREAM_RT;
 
 //=============================================================================

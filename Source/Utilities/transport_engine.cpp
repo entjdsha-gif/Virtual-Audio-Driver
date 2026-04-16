@@ -261,6 +261,12 @@ AoTransportAllocStreamRt(CMiniportWaveRTStream* stream)
     // shadow-only, makes the intent explicit.
     rt->FadeSampleCounter = -(LONG)AO_CABLE_FADE_PREFIX_LEN;
 
+    // Phase 6 Y3-v4: per-stream VB-parity spinlock (matches VB +0x160).
+    // Guards every AoCableAdvanceByQpc invocation so query-path and
+    // timer-path calls cannot race on the cursor / monotonic / anchor
+    // fields of the same stream.
+    KeInitializeSpinLock(&rt->StreamLock);
+
     return rt;
 }
 
@@ -1399,6 +1405,16 @@ AoCableAdvanceByQpc(
         return;
     }
 
+    // Phase 6 Y3-v4: per-stream spinlock (VB +0x160 parity). Serializes
+    // all cursor/monotonic/anchor state writes so query and timer
+    // invocations on the same stream cannot race. Held for the entire
+    // helper body including the AoCableWriteRenderFromDma /
+    // AoCableReadCaptureToDma call; those functions must not take
+    // blocking waits. All early-exit paths below use `goto done` so
+    // the lock is released exactly once on every control path.
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&rt->StreamLock, &oldIrql);
+
     // Unconditional "helper was reached" counter — Y1C gate uses the
     // per-reason counters below for a finer breakdown, this one is the
     // aggregate.
@@ -1425,7 +1441,7 @@ AoCableAdvanceByQpc(
     // at engine init.
     if (g_AoTeQpcFrequency <= 0)
     {
-        return;
+        goto done;
     }
 
     ULONGLONG nowQpc100ns =
@@ -1440,22 +1456,22 @@ AoCableAdvanceByQpc(
     {
         rt->AnchorQpc100ns             = nowQpc100ns;
         rt->PublishedFramesSinceAnchor = 0;
-        return;
+        goto done;
     }
 
-    LONGLONG  qpc100nsDelta    = (LONGLONG)(nowQpc100ns - rt->AnchorQpc100ns);
+    LONGLONG qpc100nsDelta = (LONGLONG)(nowQpc100ns - rt->AnchorQpc100ns);
     if (qpc100nsDelta <= 0)
     {
         // Clock went backwards or stayed put — nothing to advance.
-        return;
+        goto done;
     }
 
-    LONGLONG  elapsedFrames64  =
+    LONGLONG elapsedFrames64 =
         (qpc100nsDelta * (LONGLONG)rt->SampleRate) / 10000000LL;
 
     if (elapsedFrames64 < 0)
     {
-        return;
+        goto done;
     }
 
     LONG advance = (LONG)(elapsedFrames64 - (LONGLONG)rt->PublishedFramesSinceAnchor);
@@ -1463,7 +1479,7 @@ AoCableAdvanceByQpc(
     // --- 8-frame minimum gate (VB: cmp ebx,8; jl end) ---
     if (advance < (LONG)AO_CABLE_MIN_FRAMES_GATE)
     {
-        return;
+        goto done;
     }
 
     // --- 127-frame rebase (VB: elapsed >= sampleRate << 7) ---
@@ -1484,7 +1500,7 @@ AoCableAdvanceByQpc(
     if ((ULONG)advance > (rt->SampleRate / AO_CABLE_OVERRUN_DIVISOR))
     {
         rt->StatOverrunCounter++;
-        return;
+        goto done;
     }
 
     // --- Shadow cursor update ---
@@ -1579,13 +1595,17 @@ AoCableAdvanceByQpc(
     }
 
     // --- Monotonic counter mirror (VB +0xE0/+0xE8) ---
-    // Both counters receive the same delta. Volatile + interlocked
-    // add so a concurrent shadow reader cannot observe a torn 64-bit
-    // mid-write value — matches VB's single-writer-under-lock pattern
-    // without needing the per-stream spinlock Y2 will introduce.
+    // Both counters receive the same delta. Under Y3-v4 the per-stream
+    // spinlock already serializes writers so plain volatile stores
+    // would suffice, but InterlockedAdd64 remains the cheapest path
+    // on x64 and guarantees tear-free observation by any external
+    // lock-free reader.
     InterlockedAdd64(&rt->MonoFramesLow,    (LONGLONG)advance);
     InterlockedAdd64(&rt->MonoFramesMirror, (LONGLONG)advance);
 
     rt->LastAdvanceDelta           = advance;
     rt->PublishedFramesSinceAnchor = (ULONG)elapsedFrames64;
+
+done:
+    KeReleaseSpinLock(&rt->StreamLock, oldIrql);
 }
