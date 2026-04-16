@@ -144,6 +144,14 @@ typedef struct _AO_STREAM_RT {
     LONG                    LastAdvanceDelta;            // VB +0x1B8
     ULONG                   StatOverrunCounter;          // canonical helper reject count
 
+    // Phase 6 Y3-v6: capture tick accumulator / next target (VB +0x1B0)
+    // Tracks the running fixed-chunk target for TIMER_CAPTURE reason so
+    // VB 68ac-equivalent behavior (fixed FramesPerEvent per tick) can
+    // be honored without polluting the elapsed-frames path used by
+    // render / query. Zero = not yet seeded; first TIMER_CAPTURE call
+    // seeds and returns (VB +0x190 == 0 startup gate).
+    ULONGLONG               NextTickTargetFrames;
+
     // Packet notification state. VB shared-mode clients never arm these
     // (NotifyArmed stays 0) so the [+0x8188] dispatch is bypassed; AO's
     // existing STATUS_NOT_SUPPORTED path for m_ulNotificationsPerBuffer==0
