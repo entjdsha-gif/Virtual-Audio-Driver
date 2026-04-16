@@ -1471,67 +1471,6 @@ AoCableAdvanceByQpc(
         break;
     }
 
-    // Phase 6 Y3-v6: capture tick accumulator / next-target state.
-    //
-    // VB FUN_1400068ac drives cable mic as fixed-chunk-per-tick instead
-    // of variable elapsedFrames-based advance. Each timer DPC invocation
-    // produces exactly FramesPerEvent frames of output (48 frames @ 48k
-    // for 1 ms period) regardless of QPC jitter. NextTickTargetFrames
-    // tracks the running total so startup and rebase are well-defined.
-    //
-    // This branch is taken ONLY for TIMER_CAPTURE reason on an active
-    // cable mic. Render streams (Y2-2) and query path continue using
-    // the elapsed-frames math below — matches VB's render/capture
-    // asymmetry (results/phase6_vb_verification.md §9.5.2).
-    //
-    // Startup gate: first tick seeds NextTickTargetFrames and produces
-    // no data, matching VB FUN_1400068ac's +0x190 == 0 init branch.
-    if (reason == AO_ADVANCE_TIMER_CAPTURE &&
-        rt->IsCable && rt->IsCapture && rt->CaptureAudibleActive &&
-        rt->FramesPerEvent > 0)
-    {
-        if (rt->NextTickTargetFrames == 0)
-        {
-            // First tick: anchor state, no data this call.
-            rt->NextTickTargetFrames = rt->FramesPerEvent;
-            goto done;
-        }
-
-        // Fixed-chunk advance: exactly one event's worth per tick.
-        LONG tickAdvance = (LONG)rt->FramesPerEvent;
-
-        // Overrun guard (mirrors the elapsed-path 0.5 s reject).
-        if ((ULONG)tickAdvance > (rt->SampleRate / AO_CABLE_OVERRUN_DIVISOR))
-        {
-            rt->StatOverrunCounter++;
-            goto done;
-        }
-
-        // Shadow cursor update (for diagnostics parity with elapsed path).
-        rt->DmaCursorFramesPrev = rt->DmaCursorFrames;
-        if (rt->RingSizeFrames > 0)
-        {
-            rt->DmaCursorFrames =
-                (rt->DmaCursorFrames + (ULONGLONG)tickAdvance) % rt->RingSizeFrames;
-        }
-        else
-        {
-            rt->DmaCursorFrames += (ULONGLONG)tickAdvance;
-        }
-
-        // Write fixed chunk to DMA via the canonical helper.
-        AoCableReadCaptureToDma(rt, (ULONG)tickAdvance);
-
-        // Advance the monotonic mirror + tick accumulator state.
-        InterlockedAdd64(&rt->MonoFramesLow,    (LONGLONG)tickAdvance);
-        InterlockedAdd64(&rt->MonoFramesMirror, (LONGLONG)tickAdvance);
-        rt->LastAdvanceDelta              = tickAdvance;
-        rt->NextTickTargetFrames         += (ULONGLONG)tickAdvance;
-        rt->PublishedFramesSinceAnchor   += (ULONG)tickAdvance;
-
-        goto done;
-    }
-
     // --- QPC raw -> 100ns conversion ---
     // VB 6320 does ((arg_r8 * 10M) + (arg_rdx * 10M)) / freq. The
     // caller passes a single monotonic QPC counter so we collapse to
