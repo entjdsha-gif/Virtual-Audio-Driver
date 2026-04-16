@@ -1971,25 +1971,24 @@ VOID CMiniportWaveRTStream::UpdatePosition
     _In_ LARGE_INTEGER ilQPC
 )
 {
-    // Phase 6 Y3-v2 full literal — cable mic early-exit.
+    // Phase 6 Y3-v7 — cable mic UpdatePosition shim.
     //
-    // For cable mic streams the canonical helper is the sole cursor
-    // owner. Legacy ByteDisplacement math, WriteBytes, and the Y1C
-    // shim all bypass here so the helper's DmaProducedMono is the
-    // single source of truth. GetPosition/GetPositions (cable mic
-    // branches below) read directly from rt->DmaProducedMono, and
-    // the helper itself is invoked from those sites + the shared
-    // timer DPC, so UpdatePosition does not need to re-dispatch it
-    // for cable mic.
-    //
-    // m_ullDmaTimeStamp is still refreshed so that if any code path
-    // later calls UpdatePosition on a non-cable-mic stream and needs
-    // a valid prior timestamp, the field is current. The rest of the
-    // legacy body is skipped entirely.
+    // UpdatePosition is the common funnel for every query path that
+    // feeds capture (GetPosition, GetPositions, GetPacketCount, and
+    // TimerNotifyRT). For cable mic in Y3-v7 we drive the canonical
+    // advance helper from HERE so every call path advances the
+    // cursor, matching VB's 6320 query-driven pattern. The legacy
+    // ByteDisplacement math + WriteBytes are still skipped because
+    // the helper is the sole cursor owner; legacy would dual-write
+    // DmaProducedMono and race.
     if (m_pTransportRt && m_pMiniport && m_bCapture &&
         (m_pMiniport->m_DeviceType == eCableAMic ||
          m_pMiniport->m_DeviceType == eCableBMic))
     {
+        AoCableAdvanceByQpc(m_pTransportRt,
+                            (ULONGLONG)ilQPC.QuadPart,
+                            AO_ADVANCE_QUERY,
+                            0);
         LONGLONG hnsNow = KSCONVERT_PERFORMANCE_TIME(
             m_ullPerformanceCounterFrequency.QuadPart, ilQPC);
         m_ullDmaTimeStamp = hnsNow;
