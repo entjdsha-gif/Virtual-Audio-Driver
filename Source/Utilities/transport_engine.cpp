@@ -36,27 +36,17 @@
 // clients negotiate 48 kHz; the engine scales to non-48k streams at RUN time.
 //
 // AO_TE_EVENT_FRAMES_AT_REF is the shared-timer event quantum at the
-// reference rate. 48 frames @ 48000 Hz = 1 ms, matching the VB-Cable
-// ExAllocateTimer2 period captured via WinDbg on FUN_1400065b8 —
-// ExSetTimer(-10000, 10000, NULL) is a 1 ms due / 1 ms period timer.
-// See results/phase6_vb_verification.md §3 "Shared Timer Confirmation".
-//
-// The original Step 1 scaffold used 960 (20 ms) which predates the VB
-// timing verification and was carried over through Y1/Y2/Y3-v2 without
-// update. Y3-v2.1 migrates to the verified 1 ms value so cable mic DMA
-// fill granularity is fine enough to avoid visible position stall
-// between client queries. This is a targeted parity fix; it does NOT
-// alter the "multiple active call sources, one canonical owner" rule
-// in PHASE6_Y_IMPLEMENTATION_WORK_ORDER.md.
+// reference rate. 960 frames @ 48000 Hz is the VB-Cable-equivalent cadence
+// step; expressing it as frames keeps the constant invariant under rate
+// changes.
 //
 // AO_TE_STARTUP_THRESHOLD_FRAMES_AT_REF / AO_TE_STARTUP_TARGET_FRAMES_AT_REF
 // are the capture startup cushion values from PHASE6_PLAN.md §6, also in
-// frames. They live on the per-stream startup state machine and are
-// independent of the shared-timer period — do not reduce them in
-// lockstep with AO_TE_EVENT_FRAMES_AT_REF.
+// frames. Step 4 will tune these; Step 1 seeds them so the runtime has
+// sensible defaults for the no-op callback path.
 //
 #define AO_TE_REFERENCE_RATE                 48000U
-#define AO_TE_EVENT_FRAMES_AT_REF               48U   // 1 ms @ 48k, matches VB ExAllocateTimer2
+#define AO_TE_EVENT_FRAMES_AT_REF              960U   // 20 ms-equivalent @ 48k, stored as frames
 #define AO_TE_STARTUP_THRESHOLD_FRAMES_AT_REF  960U
 #define AO_TE_STARTUP_TARGET_FRAMES_AT_REF    1440U
 
@@ -261,12 +251,6 @@ AoTransportAllocStreamRt(CMiniportWaveRTStream* stream)
     // shadow-only, makes the intent explicit.
     rt->FadeSampleCounter = -(LONG)AO_CABLE_FADE_PREFIX_LEN;
 
-    // Phase 6 Y3-v4: per-stream VB-parity spinlock (matches VB +0x160).
-    // Guards every AoCableAdvanceByQpc invocation so query-path and
-    // timer-path calls cannot race on the cursor / monotonic / anchor
-    // fields of the same stream.
-    KeInitializeSpinLock(&rt->StreamLock);
-
     return rt;
 }
 
@@ -382,25 +366,19 @@ AoTransportOnRunEx(const AO_STREAM_SNAPSHOT* snapshot)
     rt->DmaProducedMono  = 0;
     rt->DmaConsumedMono  = 0;
 
-    // Phase 6 Y2-2 / Y3: flip the audible switches for cable streams.
-    // Render migrates in Y2-2 (helper owns DMA -> FRAME_PIPE path).
-    // Capture migrates in Y3 (helper owns FRAME_PIPE -> DMA path).
-    // Both flags are cleared on STOP by AoCableResetRuntimeFields so
-    // pause/resume cycles re-enable them cleanly on the next RUN.
+    // Phase 6 Y2-2: flip the render audible switch on cable render
+    // streams. This promotes AoCableWriteRenderFromDma to the sole
+    // owner of DMA -> FRAME_PIPE transfer for cable render, replacing
+    // the legacy ReadBytes path in CMiniportWaveRTStream::UpdatePosition.
+    // Cleared on STOP via AoCableResetRuntimeFields so pause/resume
+    // cycles re-enable the switch on the next RUN.
     if (rt->IsCable && !rt->IsCapture)
     {
-        rt->RenderAudibleActive  = TRUE;
-        rt->CaptureAudibleActive = FALSE;
-    }
-    else if (rt->IsCable && rt->IsCapture)
-    {
-        rt->RenderAudibleActive  = FALSE;
-        rt->CaptureAudibleActive = TRUE;
+        rt->RenderAudibleActive = TRUE;
     }
     else
     {
-        rt->RenderAudibleActive  = FALSE;
-        rt->CaptureAudibleActive = FALSE;
+        rt->RenderAudibleActive = FALSE;
     }
 
     // Samples-only seeding: scale the reference frame constants to this
@@ -625,14 +603,13 @@ AoRunRenderEvent(AO_STREAM_RT* rt, LONGLONG qpc)
     {
         AoCableAdvanceByQpc(rt, (ULONGLONG)qpc, AO_ADVANCE_TIMER_RENDER, 0);
 
-        // Phase 6 Y2-1.5 rate-limited byte diff DbgPrint + pipe state.
+        // Phase 6 Y2-1.5 rate-limited byte diff DbgPrint.
         // Fires once per second per cable render stream so DebugView
         // can show whether helper vs legacy cumulative byte totals
-        // are converging AND whether the cable pipe is healthy.
-        // Added pipe->FillFrames / UnderrunCount / DropCount for Y3
-        // diagnosis: if the capture side is underrunning we will see
-        // UnderrunCount climb even though the render-side H/L numbers
-        // look clean.
+        // are converging. Last-second deltas (dH, dL) make it easy
+        // to tell whether a non-zero cumulative diff is historical
+        // leftover or an active drift. Removed in Y4 with the rest
+        // of the Y2 diagnostic counters.
         if (!rt->IsCapture && rt->BlockAlign > 0 && g_AoTeQpcFrequency > 0)
         {
             LONGLONG elapsedQpc = qpc - rt->DbgY2LastPrintQpc;
@@ -646,23 +623,10 @@ AoRunRenderEvent(AO_STREAM_RT* rt, LONGLONG qpc)
                 LONGLONG diffMax     = rt->DbgY2RenderByteDiffMax;
                 LONG     mismatchHits = rt->DbgY2RenderMismatchHits;
 
-                ULONG pipeFill  = 0;
-                ULONG pipeCap   = 0;
-                ULONG underrun  = 0;
-                ULONG drops     = 0;
-                if (rt->Pipe != NULL)
-                {
-                    pipeFill = rt->Pipe->FillFrames;
-                    pipeCap  = rt->Pipe->CapacityFrames;
-                    underrun = rt->Pipe->UnderrunCount;
-                    drops    = rt->Pipe->DropCount;
-                }
-
                 DbgPrint("[AoY2.5] rt=%p H=%lld L=%lld dH=%lld dL=%lld "
-                         "diffMax=%lld miss=%d fill=%u/%u ur=%u drp=%u\n",
+                         "diffMax=%lld miss=%d\n",
                          rt, helperNow, legacyNow, helperDelta, legacyDelta,
-                         diffMax, mismatchHits,
-                         pipeFill, pipeCap, underrun, drops);
+                         diffMax, mismatchHits);
 
                 rt->DbgY2HelperPrevSnapshot = helperNow;
                 rt->DbgY2LegacyPrevSnapshot = legacyNow;
@@ -707,18 +671,15 @@ AoRunCaptureEvent(AO_STREAM_RT* rt, LONGLONG qpc)
     // state machine and underrun counter) preserved in git history at
     // commit a8ac0fb.
 
-    // Phase 6 Y3-v7: VB parity — cable mic advance is query-driven
-    // (from CMiniportWaveRTStream::GetPosition/GetPositions), not
-    // timer-driven. VB 6320 is only called from 5420/4598 query
-    // paths; VB timer DPC (5cc0) calls 6778/68ac which are
-    // scheduling/no-op paths, not data movers. Do not fire the
-    // capture advance from here — it would race with the query
-    // path and reintroduce the cadence asymmetry that caused the
-    // audible crackle in Y3-v3..Y3-v6. Capture diagnostic DbgPrint
-    // is also removed with the advance call since no capture
-    // progress happens on the timer path anymore.
-    UNREFERENCED_PARAMETER(rt);
-    UNREFERENCED_PARAMETER(qpc);
+    // Phase 6 Y1C shadow hook-up: invoke the canonical helper in
+    // shadow mode so the shared timer capture path is a visible call
+    // source for the Y1C gate. Shadow bookkeeping only; legacy capture
+    // transport (WriteBytes via UpdatePosition) remains the audible
+    // owner until Y3 retires it.
+    if (rt != NULL && rt->IsCable)
+    {
+        AoCableAdvanceByQpc(rt, (ULONGLONG)qpc, AO_ADVANCE_TIMER_CAPTURE, 0);
+    }
 }
 
 //=============================================================================
@@ -740,43 +701,6 @@ AoTransportTimerCallback(
 {
     UNREFERENCED_PARAMETER(Timer);
     UNREFERENCED_PARAMETER(Context);
-
-    // Phase 6 Y3-v5: 63/64 drift correction, VB FUN_140005cc0 verbatim.
-    //
-    // Each timer callback advances a baseline + tick accumulator. Every
-    // 100 ticks the baseline gets an extra qpcFreq added (the "63/64
-    // phase correction" — actually `freq` every 100 ticks = +1 second
-    // per 100 * period seconds, which compensates for timer period
-    // quantization drift). Target QPC is baseline + (tickCount * freq /
-    // 100), matching VB's imul with the 0xA3D70A3D70A3D70B magic
-    // integer-division constant.
-    //
-    // The target QPC is stored on the engine singleton so the per-
-    // stream advance helpers can consume it as the authoritative "now"
-    // value instead of raw KeQueryPerformanceCounter. Y3-v5 does not
-    // yet wire TargetQpc into AoCableAdvanceByQpc — that is the #3
-    // tick accumulator follow-up. Landing drift correction first
-    // gives us the anchor state for the follow-up without double-
-    // touching helper semantics.
-    {
-        LARGE_INTEGER qpcFreq;
-        KeQueryPerformanceCounter(&qpcFreq);
-
-        g_AoTransportEngine.TickCountMod100++;
-        if (g_AoTransportEngine.TickCountMod100 > 100)
-        {
-            g_AoTransportEngine.BaselineQpc     += (ULONGLONG)qpcFreq.QuadPart;
-            g_AoTransportEngine.TickCountMod100  = 1;
-        }
-
-        // target = baseline + (tickCount * freq / 100)
-        // VB uses imul+sar via magic constant; direct 64-bit division
-        // is equivalent and simpler at the cost of one divide per tick,
-        // which is cheap at DISPATCH_LEVEL.
-        g_AoTransportEngine.TargetQpc =
-            g_AoTransportEngine.BaselineQpc +
-            ((g_AoTransportEngine.TickCountMod100 * (ULONGLONG)qpcFreq.QuadPart) / 100);
-    }
 
     // Per-stream catch-up entry. The snapshot under engine lock records
     // how many virtual ticks each stream is overdue and the QPC time that
@@ -1128,15 +1052,12 @@ AoCableResetRuntimeFields(AO_STREAM_RT* rt)
     // are intentionally NOT reset here — see function header comment for
     // the VB parity verification that led to this rule.
 
-    // Phase 6 Y2-2 / Y3: clear the audible switches on STOP. OnRunEx
-    // re-sets the appropriate one on the next RUN (render for cable
-    // speaker streams, capture for cable mic streams). Also zero
-    // DmaProducedMono — helper is the sole writer for both cable
-    // render (Y2-2) and cable capture (Y3), and a stale post-STOP
-    // value would make the helper read/write wrong DMA offsets after
-    // resume.
-    rt->RenderAudibleActive  = FALSE;
-    rt->CaptureAudibleActive = FALSE;
+    // Phase 6 Y2-2: clear the render audible switch on STOP. OnRunEx
+    // re-sets it for cable render streams on the next RUN. Also zero
+    // DmaProducedMono — helper is the sole writer for cable render in
+    // Y2-2, and a stale post-STOP value would make the helper read
+    // wrong DMA offsets after resume.
+    rt->RenderAudibleActive = FALSE;
     InterlockedExchange64(&rt->DmaProducedMono, 0);
 
     // Fade state — reset so the next audible run starts with a fresh
@@ -1165,24 +1086,6 @@ AoCableResetRuntimeFields(AO_STREAM_RT* rt)
 // know AO_STREAM_RT layout. Safe with NULL rtOpaque.
 extern "C" VOID
 AoCableApplyRenderFadeInScratch(
-    PVOID   rtOpaque,
-    LONG*   scratch,
-    ULONG   sampleCount)
-{
-    if (rtOpaque == NULL)
-    {
-        return;
-    }
-    AO_STREAM_RT* rt = (AO_STREAM_RT*)rtOpaque;
-    AoApplyFadeEnvelope(scratch, sampleCount, &rt->FadeSampleCounter);
-}
-
-// AoCableApplyCaptureFadeInScratch — Y3 symmetric adapter for capture.
-// Called from loopback.cpp's FramePipeReadToDmaEx between the pipe-read
-// and the denormalize-to-DMA steps, so the envelope is applied on
-// capture samples the same way VB 5634 does.
-extern "C" VOID
-AoCableApplyCaptureFadeInScratch(
     PVOID   rtOpaque,
     LONG*   scratch,
     ULONG   sampleCount)
@@ -1308,80 +1211,6 @@ AoCableWriteRenderFromDma(AO_STREAM_RT* rt, ULONG advanceFrames)
     }
 }
 
-// AoCableReadCaptureToDma — Y3 capture audible helper.
-//
-// Mirror of AoCableWriteRenderFromDma for the capture direction.
-// Reads advanceFrames worth of samples from the FRAME_PIPE into the
-// client DMA buffer via FramePipeReadToDmaEx (which handles pipe read
-// -> channel map -> envelope -> denormalize -> DMA write in one call).
-//
-// Differences from the render helper:
-//   1. No backpressure. FramePipeReadToDma[Ex] always fills the
-//      requested byte count — underruns are zero-filled internally
-//      by FramePipeReadFrames. So the DMA wrap loop never needs to
-//      break early for partial writes.
-//   2. DmaProducedMono advances by the requested byte count every
-//      tick (no writtenFrames return check), because the client is
-//      the reader and the driver always hands it the full window.
-//   3. Envelope is applied on the pipe-read scratch, same as render.
-//
-// Still reads oldProduced from rt->DmaProducedMono as the entry
-// value and publishes newProduced = oldProduced + advanceBytes at
-// the end via InterlockedExchange64.
-extern "C" VOID
-AoCableReadCaptureToDma(AO_STREAM_RT* rt, ULONG advanceFrames)
-{
-    if (rt == NULL || advanceFrames == 0 || rt->BlockAlign == 0 ||
-        rt->DmaBuffer == NULL || rt->DmaBufferSize == 0 ||
-        rt->Pipe == NULL)
-    {
-        return;
-    }
-
-    ULONGLONG advanceBytes = (ULONGLONG)advanceFrames * rt->BlockAlign;
-
-    // Defensive clamp identical to the render path.
-    if (advanceBytes > rt->DmaBufferSize)
-    {
-        advanceBytes = rt->DmaBufferSize;
-    }
-
-    ULONGLONG oldProduced  = (ULONGLONG)rt->DmaProducedMono;
-    ULONG     bufferOffset = (ULONG)(oldProduced % (ULONGLONG)rt->DmaBufferSize);
-    ULONG     bytesRemaining = (ULONG)advanceBytes;
-    ULONG     totalWritten   = 0;
-
-    while (bytesRemaining > 0)
-    {
-        ULONG runWrite = bytesRemaining;
-        ULONG spaceToEnd = rt->DmaBufferSize - bufferOffset;
-        if (runWrite > spaceToEnd)
-        {
-            runWrite = spaceToEnd;
-        }
-
-        // Always fills runWrite bytes (silence on underrun).
-        // Y3-v8 isolation: pass NULL to skip VB envelope on capture
-        // scratch. If this fixes the crackle, the envelope
-        // implementation is the cause. If not, envelope is innocent.
-        FramePipeReadToDmaEx(
-            rt->Pipe,
-            rt->DmaBuffer + bufferOffset,
-            runWrite,
-            NULL);
-
-        totalWritten  += runWrite;
-        bufferOffset   = (bufferOffset + runWrite) % rt->DmaBufferSize;
-        bytesRemaining -= runWrite;
-    }
-
-    if (totalWritten > 0)
-    {
-        ULONGLONG newProduced = oldProduced + totalWritten;
-        InterlockedExchange64(&rt->DmaProducedMono, (LONGLONG)newProduced);
-    }
-}
-
 //-----------------------------------------------------------------------------
 // AoCableAdvanceByQpc — Y1B shadow body.
 //
@@ -1414,16 +1243,6 @@ AoCableAdvanceByQpc(
         return;
     }
 
-    // Phase 6 Y3-v4: per-stream spinlock (VB +0x160 parity). Serializes
-    // all cursor/monotonic/anchor state writes so query and timer
-    // invocations on the same stream cannot race. Held for the entire
-    // helper body including the AoCableWriteRenderFromDma /
-    // AoCableReadCaptureToDma call; those functions must not take
-    // blocking waits. All early-exit paths below use `goto done` so
-    // the lock is released exactly once on every control path.
-    KIRQL oldIrql;
-    KeAcquireSpinLock(&rt->StreamLock, &oldIrql);
-
     // Unconditional "helper was reached" counter — Y1C gate uses the
     // per-reason counters below for a finer breakdown, this one is the
     // aggregate.
@@ -1450,7 +1269,7 @@ AoCableAdvanceByQpc(
     // at engine init.
     if (g_AoTeQpcFrequency <= 0)
     {
-        goto done;
+        return;
     }
 
     ULONGLONG nowQpc100ns =
@@ -1465,22 +1284,22 @@ AoCableAdvanceByQpc(
     {
         rt->AnchorQpc100ns             = nowQpc100ns;
         rt->PublishedFramesSinceAnchor = 0;
-        goto done;
+        return;
     }
 
-    LONGLONG qpc100nsDelta = (LONGLONG)(nowQpc100ns - rt->AnchorQpc100ns);
+    LONGLONG  qpc100nsDelta    = (LONGLONG)(nowQpc100ns - rt->AnchorQpc100ns);
     if (qpc100nsDelta <= 0)
     {
         // Clock went backwards or stayed put — nothing to advance.
-        goto done;
+        return;
     }
 
-    LONGLONG elapsedFrames64 =
+    LONGLONG  elapsedFrames64  =
         (qpc100nsDelta * (LONGLONG)rt->SampleRate) / 10000000LL;
 
     if (elapsedFrames64 < 0)
     {
-        goto done;
+        return;
     }
 
     LONG advance = (LONG)(elapsedFrames64 - (LONGLONG)rt->PublishedFramesSinceAnchor);
@@ -1488,7 +1307,7 @@ AoCableAdvanceByQpc(
     // --- 8-frame minimum gate (VB: cmp ebx,8; jl end) ---
     if (advance < (LONG)AO_CABLE_MIN_FRAMES_GATE)
     {
-        goto done;
+        return;
     }
 
     // --- 127-frame rebase (VB: elapsed >= sampleRate << 7) ---
@@ -1509,7 +1328,7 @@ AoCableAdvanceByQpc(
     if ((ULONG)advance > (rt->SampleRate / AO_CABLE_OVERRUN_DIVISOR))
     {
         rt->StatOverrunCounter++;
-        goto done;
+        return;
     }
 
     // --- Shadow cursor update ---
@@ -1567,22 +1386,17 @@ AoCableAdvanceByQpc(
         }
     }
 
-    // --- Y2-2 / Y3 audible path ---
-    // Render and capture each go to their own helper based on stream
-    // direction. Both helpers now own the DMA <-> FRAME_PIPE transfer
-    // and the DmaProducedMono publish. The IsCable guard protects the
-    // helper calls from being invoked on any hypothetical non-cable
-    // stream that ends up with a transport rt attached.
-    if (rt->IsCable)
+    // --- Y2-1 render audible path (switch off by default) ---
+    // When RenderAudibleActive is TRUE, the helper owns the DMA ->
+    // FRAME_PIPE transfer for cable render streams. In Y2-1 this flag
+    // is never set, so the call is dead code for diagnostic build
+    // purposes — compiles, links, passes kernel verifier, but never
+    // executes. Y2-2 is the commit that flips the switch and retires
+    // legacy ReadBytes ownership. Gated on IsCable && !IsCapture so
+    // capture streams (which enter the same helper) skip it.
+    if (rt->RenderAudibleActive && rt->IsCable && !rt->IsCapture)
     {
-        if (!rt->IsCapture && rt->RenderAudibleActive)
-        {
-            AoCableWriteRenderFromDma(rt, (ULONG)advance);
-        }
-        else if (rt->IsCapture && rt->CaptureAudibleActive)
-        {
-            AoCableReadCaptureToDma(rt, (ULONG)advance);
-        }
+        AoCableWriteRenderFromDma(rt, (ULONG)advance);
     }
 
     // --- Packet notification check (shadow only) ---
@@ -1604,17 +1418,13 @@ AoCableAdvanceByQpc(
     }
 
     // --- Monotonic counter mirror (VB +0xE0/+0xE8) ---
-    // Both counters receive the same delta. Under Y3-v4 the per-stream
-    // spinlock already serializes writers so plain volatile stores
-    // would suffice, but InterlockedAdd64 remains the cheapest path
-    // on x64 and guarantees tear-free observation by any external
-    // lock-free reader.
+    // Both counters receive the same delta. Volatile + interlocked
+    // add so a concurrent shadow reader cannot observe a torn 64-bit
+    // mid-write value — matches VB's single-writer-under-lock pattern
+    // without needing the per-stream spinlock Y2 will introduce.
     InterlockedAdd64(&rt->MonoFramesLow,    (LONGLONG)advance);
     InterlockedAdd64(&rt->MonoFramesMirror, (LONGLONG)advance);
 
     rt->LastAdvanceDelta           = advance;
     rt->PublishedFramesSinceAnchor = (ULONG)elapsedFrames64;
-
-done:
-    KeReleaseSpinLock(&rt->StreamLock, oldIrql);
 }

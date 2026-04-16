@@ -176,27 +176,20 @@ typedef struct _AO_STREAM_RT {
     volatile LONG           DbgShadowTimerHits;
 
     //=========================================================================
-    // Phase 6 Y2 / Y3 audible switches
+    // Phase 6 Y2-1 audible switch (render path)
     //
-    // Render (Y2-2) and capture (Y3) each have their own flag so the
-    // two migrations can be toggled independently during debugging or
-    // rollback. OnRunEx sets them for cable streams; OnStop /
-    // AoCableResetRuntimeFields clears them so pause/resume cycles
-    // re-enable on the next RUN.
+    // When TRUE, AoCableAdvanceByQpc's render branch does the actual
+    // DMA -> scratch -> FRAME_PIPE write via AoCableWriteRenderFromDma
+    // and applies the fade envelope. When FALSE (Y2-1 default), the
+    // render branch stays in shadow mode and the legacy ReadBytes path
+    // (called from CMiniportWaveRTStream::UpdatePosition) remains the
+    // audible owner. Y2-2 flips this to TRUE and retires ReadBytes
+    // ownership for cable render streams.
     //
-    // When RenderAudibleActive is TRUE, AoCableAdvanceByQpc's render
-    // branch does DMA -> scratch -> FRAME_PIPE write via
-    // AoCableWriteRenderFromDma with VB fade envelope. Legacy
-    // UpdatePosition -> ReadBytes path is bypassed for cable render.
-    //
-    // When CaptureAudibleActive is TRUE, AoCableAdvanceByQpc's capture
-    // branch does FRAME_PIPE read -> denormalize -> DMA write via
-    // AoCableReadCaptureToDma with VB fade envelope on the scratch
-    // buffer. Legacy UpdatePosition -> WriteBytes path is bypassed
-    // for cable mic.
+    // Capture has no equivalent flag yet — Y3 adds its own audible
+    // switch mirroring this pattern.
     //=========================================================================
     BOOLEAN                 RenderAudibleActive;
-    BOOLEAN                 CaptureAudibleActive;
 
     //=========================================================================
     // Phase 6 Y2-1.5 render byte diff diagnostic
@@ -240,19 +233,6 @@ typedef struct _AO_STREAM_RT {
     LONGLONG                DbgY2LastPrintQpc;
     LONGLONG                DbgY2HelperPrevSnapshot;
     LONGLONG                DbgY2LegacyPrevSnapshot;
-
-    //=========================================================================
-    // Phase 6 Y3-v4 — per-stream stream-level lock (VB parity, +0x160)
-    //
-    // VB 5420 / 6320 / 68ac all acquire a per-stream spinlock at stream
-    // offset +0x160 before touching cursor / monotonic / anchor state
-    // (see results/phase6_vb_verification.md §2 5420 pseudocode:
-    // AcquireSpinLock(+0x160) ... ReleaseSpinLock). The AO canonical
-    // advance helper needs the same serialization so query-path and
-    // timer-path invocations on the same stream cannot race on the
-    // shadow+audible state writes.
-    //=========================================================================
-    KSPIN_LOCK              StreamLock;
 } AO_STREAM_RT, *PAO_STREAM_RT;
 
 //=============================================================================
@@ -269,21 +249,6 @@ typedef struct _AO_TRANSPORT_ENGINE {
     LONGLONG                NextTickQpc;
     ULONG                   ActiveStreamCount;
     LIST_ENTRY              ActiveStreams;
-
-    // Phase 6 Y3-v5: 63/64 drift correction state
-    //
-    // VB FUN_140005cc0 timer DPC maintains a baseline/tick/target
-    // accumulator (fields +0x298/+0x2A0/+0x2A8 on the instance ctx).
-    // Each timer callback advances the accumulator and computes a
-    // target QPC value that the per-stream advance helpers consume.
-    // Every 100 ticks an extra qpcFreq is added to the baseline as
-    // the 63/64 phase correction.
-    //
-    // See results/phase6_vb_verification.md §4 for the verbatim
-    // formula captured from VB disasm.
-    ULONGLONG               BaselineQpc;
-    ULONGLONG               TickCountMod100;
-    ULONGLONG               TargetQpc;
 } AO_TRANSPORT_ENGINE, *PAO_TRANSPORT_ENGINE;
 
 //=============================================================================
@@ -431,24 +396,12 @@ extern "C" VOID AoCableResetRuntimeFields(AO_STREAM_RT* rt);
 // be applied on scratch before pipe-write.
 extern "C" VOID AoCableWriteRenderFromDma(AO_STREAM_RT* rt, ULONG advanceFrames);
 
-// Phase 6 Y3 — capture audible path: FRAME_PIPE read -> scratch ->
-// envelope -> DMA write for cable mic streams. Called from
-// AoCableAdvanceByQpc's capture branch when CaptureAudibleActive is
-// set. Mirrors AoCableWriteRenderFromDma but with read direction:
-// driver is the DMA writer (client is the reader), underruns are
-// zero-filled internally by FramePipeReadFrames, and the function
-// always fulfills the requested byte count (no backpressure stop).
-extern "C" VOID AoCableReadCaptureToDma(AO_STREAM_RT* rt, ULONG advanceFrames);
-
-// Opaque-pointer adapters called from loopback.cpp's Ex variants.
-// Wrap AoApplyFadeEnvelope with the stream's FadeSampleCounter so the
+// Opaque-pointer adapter called from loopback.cpp's FramePipeWriteFromDmaEx.
+// Wraps AoApplyFadeEnvelope with the stream's FadeSampleCounter so the
 // loopback TU does not need to know AO_STREAM_RT layout. Safe to call
 // with rtOpaque == NULL (no-op).
 extern "C" VOID AoCableApplyRenderFadeInScratch(PVOID rtOpaque,
                                                  LONG* scratch,
                                                  ULONG sampleCount);
-extern "C" VOID AoCableApplyCaptureFadeInScratch(PVOID rtOpaque,
-                                                  LONG* scratch,
-                                                  ULONG sampleCount);
 
 #endif // AO_TRANSPORT_ENGINE_H
