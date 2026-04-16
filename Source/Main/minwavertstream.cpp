@@ -881,25 +881,17 @@ NTSTATUS CMiniportWaveRTStream::GetPosition
         LARGE_INTEGER ilQPC = KeQueryPerformanceCounter(NULL);
         UpdatePosition(ilQPC);
 
-        // Phase 6 Y3-v3 / Y2-2 render asymmetry:
-        //
-        //   render = query-driven
-        //   capture = timer-driven
-        //   query on capture = informational only
-        //
-        // Cable render helper advances on every query (Y2-2 design —
-        // pos-query is the primary driver). Cable mic helper is
-        // TIMER-DRIVEN only; query path is read-only here and the
-        // cable mic return values below come straight from
-        // DmaProducedMono that the timer DPC has been publishing.
-        // Adding a query-path advance for cable mic races with the
-        // render helper on the same pipe and produces audible
-        // crackle, as observed in the Y3-v2 live call test. See
-        // results/phase6_vb_verification.md §9.5.2 for the VB
-        // runtime basis of this asymmetry.
+        // Phase 6 Y3-v7: VB 6320 is called from query path only
+        // (5420 GetPosition and 4598 internal helper). Timer DPC calls
+        // 6778/68ac which are scheduling/no-op paths, not data movers.
+        // Both render AND capture must advance on query to match VB.
+        // Fresh Ghidra verification: grep "FUN_140006320(" finds
+        // exactly 2 callers, both query-path.
         if (m_pTransportRt && m_pMiniport &&
             (m_pMiniport->m_DeviceType == eCableASpeaker ||
-             m_pMiniport->m_DeviceType == eCableBSpeaker))
+             m_pMiniport->m_DeviceType == eCableBSpeaker ||
+             m_pMiniport->m_DeviceType == eCableAMic      ||
+             m_pMiniport->m_DeviceType == eCableBMic))
         {
             AoCableAdvanceByQpc(m_pTransportRt,
                                 (ULONGLONG)ilQPC.QuadPart,
@@ -1207,13 +1199,13 @@ NTSTATUS CMiniportWaveRTStream::GetPositions(
         // fresh and stays under m_PositionSpinLock. No transport mutation.
         PumpToCurrentPositionFromQuery(ilQPC);
 
-        // Phase 6 Y3-v3 / Y2-2 render asymmetry: only cable render
-        // advances on query. Cable mic is timer-driven; query here is
-        // informational only. See GetPosition above and
-        // results/phase6_vb_verification.md §9.5.2.
+        // Phase 6 Y3-v7: capture query-driven, matching VB 6320 callers.
+        // See GetPosition above for Ghidra-verified basis.
         if (m_pTransportRt && m_pMiniport &&
             (m_pMiniport->m_DeviceType == eCableASpeaker ||
-             m_pMiniport->m_DeviceType == eCableBSpeaker))
+             m_pMiniport->m_DeviceType == eCableBSpeaker ||
+             m_pMiniport->m_DeviceType == eCableAMic      ||
+             m_pMiniport->m_DeviceType == eCableBMic))
         {
             AoCableAdvanceByQpc(m_pTransportRt,
                                 (ULONGLONG)ilQPC.QuadPart,

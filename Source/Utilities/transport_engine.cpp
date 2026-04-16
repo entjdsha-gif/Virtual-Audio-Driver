@@ -707,49 +707,18 @@ AoRunCaptureEvent(AO_STREAM_RT* rt, LONGLONG qpc)
     // state machine and underrun counter) preserved in git history at
     // commit a8ac0fb.
 
-    // Phase 6 Y3-v3: cable mic is now timer-driven (capture audible
-    // path). Helper advance -> AoCableReadCaptureToDma -> pipe read ->
-    // envelope -> denormalize -> DMA write.
-    if (rt != NULL && rt->IsCable)
-    {
-        AoCableAdvanceByQpc(rt, (ULONGLONG)qpc, AO_ADVANCE_TIMER_CAPTURE, 0);
-
-        // Phase 6 Y3-v3 diagnostic — symmetric to the render side.
-        // 1 Hz per-stream DbgPrint showing the capture helper state
-        // so we can tell whether the audible crackle is caused by
-        // underrun, envelope, or format path issues. Output format:
-        //   [AoY3cap] rt=PTR fade=counter dmon=DmaProducedMono
-        //              fill=/cap ur=underrun drp=drop
-        if (rt->IsCapture && rt->BlockAlign > 0 && g_AoTeQpcFrequency > 0)
-        {
-            LONGLONG elapsedQpc = qpc - rt->DbgY2LastPrintQpc;
-            if (elapsedQpc >= g_AoTeQpcFrequency ||
-                rt->DbgY2LastPrintQpc == 0)
-            {
-                ULONG pipeFill = 0;
-                ULONG pipeCap  = 0;
-                ULONG underrun = 0;
-                ULONG drops    = 0;
-                if (rt->Pipe != NULL)
-                {
-                    pipeFill = rt->Pipe->FillFrames;
-                    pipeCap  = rt->Pipe->CapacityFrames;
-                    underrun = rt->Pipe->UnderrunCount;
-                    drops    = rt->Pipe->DropCount;
-                }
-
-                LONGLONG dmon = (LONGLONG)rt->DmaProducedMono;
-                LONG fadeCtr  = rt->FadeSampleCounter;
-
-                DbgPrint("[AoY3cap] rt=%p fade=%d dmon=%lld "
-                         "fill=%u/%u ur=%u drp=%u\n",
-                         rt, fadeCtr, dmon,
-                         pipeFill, pipeCap, underrun, drops);
-
-                rt->DbgY2LastPrintQpc = qpc;
-            }
-        }
-    }
+    // Phase 6 Y3-v7: VB parity — cable mic advance is query-driven
+    // (from CMiniportWaveRTStream::GetPosition/GetPositions), not
+    // timer-driven. VB 6320 is only called from 5420/4598 query
+    // paths; VB timer DPC (5cc0) calls 6778/68ac which are
+    // scheduling/no-op paths, not data movers. Do not fire the
+    // capture advance from here — it would race with the query
+    // path and reintroduce the cadence asymmetry that caused the
+    // audible crackle in Y3-v3..Y3-v6. Capture diagnostic DbgPrint
+    // is also removed with the advance call since no capture
+    // progress happens on the timer path anymore.
+    UNREFERENCED_PARAMETER(rt);
+    UNREFERENCED_PARAMETER(qpc);
 }
 
 //=============================================================================
