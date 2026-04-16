@@ -1361,11 +1361,14 @@ AoCableReadCaptureToDma(AO_STREAM_RT* rt, ULONG advanceFrames)
         }
 
         // Always fills runWrite bytes (silence on underrun).
+        // Y3-v8 isolation: pass NULL to skip VB envelope on capture
+        // scratch. If this fixes the crackle, the envelope
+        // implementation is the cause. If not, envelope is innocent.
         FramePipeReadToDmaEx(
             rt->Pipe,
             rt->DmaBuffer + bufferOffset,
             runWrite,
-            (PVOID)rt);
+            NULL);
 
         totalWritten  += runWrite;
         bufferOffset   = (bufferOffset + runWrite) % rt->DmaBufferSize;
