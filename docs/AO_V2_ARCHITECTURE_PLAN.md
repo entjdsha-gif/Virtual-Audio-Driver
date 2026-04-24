@@ -15,6 +15,21 @@
 
 ---
 
+CURRENT WARNING (2026-04-16)
+This file is historical context only.
+Do not use it as the current Phase 6 design source.
+
+Authoritative Phase 6 design:
+- `docs/PHASE6_PLAN.md`
+- `docs/PHASE6_OPTION_Y_CABLE_REWRITE.md`
+
+Any wording below that implies "dedicated cadence timer owns transport" is outdated.
+Current direction is:
+- `Z`: revert the failed timer-owned Step 3/4 transport and recover the known-good baseline
+- `Y`: rebuild transport as update-chain-coupled transport, not timer-owned transport
+
+---
+
 ## Direction Summary
 
 AO Virtual Cable의 통화 품질 문제 근본 원인: 현재 byte-ring 기반 transport는 오디오를

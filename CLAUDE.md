@@ -104,6 +104,23 @@ When changing stream-status diagnostics, update these together:
 
 Do not trust hardcoded struct offsets without re-verifying layout.
 
+## Pre-Experiment Phone Link Connection Check (엄수)
+
+라이브콜 실험 전 **매번** Phone Link가 실제로 휴대폰과 연결되어 있는지 확인할 것. Phone Link 앱이 떠있어도 폰쪽 "Windows와 연결" 토글이 꺼져 있으면 dial이 나가지 않고 실험 전체가 무효가 됨. 이번 세션 실제 사고:
+
+- Phone Link 앱 자체는 PhoneExperienceHost PID 존재 + 메인 윈도우 있음
+- 그런데 폰쪽 설정이 꺼져 있어 "모바일 장치에서 Windows와 연결이 꺼져 있음" 에러 화면 표시
+- 현재 `phone_link_main_dialer_disconnected()` 헬퍼는 이 에러 화면을 miss함 (다른 automation id 사용)
+- dialer가 hidden URI를 성공적으로 launch해도 Phone Link가 dial 요청을 무시함
+
+확인 방법 (순서):
+1. Phone Link 앱 열어서 "통화" 탭 상태 시각 확인 — 다이얼 패드가 정상인지, "모바일 장치에서 Windows와 연결이 꺼져 있음" 에러 화면인지
+2. 에러 화면이면 폰 퀵세팅에서 "Windows와 연결" 토글 ON
+3. Phone Link 앱이 dialer 상태로 복구된 것 확인
+4. 그 다음에 run_test_call.py 실행
+
+TODO: `phone_link_dialer.py`의 연결 감지 헬퍼를 강화해서 이 에러 화면도 잡도록 하고, `run_test_call.py` 시작 시 hard-gate로 실행. 현재까지는 수동 확인 엄수.
+
 ## Pre-Experiment Cable Check (엄수)
 
 라이브콜 실험 전 **매번** 시스템 기본장치가 AO Cable A/B인지 확인할 것. install.ps1의 restore 경로가 이전 세션의 default device(보통 VB-Audio)를 복원해버려 사용자도 모르게 VB 경로로 실험이 돌아가는 사고가 실제로 발생했음.

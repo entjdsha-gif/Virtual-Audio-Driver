@@ -1,5 +1,61 @@
 # Pipeline V2 Changelog
 
+## 2026-04-16 - VB runtime parity findings: hybrid call-source model confirmed
+
+**Evidence captured:**
+
+- A-side observed as query-heavier during live-call/query-path sampling
+- B-side observed as timer-dominant hybrid during payload-bearing sampling
+- `+0x22b0` confirmed as a real hot payload primitive on B
+- hot-path WinDbg breakpoints measurably distort live audio quality and therefore remain classification tools, not quality oracles
+
+**Architectural consequence:**
+
+- `shared timer = auxiliary only` is now too weak
+- `timer-only` is also wrong
+- `query-only` is also wrong
+- the safe model is:
+  - multiple active call sources
+  - one canonical cable advance owner
+
+**Docs affected:**
+
+- `docs/PHASE6_PLAN.md`
+- `docs/PHASE6_OPTION_Y_CABLE_REWRITE.md`
+- `docs/CURRENT_STATE.md`
+- `docs/VB_PARITY_DEBUG_RESULTS.md`
+
+---
+
+## 2026-04-16 - Phase 6 direction reset: abandon timer-owned transport, adopt Z -> Y
+
+**What changed conceptually:**
+
+- The earlier Phase 6 timer-owned Step 3/4 transport is no longer the design baseline.
+- The current decision is:
+  - `Z`: revert the failed Step 3/4 data movement and recover the known-good baseline while keeping the Step 1 skeleton
+  - `Y`: rebuild transport as update-chain-coupled transport, not timer-owned transport
+
+**Why:**
+
+Step 3/4 regression is now understood as a structural decoupling problem. Transport movement was moved into an external engine cadence while cursor/accounting/update work remained elsewhere. That split created the regression surface. At this point the project no longer treats "lower the timer period" or "better timer-owned cursor anchoring" as the main architectural answer.
+
+**Architectural consequence:**
+
+- Shared timer remains active, but must not become a second owner
+- Query path remains active too
+- Main transport owner is the canonical cable advance path that both sources funnel into
+- Frame delta, gating, cursor/accounting, and DMA<->pipe movement must stay coupled
+
+**Authoritative docs after this reset:**
+
+- design: `docs/PHASE6_PLAN.md`
+- detailed cable rewrite: `docs/PHASE6_OPTION_Y_CABLE_REWRITE.md`
+- runtime evidence: `docs/VB_PARITY_DEBUG_RESULTS.md`
+- status: `docs/CURRENT_STATE.md`
+
+---
+
 ## 2026-04-15 — FP_WRITE trace + 300 ms headroom test (negative result)
 
 **Files changed:**

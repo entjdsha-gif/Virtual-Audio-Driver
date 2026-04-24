@@ -1,118 +1,180 @@
-# AO Virtual Cable — Current State & Roadmap
+# AO Virtual Cable - Current State
 
-**Last updated:** 2026-04-15
-**Branch:** `feature/ao-fixed-pipe-rewrite`
-**Effective baseline commit:** `ed23271` (Phase 5c)
-**Canonical doc:** this file. Older plan docs kept as historical reference (see bottom).
+**Last updated:** 2026-04-16
+**Primary active design branch:** `feature/ao-phase6-core`
+**Primary active worktree:** `D:/mywork/ao-phase6`
+**Historical branch:** `feature/ao-fixed-pipe-rewrite`
+**Effective last-known-good baseline:** `439bbcd`
 
----
+## Canonical docs
+
+- **Design source of truth:** `docs/PHASE6_PLAN.md`
+- **Detailed Option Y rewrite spec:** `docs/PHASE6_OPTION_Y_CABLE_REWRITE.md`
+- **VB runtime parity findings:** `docs/VB_PARITY_DEBUG_RESULTS.md`
+- **Current status / roadmap:** this file
+- **Historical commit-by-commit record:** `docs/PIPELINE_V2_CHANGELOG.md`
+- **Older architecture history:** `docs/AO_V2_ARCHITECTURE_PLAN.md`
+
+If two documents disagree:
+
+1. runtime evidence
+2. `docs/PHASE6_PLAN.md` for architecture/design intent
+3. `docs/CURRENT_STATE.md` for current execution state and roadmap
+4. `docs/PIPELINE_V2_CHANGELOG.md` for historical record
 
 ## Where we are
 
-### Completed phases (VB-equivalent principles applied)
+### Known-good baseline
 
-| Phase | Scope | Commit | Status |
-|---|---|---|---|
-| 1 | Diagnostic counters + feature flag scaffolding | — | ✅ |
-| 2 | Format parity (32-bit PCM, 32-bit float) | — | ✅ |
-| 3 | Shadow-mode query pump on GetPositions | — | ✅ |
-| 4 | STOP/PAUSE semantic alignment | `439bbcd` | ✅ |
-| 5 | Render transport ownership → GetPositions pump | `2c733f1` | ❌ **reverted** (regression) |
-| 5c | Phase 5 transport revert + scaffold kept | `ed23271` | ⚠️ current tip |
+`439bbcd` remains the effective last-known-good baseline for the phone path.
 
-### What Phase 5c did and did not solve
+That does not mean it is perfect. It means:
 
-Phase 5 attempted to move the cable-render transport call site from the legacy `UpdatePosition` packet cadence into a query-driven helper called from `GetPositions`. Measurement proved the design wrong: `GetPositions` fires at ~130 ms in practice while Phone Link reads Cable B mic at ~1 ms, producing a burst+gap pattern at the pipe output and phone-side chopping. Phase 5c reverted the transport call site back to `UpdatePosition` packet cadence but kept the Phase 5 scaffold (IOCTL, counters, ownership flags) for later reuse.
+- it is the current safe behavioral baseline
+- later Step 3/4 timer-owned transport experiments regressed from it
+- all new design work must compare back to it
 
-Live-call measurement confirmed:
-- **Front-chopping** (first AI utterance lost): resolved by a 40 ms startup headroom prefill added during Phase 5c iterations.
-- **Mid-call chopping** (degraded voice quality on phone): **still present**. Cable B mic runs at ~5 ms ring depth in steady state because writer (UpdatePosition packet cadence) and reader (Phone Link 1 ms pulls) are rate-matched but have zero headroom to absorb WaveRT packet jitter and AI's 200–250 ms burst cadence. Both 40 ms and 300 ms fixed-size prefill experiments proved prefill size is not the right axis — a cushion that depletes between AI bursts cannot fix a cadence mismatch.
+### Phase 5 status
 
-### Why VB is not chopping and we are
+`2c733f1` is the archived failed Phase 5 attempt.
 
-Reverse engineering (see `results/vbcable_pipeline_analysis.md`, `VB_CABLE_AO_COMPARISON_CODEX_NOTES.md`) shows VB-Cable does **not** rely on WaveRT packet cadence for ring fills. Ring fill is driven by the position-query callback (`KSPROPERTY_AUDIO_POSITION`) recalculating elapsed frames from QPC on every query, with a 1 ms high-resolution `ExAllocateTimer` running alongside for metering and drift correction (63/64 phase correction, rebase every 100 ticks). The cadence owner is the driver itself, not the upstream audio source. AO still ties writer cadence to upstream packet delivery, which is why the AI's 250 ms burst pattern surfaces as phone chopping.
+What failed:
 
----
+- moving transport ownership to a query/timer-owned path
+- treating transport cadence as something external to the stream update chain
 
-## Where we are going — Phase 6
+What remains useful:
 
-**Authoritative plan: `docs/PHASE6_PLAN.md` (Codex, 2026-04-15).** Per CLAUDE.md "플랜은 Codex, 실행은 Claude" rule, that file is the source of truth for Phase 6 design. This section is a summary only.
+- historical evidence
+- some scaffolding ideas
+- lessons learned about what not to do
 
-### One-line definition
+But Phase 5 is not a design baseline anymore.
 
-Phase 6은 AO 위 patch가 아니라, **VB-equivalent shared-timer transport core replacement**이다.
+### Phase 6 status
 
-### What changes vs the current codebase
+Phase 6 Step 1 skeleton succeeded.
 
-- A global `AO_TRANSPORT_ENGINE` with a single high-resolution timer owns transport cadence for *all* active streams (render + capture, Cable A + B). No per-pipe timers.
-- Each stream gets an `AO_STREAM_RT` runtime struct tracking `NextEventQpc`, `FramesPerEvent`, `StartupArmed`, `CarryFrames` etc.
-- Transport is **event-driven** (`now >= NextEventQpc`), not query-driven.
-- `GetPositions` / `UpdatePosition` become reporting-only. They never touch FRAME_PIPE.
-- `StartPhaseComplete` sticky flag is removed; startup is re-armed per session via an explicit state machine.
-- Phase 5 scaffold (`IOCTL_AO_SET_PUMP_FEATURE_FLAGS`, `RenderPumpDriveCount`, query-driven pump helpers) is deleted in the final step.
+What is already proven:
 
-### Six implementation steps
+- engine lifecycle scaffolding can exist safely
+- stream register/unregister works
+- shared timer skeleton can be loaded without BSOD
 
-1. Add `AO_TRANSPORT_ENGINE` + `AO_STREAM_RT` structures (no behavior change)
-2. Register/unregister streams in engine at RUN/PAUSE/STOP (legacy transport still active)
-3. Move **render** side to engine event transport; drop legacy render path
-4. Move **capture** side to engine event transport; apply startup/recovery state machine
-5. Finish position-path decouple; remove all legacy transport coupling
-6. Delete Phase 5 scaffold (IOCTLs, feature flags, pump helpers, rollback infra)
+What failed:
 
-See `docs/PHASE6_PLAN.md` for full pseudo-code of `AoTransportTimerCallback`, `AoRunRenderEvent`, `AoRunCaptureEvent`, and the success criteria.
+- Phase 6 Step 3/4 timer-owned transport
 
-### Phase 6 keystone
+Current understanding:
 
-Steps 1–2 are mechanical. Step 3 (render move) is the first behavior change. **Step 4 (capture move + startup state machine) is the actual chopping fix** — this is where the mid-call chopping must disappear. Steps 5–6 are cleanup.
+- the Step 3/4 regression was not just one bad constant
+- it was not solved by "better publish cursor" alone
+- the core mistake was **decoupling transport from the update chain**
 
-### Pending before Step 1 kickoff
+In other words:
 
-- Request file-level breakdown from Codex: where `AO_TRANSPORT_ENGINE` lives, how the engine links into `adapter.cpp` init and `minwavertstream.cpp` RUN/STOP, whether Step 1 is a new source file or an addition to `loopback.*`. Recorded as a followup in `PHASE6_PLAN.md` § "Next follow-up".
-- Commit or revert the uncommitted Bug A Option 2 hns-precision math so Phase 6 starts from a clean working tree.
+- one path advanced accounting/cursor state
+- another path later moved audio on its own cadence
 
----
+That separation is now considered the structural regression source.
 
-## After Phase 6 — product extension (Stage B)
+## Current decision
 
-User requirement beyond VB-equivalent: **accept more channel counts** and **accept all input formats** so the cable is a universal audio sink. Stage B work is scoped after Phase 6 ships:
+The project is now on:
 
-1. Channel extension — verify current `FP_MAX_CHANNELS = 16` path, expose 7.1/Atmos configurations through ControlPanel
-2. Broader format wildcard — 44.1 / 48 / 96 / 192 kHz, int16 / int24 / int32 / float32, any pipe sample rate via SRC
-3. Answering-machine detection (AMD) — telephony feature
-4. ControlPanel runtime config — latency / channels / format live switch
+### `Z`
 
-Stage B is NOT part of Phase 6. Phase 6 must land cleanly first.
+Revert the failed Step 3/4 data movement and recover Step 1 / Phase 4 quality while keeping the reusable engine skeleton.
 
----
+### `Y`
 
-## Stage C — production polish (after Stage B or parallel)
+Rebuild Phase 6 as **update-chain-coupled transport**, not timer-owned transport.
 
-1. `install.ps1` quiesce stability — reduce reboot-fallback frequency
-2. `install.ps1` default-device restore bug — avoid silently reverting from AO to VB after install cycles (observed this session)
-3. Test harness auto Cable A/B verification — enforce pre-experiment check
-4. Changelog / memory consolidation pass
-5. Phase number cleanup
+This means:
 
----
+- main transport owner is the canonical cable advance path
+- query path and shared timer both remain active call sources
+- frame delta, gate, cursor/accounting, and transport move together
+- shared timer must not become a second owner
 
-## Authoritative doc hierarchy
+It explicitly does **not** mean:
 
-When two docs disagree about current state, resolve in this order:
+- "just lower the timer to 1 ms"
+- "make the shared timer own everything"
+- "keep timer-owned transport and tune constants"
 
-1. **Runtime evidence** (captures, DbgView logs, user perceptual reports)
-2. **This file (`docs/CURRENT_STATE.md`)** — single source of truth for current phase, roadmap, and scope
-3. **`docs/PIPELINE_V2_CHANGELOG.md`** — per-commit historical record
-4. **`docs/VB_CABLE_AO_COMPARISON_CODEX_NOTES.md`** — VB reverse-engineering factual reference
-5. **`docs/VB_CABLE_DUAL_PLAN_OPERATING_RULES.md`** — Codex/Claude workflow discipline
-6. **`docs/VB_CABLE_AO_REIMPLEMENTATION_PLAN_CODEX.md`** — long-form architecture blueprint (historical, Phase 5c addendum pending)
-7. **`docs/AO_V2_ARCHITECTURE_PLAN.md`** — M1-M6 productization history (byte-ring era, architecturally superseded)
-8. **`docs/archive/`** — historical plan docs kept for context only
+## Immediate next steps
 
-CLAUDE.md points to this file as the roadmap. Memory `project_remaining_tasks.md` mirrors the current-phase summary.
+1. Finish `Z`
+   - restore legacy cable speaker `ReadBytes` from `UpdatePosition`
+   - restore legacy cable mic `WriteBytes` from `UpdatePosition`
+   - stop timer callback from dispatching render/capture movement
+   - keep Step 1 skeleton
 
----
+2. Validate `Z`
+   - build/install
+   - local loopback
+   - live call
+   - confirm Step 3/4 regression disappears
 
-## Archived
+3. Start `Y1`
+   - add update-chain shadow hook only
+   - no audio movement change yet
+   - follow `docs/PHASE6_OPTION_Y_CABLE_REWRITE.md` for exact cable-only removal scope and phase gates
 
-- `docs/archive/MILESTONES_M1-M6_ACHIEVED.md` — former `VBCABLE_SURPASS_PLAN.md`. M1-M6 milestone completion claim, valid when written but the "Surpass VB" outcome is now contingent on Phase 6.
+4. Start `Y2`
+   - move render transport into update-coupled helper
+   - validate before touching capture
+
+5. Start `Y3`
+   - move capture transport into update-coupled helper
+   - reuse good startup/headroom/recovery ideas only inside the new coupled design
+
+## Current quality gate
+
+We are **not** in cleanup/tuning-only territory yet.
+
+The active quality gate is:
+
+- recover from the failed timer-owned Step 3/4 experiment
+- prove that update-chain-coupled migration can match or beat the `439bbcd` baseline
+
+Until that happens:
+
+- Step 5/6 style cleanup is not the main work
+- timer-owned transport is not the design baseline
+- "VB-equivalent" means structural coupling with hybrid call sources, not simply a faster timer
+
+## Runtime evidence snapshot
+
+The current VB runtime evidence is recorded in `docs/VB_PARITY_DEBUG_RESULTS.md`.
+
+What is already strong enough to act on:
+
+- A side looks query-heavier
+- B side is timer-dominant hybrid
+- `+0x22b0` is a real hot payload primitive
+- hot-path WinDbg breakpoints are intrusive enough to distort quality judgment
+
+What still remains open before claiming full VB identity:
+
+- packet notification contract
+- capture branch parity
+- full lifecycle reset semantics beyond register/unregister entry
+
+## Stage B and later
+
+After Phase 6 lands cleanly:
+
+1. broader channel acceptance
+2. broader format acceptance
+3. telephony features such as AMD
+4. ControlPanel runtime configuration polish
+
+These are intentionally downstream of Phase 6.
+
+## One-line summary
+
+Current project direction is:
+
+**recover from the failed timer-owned experiment, then rebuild Phase 6 so query and timer both funnel into one canonical cable advance path instead of maintaining separate ownership models.**

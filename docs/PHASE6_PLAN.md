@@ -1,528 +1,431 @@
-# Phase 6 — VB-equivalent Core Replacement
+# Phase 6 Plan
 
-> **Authoritative Phase 6 plan. Source: Codex (2026-04-15).**
-> Per CLAUDE.md ordering, this plan takes precedence over Claude drafts if they conflict.
-> Live status and step progress live in `docs/CURRENT_STATE.md`.
+> Authoritative Phase 6 plan as of 2026-04-16.
+> If this file conflicts with older notes, Phase 5 experiments, or timer-owned Phase 6 drafts, this file wins.
 
-## 목표
+Detailed cable-stream rewrite spec:
 
-기존 AO transport를 계속 보수하지 않는다.
-`439bbcd`를 작업 베이스로 두고, 그 위에 **VB-equivalent transport core**를 새로 올린다.
+- `docs/PHASE6_OPTION_Y_CABLE_REWRITE.md`
+- `docs/VB_PARITY_DEBUG_RESULTS.md`
+- `docs/PHASE6_Y_IMPLEMENTATION_WORK_ORDER.md`
 
-이 Phase의 목표는 다음과 같다.
+## Current position
 
-1. 드라이버가 transport cadence를 완전히 소유한다
-2. render/capture transport를 query-driven이 아니라 **event-driven**으로 바꾼다
-3. startup / underrun / recovery를 명시적인 상태 기계로 관리한다
-4. position reporting과 transport를 분리한다
-5. 기존 AO 스타일 기능은 코어가 안정화된 뒤 위에 다시 입힌다
+We now have three distinct states:
 
-## 폐기 대상
+1. `439bbcd`
+   Effective last-known-good baseline for the phone path.
 
-Phase 6에서는 아래 접근을 코어에서 제거한다.
+2. `2c733f1`
+   Archived failed Phase 5 attempt. Keep for history, not as a design baseline.
 
-- `GetPositions` 기반 transport
-- `UpdatePosition` 기반 transport
-- per-call time math로 write/read 양을 결정하는 방식
-- Phase 5 render ownership hook
-- Phase 5 rollback/scaffold를 코어 설계의 전제로 두는 방식
+3. Phase 6 Step 3/4 timer-owned transport experiment
+   Also failed. The problem was not just a constant or one bad cursor choice. The structural mistake was **decoupling transport from the update chain** and moving audio transfer into an external engine cadence.
 
-즉, **position query가 transport를 drive하는 구조를 완전히 버린다**.
+The next move is therefore:
 
----
+- `Z`: revert Step 3/4 data movement and recover the known-good baseline behavior while keeping the Step 1 skeleton
+- `Y`: reimplement Phase 6 as a **VB-equivalent update-chain-coupled transport**, not as a timer-owned transport core
 
-## Core Model
+## What Phase 6 is now
 
-### 1. Global Engine
+Phase 6 is now a **cable-stream core rewrite**.
 
-드라이버 전역에 high-resolution shared timer 1개를 둔다.
+That means:
 
-```c
-typedef struct _AO_TRANSPORT_ENGINE {
-    EX_TIMER*      Timer;
-    KSPIN_LOCK     Lock;
-    BOOLEAN        Running;
-    LONGLONG       PeriodQpc;          // default 20ms
-    LONGLONG       NextTickQpc;
-    ULONG          ActiveStreamCount;
-    LIST_ENTRY     ActiveStreams;      // all active render/capture streams
-} AO_TRANSPORT_ENGINE;
-```
+- we keep the PortCls / WaveRT shell
+- we keep device registration, INF, install, service, adapter, filter, and non-cable paths
+- we discard the MSVAD-derived cable-stream transport/update pattern
 
-**핵심 규칙:**
+Phase 6 is no longer:
 
-- timer는 전역 1개
-- 모든 active stream은 같은 tick 안에서 처리
-- stream별 독립 timer 금지
-- render/capture가 같은 tick 경계 안에서 순차 실행
+- a shared-timer-owned render/capture transport experiment
+- a "1 ms timer will fix it" experiment
+- a GetPositions-only ownership model
+- a tuning exercise on top of the existing MSVAD cable path
 
-### 2. Per-Stream Runtime
+Phase 6 is now:
 
-각 stream은 transport용 runtime state를 가진다.
+- a new cable-stream core where accounting and transport stay coupled
+- a design where frame delta calculation, gating, cursor/accounting, DMA<->pipe movement, and position freshness are owned by one canonical cable advance path
+- a design where query path and shared timer may both be active call sources, but neither may become a second owner
+- a design that uses the existing engine skeleton only as supporting infrastructure
+- a design where shared-mode phone paths do not depend on packet-ready notification as a Y1 blocker
 
-```c
-typedef struct _AO_STREAM_RT {
-    LIST_ENTRY     Link;
+## Rewrite boundary
 
-    CMiniportWaveRTStream* Stream;
-    BOOLEAN        IsCapture;
-    BOOLEAN        IsCable;
-    BOOLEAN        IsSpeakerSide;
-    BOOLEAN        Active;
+### Keep
 
-    ULONG          SampleRate;
-    ULONG          Channels;
-    ULONG          BlockAlign;
+- PortCls / WaveRT framework usage
+- `PcAddAdapterDevice`, subdevice registration, filter/pin/topology setup
+- install / INF / signing / service scaffolding
+- `FRAME_PIPE` infrastructure, unless a later implementation detail forces a local rewrite
+- non-cable stream behavior
 
-    ULONG          FramesPerEvent;     // primary transport unit
-    ULONG          BytesPerEvent;      // derived: FramesPerEvent * BlockAlign
-    LONGLONG       EventPeriodQpc;     // derived from FramesPerEvent and SampleRate
-    LONGLONG       NextEventQpc;
+### Rewrite
 
-    BOOLEAN        StartupArmed;
-    ULONG          StartupTargetFrames;
-    ULONG          StartupThresholdFrames;
-    ULONG          MinHeadroomFrames;
+Cable-stream-specific MSVAD-derived transport/update behavior is not a baseline anymore.
 
-    ULONG          LateEventCount;
-    ULONG          UnderrunEvents;
-    ULONG          DropEvents;
+For cable streams, Phase 6 is allowed to replace:
 
-    ULONG          DmaOffset;          // current DMA-side transport offset
-    ULONG          CarryFrames;        // non-integer rate/period carry
-} AO_STREAM_RT;
-```
+- `UpdatePosition` as the authoritative transport owner
+- cable-side `ReadBytes` / `WriteBytes` ownership
+- `m_pNotificationTimer`
+- `m_pDpc`
+- precomputed `m_ullLinearPosition += ByteDisplacement` as the cable truth source
+- any cable-only dependence on the old periodic simulated-hardware pattern
 
-**핵심 규칙:**
+## Design rules
 
-- stream마다 `next_event_qpc` 보유
-- event마다 처리할 frame 수는 고정
-- 44.1k 등 비정수는 `CarryFrames`로 보정
-- render/capture 모두 동일한 event contract 사용
+### 1. Canonical cable advance path
 
-## Scheduling Model
+Cable streams must have exactly one canonical advancement routine.
 
-### 3. Timer Callback
-
-전역 timer callback은 stream 배열/리스트를 순회한다.
+Suggested shape:
 
 ```c
-VOID AoTransportTimerCallback(...)
-{
-    qpc = KeQueryPerformanceCounter(NULL);
-
-    Acquire(engine->Lock);
-
-    for each stream in engine->ActiveStreams:
-        if (!stream->Active)
-            continue;
-
-        if (qpc < stream->NextEventQpc)
-            continue;
-
-        if (stream->IsCapture)
-            AoRunCaptureEvent(stream, qpc);
-        else
-            AoRunRenderEvent(stream, qpc);
-
-        stream->NextEventQpc += stream->EventPeriodQpc;
-
-    Release(engine->Lock);
-}
+AoCableAdvanceByQpc(rt, nowQpc, reason, flags);
 ```
 
-**핵심 규칙:**
+This routine owns, together, for cable streams:
 
-- timer tick은 단지 "검사 펄스"
-- 실제 transport는 `now >= next_event_qpc`인 stream만 수행
-- 같은 callback에서 render/capture 모두 처리
-- 같은 cable pair에서는 render를 먼저, capture를 나중에 처리해 위상차를 최소화
+1. QPC -> frame delta calculation
+2. minimum gate logic
+3. monotonic cursor/accounting updates
+4. DMA linearization / wrap handling
+5. `FRAME_PIPE` read/write
+6. position freshness before reporting to WaveRT clients
 
-## Transport Paths
+This is the key rewrite rule:
 
-### 4. Render Event
+**No second path is allowed to "just move audio later" using state published by the first path.**
 
-render event는 DMA에서 pipe로 고정 chunk를 밀어넣는다.
+That split was the Step 3/4 regression source.
+
+### 2. Call sources
+
+The call source may be more than one entrypoint, but they must all funnel into the same canonical cable advance path.
+
+Possible call sources include:
+
+- `GetPosition`
+- `GetPositions`
+- `GetReadPacket`
+- `SetWritePacket`
+- a shared engine tick
+
+Runtime evidence in `docs/VB_PARITY_DEBUG_RESULTS.md` currently supports:
+
+- A-side query-heavier behavior
+- B-side timer-dominant hybrid behavior
+- therefore neither `query-only` nor `timer-only` wording is safe
+
+Do not assume `GetLinearBufferPosition` exists unless it is found in the current codebase.
+
+The important rule is not the name of the entrypoint.
+The important rule is:
+
+**all cable transport/accounting work must go through the same advancement function.**
+
+Loud implementation rule:
+
+- every cable `GetPosition` call must invoke the canonical helper before reporting offsets
+- every cable `GetPositions` call must invoke the canonical helper before reporting positions
+- packet-mode surfaces may also invoke the helper, but they must not become a second ownership path
+
+### 3. Shared timer role
+
+The shared timer remains in the codebase as an **active first-class call source**, but it is not allowed to become a second owner.
+
+Allowed uses:
+
+- shared wakeups that enter the canonical cable advance path
+- lifecycle scaffolding
+- idle/background bookkeeping
+- optional diagnostics
+- future helper work that ultimately funnels into the canonical cable advance path
+
+Explicitly forbidden for cable streams:
+
+- per-stream `m_pNotificationTimer` ownership as the old MSVAD transport owner
+- per-stream DPC ownership as the old MSVAD transport owner
+- a second transport path outside the canonical cable advance path
+
+Forbidden use:
+
+- a second independent transport owner that bypasses the canonical cable advance path
+- a timer-owned cursor/accounting truth separate from the query/packet truth
+
+### 4. Units
+
+All runtime transport math is frame-count-driven.
+
+- authoritative unit: `frames`
+- derived units: `bytes`, `QPC`
+- forbidden runtime unit: `ms`
+
+`ms` may appear only in:
+
+- comments
+- external UI
+- logs for human readability
+
+It must not be stored as runtime state and must not drive transport math.
+
+### 5. Required VB-parity implementation details
+
+The following are not optional polish items.
+They are required for Option Y to remain meaningfully VB-equivalent:
+
+1. **63/64 drift correction**
+   - the canonical cable advance path must include drift-corrected scheduling/accounting behavior
+   - this is not a later optimization item
+   - long-running calls must not depend on raw timer regularity alone
+
+2. **Scratch linearization before processing**
+   - the canonical helper must support `DMA circular -> linear scratch -> FRAME_PIPE`
+   - do not make wrap handling an incidental side effect scattered across conversion code
+
+3. **DMA overrun guard**
+   - the canonical helper must reject or skip pathological late bursts before they exceed the safe DMA-window bound
+   - this guard sits next to the frame gate and is part of the authoritative helper contract
+
+If these three are absent, the design may still compile and sound close, but it is not considered sufficiently VB-equivalent.
+
+### 6. Keep transport and accounting coupled
+
+Within the authoritative update path, the following belong together:
+
+1. QPC/frame delta calculation
+2. minimum gate logic
+3. monotonic cursor/accounting update
+4. DMA linearization or wrapping logic
+5. `FRAME_PIPE` read/write
+
+If these steps are split across independent clocks, stale gaps and race-like behavior return.
+
+### 7. Render and capture may remain asymmetric
+
+Render and capture do not have to use the exact same helper internals, but they must obey the same rule:
+
+**the producer/consumer accounting used by transport must be advanced in the same chain that triggers transport.**
+
+Do not force symmetry if the real producer differs by direction.
+
+## What is abandoned
+
+The following are explicitly abandoned and must not come back as the primary design:
+
+- timer-owned Step 3/4 data movement
+- fixed 20 ms engine-owned burst transport
+- "just lower the timer to 1 ms" as the main fix
+- "publish a better cursor to the timer engine and keep the rest the same"
+
+Those may be useful diagnostics, but they are not the Phase 6 architecture.
+
+## Z: immediate recovery step
+
+### Goal
+
+Recover Step 1 / Phase 4 quality while preserving the reusable Phase 6 skeleton.
+
+### Code changes
+
+1. Restore legacy cable speaker `ReadBytes` from `UpdatePosition`
+2. Restore legacy cable mic `WriteBytes` from `UpdatePosition`
+3. Stop the timer callback from dispatching `AoRunRenderEvent` / `AoRunCaptureEvent`
+4. Keep:
+   - `AO_TRANSPORT_ENGINE`
+   - `AO_STREAM_RT`
+   - engine init/cleanup
+   - stream register/unregister
+   - shared timer creation/destruction
+   - helper scaffolding that does not move audio
+   - the future hook points needed for the cable-stream rewrite
+
+### Validation gate
+
+Do not start `Y` until `Z` passes:
+
+1. build/install succeeds
+2. no BSOD / hang / deadlock
+3. local loopback returns to Step 1 / Phase 4 level
+4. live call regression from Step 3/4 disappears
+
+## Y: redefined Phase 6
+
+### Definition
+
+`Y` means:
+
+**VB-equivalent cable-stream core rewrite**
+
+It does **not** mean:
+
+- "1 ms timer-only engine"
+- "shared timer now owns everything"
+- "keep MSVAD cable transport and just tune it"
+- "port only one helper and leave the rest of the cable path MSVAD-owned"
+
+### Y1: canonical cable runtime + shadow hook
+
+Build the cable-stream runtime and canonical cable advance helper without changing audible movement yet.
+
+Example shape:
 
 ```c
-VOID AoRunRenderEvent(AO_STREAM_RT* rt, LONGLONG qpc)
-{
-    frames = AoComputeFramesForEvent(rt);   // fixed + carry
-    bytes  = frames * rt->BlockAlign;
-
-    AoLinearizeDmaIfWrapped(rt->Stream, rt->DmaOffset, bytes, scratch);
-    FramePipeWriteFromDma(rt->Pipe, scratch, bytes);
-
-    rt->DmaOffset = (rt->DmaOffset + bytes) % rt->Stream->m_ulDmaBufferSize;
-}
+AoCableAdvanceByQpc(rt, nowQpc, reason, flags);
 ```
 
-**규칙:**
+The helper may compute and record:
 
-- event마다 고정 frame 수 처리
-- query rate와 무관
-- DMA wrap은 scratch로 선형화
-- overflow는 reject + counter
+- frame delta
+- gating result
+- would-move frame count
+- monotonic accounting state
+- diagnostics
 
-### 5. Capture Event
+But audible cable transport remains legacy during this shadow step.
 
-capture event는 pipe에서 읽어 mic DMA에 고정 chunk를 채운다.
+#### Y1 pass criteria
 
-```c
-VOID AoRunCaptureEvent(AO_STREAM_RT* rt, LONGLONG qpc)
-{
-    frames = AoComputeFramesForEvent(rt);
-    bytes  = frames * rt->BlockAlign;
+- no quality change
+- no new timing instability
+- cable call sources successfully funnel into the new canonical helper
+- we can observe one source of truth for cable accounting
+- 63/64 drift correction is present in the helper, not deferred
+- scratch linearization path exists in the helper design and implementation surface
+- overrun guard exists next to the frame gate before audible migration begins
 
-    if (rt->StartupArmed)
-    {
-        if (FramePipeGetFillFrames(rt->Pipe) < rt->StartupThresholdFrames)
-        {
-            AoWriteSilenceToMicDma(rt, bytes);
-            return;
-        }
-        rt->StartupArmed = FALSE;
-    }
+### Y2: render migration
 
-    readFrames = FramePipeReadToDmaPartial(rt->Pipe,
-                    rt->DmaBuffer + rt->DmaOffset, bytes);
-
-    if (readFrames < frames)
-    {
-        AoZeroTail(rt, frames - readFrames);
-        rt->UnderrunEvents++;
-    }
-
-    rt->DmaOffset = (rt->DmaOffset + bytes) % rt->Stream->m_ulDmaBufferSize;
-}
-```
-
-**규칙:**
-
-- startup arm/threshold는 capture side의 일급 개념
-- underrun 시 전체 zero-fill이 아니라 partial-read + tail zero-fill
-- Phone Link의 1ms read는 이미 준비된 DMA chunk를 읽게 됨
-
-## Startup / Recovery
-
-### 6. Startup State Machine
-
-새 call / 새 mic session / speaker reopen 시 명시적으로 startup을 재무장한다.
-
-**상태:**
-
-- `StartupArmed = TRUE`
-- `StartupThresholdFrames = 20~40ms 수준`
-- threshold 도달 전까지 capture는 silence
-- threshold 도달 후 steady-state 진입
-
-**규칙:**
-
-- `StartPhaseComplete` 같은 sticky one-shot 플래그에 의존하지 않는다
-- session boundary마다 반드시 재무장
-- startup cushion과 steady-state target fill은 분리한다
-
-## Position Decoupling
-
-### 7. Position Reporting
-
-`GetPositions`와 `UpdatePosition`은 transport를 drive하지 않는다.
-
-**역할:**
-
-- linear/presentation position bookkeeping
-- WaveRT packet accounting
-- QPC timestamp reporting
-
-**금지:**
-
-- pipe write/read 호출
-- transport chunk move
-- query cadence에 transport를 묶는 모든 동작
-
-즉:
-
-- **position path = reporting only**
-- **timer engine = transport only**
-
-## Latency Unit Policy — **samples only, never ms**
-
-> 규범: 드라이버/ControlPanel/Registry/IOCTL/test harness 어디에서도 latency 값으로 ms를 쓰지 않는다. 언제 어디서나 **samples (frames)** 만 쓴다.
-
-### 엄격 규칙
-
-1. **Primary storage unit = samples (frames)**. 모든 latency/cushion/period 필드는 frame count로 저장된다. `FramesPerEvent`, `StartupTargetFrames`, `StartupThresholdFrames`, `MinHeadroomFrames` 등.
-2. **QPC/bytes는 파생값**. `EventPeriodQpc = FramesPerEvent × qpc_freq / SampleRate`, `BytesPerEvent = FramesPerEvent × BlockAlign`. 저장할지 캐싱할지는 구현 자유.
-3. **ms는 어디에도 저장되지 않는다**. 구조체 필드 금지. 상수 이름에 ms 금지. 주석에 "20 ms @ 48k" 같은 설명이 들어가는 건 OK지만 **값 자체가 ms로 저장되는 필드는 존재 금지**.
-4. **Registry / ControlPanel / IOCTL 구성값도 samples**. 사용자 입력도 samples로 직접 받는다. 이전 ms 기반 설정이 있다면 마이그레이션 단계에서 1회 frames로 변환 후 그 값으로만 저장.
-5. **non-48k 정밀도 보존**. 44.1k / 96k / 192k 등에서 ms로 표현하면 정수로 안 떨어지는 값도 samples로 저장하면 그대로 보존. 예: 20 ms @ 44.1k = 882 samples (정수). samples를 primary로 두면 round-trip 손실 zero.
-6. **Bug A 재발 방지**. Bug A는 `bytes = ms_rounded × sample_rate × blockAlign / 1000` 식의 ms quantization이 원인이었다. Phase 6 core에는 `elapsed_qpc → frames` 직통 경로만 존재하고 ms quantization step 자체가 없으므로 구조적으로 같은 종류의 오차가 재발할 수 없다.
-7. **로그/표시도 frames 우선**. 사람이 읽는 로그도 가능한 한 samples 단위. 필요하면 표시 시점에 한 번 `frames × 1000 / SampleRate` 를 계산해서 `(≈X ms)` 보조 표기 추가 허용 — 단 저장값은 여전히 frames.
-
-### 금지 리스트 (Phase 6 진입 시 제거/리네임 대상)
-
-- `FP_STARTUP_HEADROOM_MS` 상수 → `FP_STARTUP_HEADROOM_FRAMES` 또는 제거
-- `EventPeriodMs` 필드 (초안에 있었음, 이미 제거됨)
-- `savedLatency` (ms 단위로 추정되는 이름) → `savedLatencyFrames`
-- `latencyMs`, `targetFillMs` 같은 이름 가진 기존 변수/함수
-- Registry key 중 ms 값이 있다면 frames 기반 key로 교체 (legacy key 유지 불가)
-
-### 영향 범위 (Phase 6 작업 동안 같이 정리)
-
-- `Source/Utilities/loopback.cpp` / `loopback.h` — 모든 latency 상수/필드 frames 기반으로
-- `Source/Main/adapter.cpp` — registry load/store 경로 frames로 교체
-- `Source/Main/ioctl.h` — 공유 구조체 latency 필드 frames로
-- `Source/ControlPanel/main.cpp` — 사용자 UI 단위 samples로 교체
-- `tests/` — 테스트 구성값도 frames 기반
-
-## Pipe Contract
-
-### 8. FRAME_PIPE Role
-
-FRAME_PIPE는 그대로 **"유일한 transport ring"** 으로 유지한다.
-
-**유지할 것:**
-
-- INT32 ring
-- normalize/denormalize
-- channel mapping
-- hard reject overflow
-- underrun counter
-- format registration
-
-**바꿀 것:**
-
-- write/read를 호출 시점마다 즉흥적으로 하지 않음
-- engine event가 pipe를 drive
-
-## Implementation Order
-
-### Step 1
-- 전역 `AO_TRANSPORT_ENGINE` + `AO_STREAM_RT` 구조체 추가
-- 동작 변화 없음
-
-### Step 2
-- stream RUN/PAUSE/STOP에서 engine register/unregister 추가
-- 아직 legacy transport 유지
-
-### Step 3
-- render side를 engine event transport로 전환
-- `GetPositions`/`UpdatePosition` transport 제거
-
-### Step 4
-- capture side를 engine event transport로 전환
-- startup/recovery 적용
-
-### Step 5
-- position path decouple 완료
-- legacy transport 완전 제거
-
-### Step 6
-- Phase 5 scaffold 정리
-  - `IOCTL_AO_SET_PUMP_FEATURE_FLAGS` 제거
-  - `RenderPumpDriveCount`/`LegacyDriveCount` 제거
-  - query-driven pump helper 제거
-
-## Success Criteria
-
-- deterministic local-in-Chrome repro shows no first-4-second 20ms stale replay signature
-  - practical gate: `AC[20ms] @ start+2s <= 0.20`
-
-- local loopback에서 VB 수준 clean
-- Phone Link live call에서 phone chopping 없음
-- Cable B mic read cadence가 1ms여도 steady-state underrun 없음
-- startup 첫 구간이 잘리지 않음
-- `GetPositions` 호출 빈도 변화가 transport 품질에 영향 없음
-
-## One-Line Definition
-
-**Phase 6은 AO 위 patch가 아니라, VB-equivalent shared-timer transport core replacement이다.**
-
----
-
-## Next follow-up (pending)
-
-## Addendum — Working Baseline
-
-- `439bbcd` is the effective last-known-good baseline for the phone path.
-- `2c733f1` remains in history as the archived failed Phase 5 attempt.
-- Phase 6 starts from the Phase 4 baseline semantics, not from the Phase 5 transport hook.
-
-## Addendum — File-Level Breakdown (authoritative)
-
-This addendum pins the Phase 6 skeleton to the current AO file layout so Step 1
-implementation can begin without re-deciding ownership.
-
-### 1. New files
-
-Create a dedicated transport engine pair:
-
-- `Source/Utilities/transport_engine.h`
-- `Source/Utilities/transport_engine.cpp`
-
-Reason:
-
-- `loopback.cpp` remains the home of `FRAME_PIPE` ring semantics
-- `minwavertstream.cpp` remains stream-facing WaveRT glue
-- the shared timer engine is a third concern and should not be hidden inside
-  either ring code or stream code
-
-### 2. What stays in `loopback.cpp/.h`
-
-Keep `FRAME_PIPE` here, including:
-
-- ring storage and indices
-- normalize / denormalize
-- channel mapping
-- `FramePipeWriteFromDma`
-- `FramePipeReadToDma` and partial-read helpers
-- fill / drop / underrun accounting
-- format registration
-
-Do not place the shared transport scheduler or timer callback here.
-
-### 3. What goes in `transport_engine.cpp/.h`
-
-This file pair owns:
-
-- `AO_TRANSPORT_ENGINE`
-- `AO_STREAM_RT`
-- global shared timer creation / destruction
-- active stream list management
-- timer callback
-- due-stream scheduling
-- render event runner
-- capture event runner
-- startup arm / re-arm policy
-
-Suggested public surface:
-
-```c
-NTSTATUS AoTransportEngineInit();
-VOID     AoTransportEngineCleanup();
-
-NTSTATUS AoTransportRegisterStream(CMiniportWaveRTStream* stream);
-VOID     AoTransportUnregisterStream(CMiniportWaveRTStream* stream);
-VOID     AoTransportOnRun(CMiniportWaveRTStream* stream);
-VOID     AoTransportOnPause(CMiniportWaveRTStream* stream);
-VOID     AoTransportOnStop(CMiniportWaveRTStream* stream);
-```
-
-### 4. What changes in `adapter.cpp`
-
-`adapter.cpp` is the correct place to create and destroy the engine because it
-already owns global driver bring-up / teardown.
-
-Add:
-
-- engine init after global pipe init succeeds
-- engine cleanup during adapter teardown / uninstall path
-
-Do not hide engine creation inside first-stream-open lazy init unless later
-stability work proves that necessary.
-
-### 5. What changes in `minwavertstream.h`
-
-Add a per-stream transport pointer to `CMiniportWaveRTStream`:
-
-```c
-AO_STREAM_RT* m_pTransportRt;
-```
-
-Ownership model:
-
-- `CMiniportWaveRTStream` owns the pointer for its lifetime
-- the engine active list holds non-owning references
-- allocate once on first registration (or stream construction)
-- free on stream destruction
-
-Do not use a global map keyed by stream pointer unless later debugging proves
-it is necessary. A direct stream-owned pointer is simpler and fits the current
-architecture better.
-
-### 6. What changes in `minwavertstream.cpp`
-
-Use `SetState(RUN/PAUSE/STOP)` as the authoritative engine registration /
-activation bridge.
-
-Expected wiring:
-
-- `RUN`
-  - ensure `m_pTransportRt` exists
-  - register / activate stream in engine
-  - arm startup state for capture side
-- `PAUSE`
-  - mark stream inactive for scheduling
-  - keep runtime object attached to stream
-- `STOP`
-  - unregister from active scheduling
-  - reset transport-facing per-session state
-
-Important:
-
-- `GetPositions` and `UpdatePosition` must not move audio data
-- they remain reporting / bookkeeping only
-
-### 7. Locking rules
-
-Do **not** allow ad hoc nested locking. The Phase 6 engine should use this
-contract:
-
-- `m_PositionSpinLock`: stream-local position bookkeeping only
-- `EngineLock`: active stream list + scheduler metadata only
-- `PipeLock`: ring read/write only
-
-Preferred rule:
-
-- never hold `EngineLock` while taking `PipeLock`
-- never hold `m_PositionSpinLock` while taking `EngineLock`
-- never hold `m_PositionSpinLock` while taking `PipeLock`
-
-Implementation pattern:
-
-1. timer callback takes `EngineLock`
-2. snapshots due streams into a small local array
-3. releases `EngineLock`
-4. runs render/capture events per stream
-5. each event may briefly take that stream's `PipeLock`
-
-This snapshot-and-drop pattern is the default. If any future code needs a
-different order, it must document the exception explicitly.
-
-### 7.5. Unit discipline
-
-Phase 6 stores transport and latency state in **frames**, not milliseconds.
+Move cable render transport into the canonical cable advance path.
 
 Rules:
 
-- `FramesPerEvent` is the authoritative event size
-- `BytesPerEvent` is derived from `FramesPerEvent * BlockAlign`
-- `EventPeriodQpc` is derived from `FramesPerEvent` and stream sample rate
-- startup thresholds and headroom values are stored as frame counts
-- milliseconds are allowed only at UI / registry / display boundaries and must
-  be converted to frames immediately
+- cable render no longer depends on old MSVAD transport ownership
+- helper performs accounting and transport together
+- any call source still funnels through the same helper
+- old cable-render `UpdatePosition` transport ownership is retired
 
-Practical implication:
+#### Y2 pass criteria
 
-- remove `EventPeriodMs` from runtime state
-- avoid any `elapsed_ms -> bytes` transport math in the engine
-- keep scheduling and recovery math in frame/sample space end-to-end
+- local loopback is not worse than `Z`
+- no new buzz/static regression
+- render path is at least Phase 4 level before moving capture
 
-### 8. Explicit non-goals for Step 1
+### Y3: capture migration
 
-Step 1 should **not** attempt to:
+Move cable capture transport into the canonical cable advance path.
 
-- port every existing diagnostic counter
-- preserve Phase 5 rollback flags
-- add Phone Link specific special-casing
-- tune the final event size perfectly
+Reuse the good parts learned from the Step 4 experiment:
 
-Step 1 only needs:
+- startup arming
+- threshold/headroom concepts
+- partial-read + tail zero-fill behavior
 
-- shared timer exists
-- streams can register/unregister
-- timer callback can schedule no-op or stub events safely
+But keep them inside the update-coupled transport design.
 
-That is enough to validate the skeleton before data movement is switched over.
+#### Y3 pass criteria
 
-Codex는 이 skeleton을 현재 파일 구조(`loopback.cpp` / `minwavertstream.cpp` / `adapter.cpp`)에 어떻게 배치할지 파일 단위로 풀어줄 수 있다. Step 1 진입 전에 이 file-level 브레이크다운을 받아두는 것을 권장한다.
+- Phone Link call path improves or at minimum does not regress from `Z`
+- startup clipping is reduced
+- mid-call chopping is reduced
+
+### Y4: cable MSVAD-remnant cleanup
+
+After Y2/Y3 pass, remove stale remnants from the failed timer-owned attempt.
+
+Cleanup targets:
+
+- timer-owned transport-only assumptions
+- stale comments about transport ownership
+- unused Step 3/4-only fields/helpers
+- old scaffolding that no longer serves the update-coupled design
+- cable-stream `m_pNotificationTimer` / `m_pDpc` remnants if no longer required
+- cable-stream dependence on old MSVAD periodic position-simulation patterns
+
+## File-level ownership
+
+### `Source/Main/minwavertstream.cpp`
+
+This is now the most important Phase 6 rewrite file.
+
+It owns:
+
+- the authoritative cable-stream update path
+- the WaveRT-facing cable entrypoints that will feed the canonical cable advance path
+- stream-specific bridging from WaveRT state into the rewritten cable core
+
+This file is where `Y1`, `Y2`, and `Y3` are anchored.
+The cable-stream rewrite details, current AO file:line references, and the implementation-phase risk table live in `docs/PHASE6_OPTION_Y_CABLE_REWRITE.md`.
+
+### `Source/Utilities/transport_engine.h`
+
+Owns shared Phase 6 runtime structures and helper APIs:
+
+- `AO_TRANSPORT_ENGINE`
+- `AO_STREAM_RT`
+- helper declarations for update-coupled transport
+
+Keep the API surface narrow. This file should describe runtime structures, not re-own WaveRT semantics.
+
+### `Source/Utilities/transport_engine.cpp`
+
+Owns reusable helper logic and auxiliary engine lifecycle:
+
+- engine init/cleanup
+- stream registration bookkeeping
+- helper routines used by the rewritten cable core, including the implementation of `AoCableAdvanceByQpc(...)`
+- optional auxiliary timer behavior
+
+This file must not silently become the main transport owner again.
+
+`Source/Main/minwavertstream.cpp` remains the WaveRT-facing callsite owner.
+`Source/Utilities/transport_engine.cpp` owns the canonical helper implementation.
+
+### `Source/Utilities/loopback.cpp`
+
+Owns `FRAME_PIPE` and conversion/ring behavior only.
+
+It should not decide transport ownership.
+
+### `Source/Main/adapter.cpp`
+
+Owns engine lifetime at device level:
+
+- create after `FramePipeInit`
+- destroy on teardown
+
+No main transport policy belongs here.
+
+## Locking rules
+
+The locking hierarchy remains strict:
+
+1. engine/global bookkeeping lock
+2. stream-local position/accounting lock
+3. `FRAME_PIPE` lock
+
+Avoid nested ad hoc locking.
+
+The update-coupled helper should do the minimum necessary under each lock and not hold unrelated locks across large data movement.
+
+## Success criteria
+
+Phase 6 is only considered successful if all of the following become true:
+
+1. `Z` restores the Step 1 / Phase 4 baseline behavior
+2. `Y2` render migration does not worsen local loopback or reintroduce static
+3. `Y3` reduces phone chopping on live call
+4. startup clipping is improved, not worsened
+5. cable streams no longer depend on the old MSVAD periodic transport pattern
+6. transport quality no longer depends on the failed timer-owned Step 3/4 experiment
+7. the failed timer-owned Step 3/4 path can be cleanly removed afterward
+8. shared-mode phone paths work without making packet-notification parity a Y1 blocker
+
+## One-line summary
+
+Phase 6 is now:
+
+**revert the failed timer-owned transport, then rewrite the cable-stream core so timer and query both funnel into one canonical cable advance path that owns accounting, transport, and position freshness instead of the old MSVAD-derived transport pattern.**
