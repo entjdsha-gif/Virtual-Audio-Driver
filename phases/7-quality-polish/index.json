@@ -1,0 +1,38 @@
+{
+  "phase": "7-quality-polish",
+  "project": "AO Cable V1",
+  "status": "planned",
+  "summary": "Post-rewrite product polish: multi-channel, broader format acceptance, telephony category metadata, Control Panel UX, benchmark suite, M6 shipping prep.",
+  "steps": [
+    {
+      "step": 0,
+      "name": "rate-aware-frame-gate",
+      "status": "pending"
+    },
+    {
+      "step": 1,
+      "name": "telephony-category-metadata",
+      "status": "pending"
+    },
+    {
+      "step": 2,
+      "name": "multi-channel-support",
+      "status": "pending"
+    },
+    {
+      "step": 3,
+      "name": "control-panel-diagnostics-polish",
+      "status": "pending"
+    },
+    {
+      "step": 4,
+      "name": "benchmark-suite-extension",
+      "status": "pending"
+    },
+    {
+      "step": 5,
+      "name": "m6-shipping-checklist",
+      "status": "pending"
+    }
+  ]
+}

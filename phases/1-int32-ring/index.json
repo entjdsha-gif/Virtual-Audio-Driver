@@ -1,0 +1,38 @@
+{
+  "phase": "1-int32-ring",
+  "project": "AO Cable V1",
+  "status": "planned",
+  "summary": "Replace packed 24-bit cable ring with INT32 frame-indexed ring; hard-reject overflow + counters.",
+  "steps": [
+    {
+      "step": 0,
+      "name": "frame-pipe-struct",
+      "status": "pending"
+    },
+    {
+      "step": 1,
+      "name": "ring-write-int32-conversion",
+      "status": "pending"
+    },
+    {
+      "step": 2,
+      "name": "ring-read-int32-conversion",
+      "status": "pending"
+    },
+    {
+      "step": 3,
+      "name": "hard-reject-overflow",
+      "status": "pending"
+    },
+    {
+      "step": 4,
+      "name": "underrun-hysteresis",
+      "status": "pending"
+    },
+    {
+      "step": 5,
+      "name": "diagnostics-counters",
+      "status": "pending"
+    }
+  ]
+}

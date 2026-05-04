@@ -1,0 +1,33 @@
+{
+  "phase": "6-cleanup",
+  "project": "AO Cable V1",
+  "status": "planned",
+  "summary": "Remove retired Phase 5 / Step 3-4 / Y-attempt scaffolding (pump flags, sinc table, packed-24 paths, MicSink remnants); strip stale comments.",
+  "steps": [
+    {
+      "step": 0,
+      "name": "remove-pump-flags",
+      "status": "pending"
+    },
+    {
+      "step": 1,
+      "name": "remove-sinc-coefficients",
+      "status": "pending"
+    },
+    {
+      "step": 2,
+      "name": "remove-packed-24-paths",
+      "status": "pending"
+    },
+    {
+      "step": 3,
+      "name": "remove-micsink-remnants",
+      "status": "pending"
+    },
+    {
+      "step": 4,
+      "name": "strip-stale-phase5-phase6-comments",
+      "status": "pending"
+    }
+  ]
+}

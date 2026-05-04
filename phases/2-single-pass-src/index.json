@@ -1,0 +1,28 @@
+{
+  "phase": "2-single-pass-src",
+  "project": "AO Cable V1",
+  "status": "planned",
+  "summary": "Single-pass linear-interp SRC per direction (GCD divisor 300/100/75); 4-way bit-depth dispatch already in Phase 1.",
+  "steps": [
+    {
+      "step": 0,
+      "name": "gcd-divisor-helper",
+      "status": "pending"
+    },
+    {
+      "step": 1,
+      "name": "ring-write-src-path",
+      "status": "pending"
+    },
+    {
+      "step": 2,
+      "name": "ring-read-src-path",
+      "status": "pending"
+    },
+    {
+      "step": 3,
+      "name": "round-trip-rate-tests",
+      "status": "pending"
+    }
+  ]
+}

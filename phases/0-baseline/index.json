@@ -1,0 +1,27 @@
+{
+  "phase": "0-baseline",
+  "project": "AO Cable V1",
+  "status": "completed",
+  "completed_at": "2026-04-25",
+  "summary": "VB-Cable RE evidence collected; branch consolidated; architecture frozen as docs/AO_CABLE_V1_ARCHITECTURE.md + docs/AO_CABLE_V1_DESIGN.md.",
+  "steps": [
+    {
+      "step": 0,
+      "name": "vb-re-evidence",
+      "status": "completed",
+      "summary": "VB-Cable Ghidra decompile + WinDbg verification + capture-side contract Q&A complete."
+    },
+    {
+      "step": 1,
+      "name": "branch-consolidation",
+      "status": "completed",
+      "summary": "Merged feature/ao-phase6-core into feature/ao-fixed-pipe-rewrite; deleted phase6-core branch and ao-phase6 worktree; archived superseded docs."
+    },
+    {
+      "step": 2,
+      "name": "architecture-frozen",
+      "status": "completed",
+      "summary": "PRD/ADR/ARCHITECTURE/DESIGN/REVIEW_POLICY/GIT_POLICY written; CLAUDE.md/AGENTS.md/.claude/commands set up; planning files restarted from V2 template (V1 context)."
+    }
+  ]
+}

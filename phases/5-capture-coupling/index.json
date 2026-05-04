@@ -1,0 +1,23 @@
+{
+  "phase": "5-capture-coupling",
+  "project": "AO Cable V1",
+  "status": "planned",
+  "summary": "Flip cable capture audible ownership to AoCableAdvanceByQpc; retire legacy capture write; validate live call.",
+  "steps": [
+    {
+      "step": 0,
+      "name": "capture-helper-real-write",
+      "status": "pending"
+    },
+    {
+      "step": 1,
+      "name": "retire-legacy-capture-path",
+      "status": "pending"
+    },
+    {
+      "step": 2,
+      "name": "live-call-end-to-end-validation",
+      "status": "pending"
+    }
+  ]
+}
