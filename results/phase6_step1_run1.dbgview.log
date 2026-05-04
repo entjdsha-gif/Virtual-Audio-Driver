@@ -1,0 +1,136 @@
+[\\DESKTOP-AA5B33E]
+00000001	0.00000000	System	AO_STATE: DevType=2 capture=0 2->1
+00000002	0.00001440	System	AO_STATE: DevType=2 capture=0 1->0
+00000003	0.00001620	System	[AoTransport] OnStop rt=FFFFD303DC062290
+00000004	0.00006230	System	[AoTransport] OnStop rt=FFFFD303DC062290
+00000005	0.00006500	System	AO_PIPE[A]: UnregisterFormat SPK bothStopped=1 Fill=48 Drop=0 Underrun=0
+00000001	5.13238144	7512	Suspending
+00000002	11.48394012	588	04/15/2026 11:43:42.00000679:Deleted GP object
+00000003	13.27080536	5856	Populating UpdatePolicy AllowList
+00000004	13.27104092	5856	SKU MDM licensing allow list string from SLAPI:
+00000005	13.27106762	5856	AboveLock|Accounts|ActiveXControls|ADMXIngest|AllowMessageSync|AppDeviceInventory|AppHVSI|ApplicationDefaults|AllowAllTrustedApps|AllowAppStoreAutoUpdate|AllowAutomaticAppArchiving|AllowDeveloperUnlock|AllowGameDVR|AllowSharedUserAppData|ApplicationRestrictions|Audit|ConfigureChatIcon|LaunchAppAfterLogOn|MSIAllowUserControlOverInstall|MSIAlwaysInstallWithElevatedPrivileges|RestrictAppDataToSystemVolume|RestrictAppToSystemVolume|AppRuntime|AttachmentManager|Authentication|Autoplay|BitLocker|BITS|Bluetooth|Browser|Camera|Cellular|CloudDesktop|Connectivity|ControlPolicyConflict|CredentialProviders|CredentialsDelegation|CredentialsUI|Cryptography|DataProtection|DataUsage|Defender|DeliveryOptimization|Desktop|DesktopAppInstaller|ConfigureSystemGuardLaunch|EnableVirtualizationBasedSecurity|DeviceHealthMonitoring|DeviceInstallation|DeviceLock|Display|DmaGuard|ErrorReporting|Eap|Education|EnterpriseCloudPrint|EventLogService|AllowClipboardHistory|AllowCopyPaste|AllowCortana|AllowDeviceDiscovery|AllowManualMDMUnenrollment|AllowSaveAsOfOfficeFiles|AllowScreenCapture|AllowSharingOfOfficeFiles|AllowSIMErrorDialogPromptWhenNoSIM|AllowSyncMySettings|AllowTailoredExperiencesWithDiagnosticData|AllowTaskSwitcher|AllowThirdPartySuggestionsInWindowsSpotlight|AllowVoiceRecording|DoNotShowFeedbackNotifications|DoNotSyncBrowserSettings|AllowFindMyDevice|ExploitGuard|FederatedAuthentication|Feeds|FileExplorer|FileSystem|Games|Handwriting|HumanPresence|InternetExplorer|Kerberos|KioskBrowser|Knobs|LanmanServer|LanmanWorkstation|Licensing|LocalPoliciesSecurityOptions|LocalSecurityAuthority|LocalUsersAndGroups|Lockdown|Maps|MemoryDump|MSSecurityGuide|MSSLegacy|Multitasking|NetworkIsolation|NetworkListManager|NewsAndInterests|Notifications|OneDrive|OOBE|Power|Printers|Privacy|RemoteAssistance|RemoteDesktopServices|RemoteDesktop|RemoteManagement|RemoteProcedureCall|RemoteShell|RestrictedGroups|Search|SecureBoot|Security|Settings|SettingsSync|SmartScreen|Speech|Start|Storage|Sudo|System|SystemServices|TaskManager|TaskScheduler|TenantRestrictions|TextInput|TimeLanguageSettings|Troubleshooting|Update|UserRights|VirtualizationBasedTechnology|WebThreatDefense|WiFi|WindowsLogon|WirelessDisplay|Location|TurnOffWindowsCopilot|DisableAIDataAnalysis|SetCopilotHardwareKey|AllowRecallEnablement|DisableClickToDo|DisableImageCreator|DisableCocreator|DisableGenerativeFill|WindowsAutopilot|WindowsConnectionManager|WindowsDefenderSecurityCenter|WindowsInkWorkspace|WindowsPowerShell|WindowsSandbox|WiredNetwork|ADMX_
+00000007	13.27119732	5856	All policies are allowed
+00000008	13.48613930	5520	Populating EnterprisePolicy AllowList
+00000009	13.48617077	5520	SKU MDM licensing allow list string from SLAPI:
+00000010	13.48620605	5520	AboveLock|Accounts|ActiveXControls|ADMXIngest|AllowMessageSync|AppDeviceInventory|AppHVSI|ApplicationDefaults|AllowAllTrustedApps|AllowAppStoreAutoUpdate|AllowAutomaticAppArchiving|AllowDeveloperUnlock|AllowGameDVR|AllowSharedUserAppData|ApplicationRestrictions|Audit|ConfigureChatIcon|LaunchAppAfterLogOn|MSIAllowUserControlOverInstall|MSIAlwaysInstallWithElevatedPrivileges|RestrictAppDataToSystemVolume|RestrictAppToSystemVolume|AppRuntime|AttachmentManager|Authentication|Autoplay|BitLocker|BITS|Bluetooth|Browser|Camera|Cellular|CloudDesktop|Connectivity|ControlPolicyConflict|CredentialProviders|CredentialsDelegation|CredentialsUI|Cryptography|DataProtection|DataUsage|Defender|DeliveryOptimization|Desktop|DesktopAppInstaller|ConfigureSystemGuardLaunch|EnableVirtualizationBasedSecurity|DeviceHealthMonitoring|DeviceInstallation|DeviceLock|Display|DmaGuard|ErrorReporting|Eap|Education|EnterpriseCloudPrint|EventLogService|AllowClipboardHistory|AllowCopyPaste|AllowCortana|AllowDeviceDiscovery|AllowManualMDMUnenrollment|AllowSaveAsOfOfficeFiles|AllowScreenCapture|AllowSharingOfOfficeFiles|AllowSIMErrorDialogPromptWhenNoSIM|AllowSyncMySettings|AllowTailoredExperiencesWithDiagnosticData|AllowTaskSwitcher|AllowThirdPartySuggestionsInWindowsSpotlight|AllowVoiceRecording|DoNotShowFeedbackNotifications|DoNotSyncBrowserSettings|AllowFindMyDevice|ExploitGuard|FederatedAuthentication|Feeds|FileExplorer|FileSystem|Games|Handwriting|HumanPresence|InternetExplorer|Kerberos|KioskBrowser|Knobs|LanmanServer|LanmanWorkstation|Licensing|LocalPoliciesSecurityOptions|LocalSecurityAuthority|LocalUsersAndGroups|Lockdown|Maps|MemoryDump|MSSecurityGuide|MSSLegacy|Multitasking|NetworkIsolation|NetworkListManager|NewsAndInterests|Notifications|OneDrive|OOBE|Power|Printers|Privacy|RemoteAssistance|RemoteDesktopServices|RemoteDesktop|RemoteManagement|RemoteProcedureCall|RemoteShell|RestrictedGroups|Search|SecureBoot|Security|Settings|SettingsSync|SmartScreen|Speech|Start|Storage|Sudo|System|SystemServices|TaskManager|TaskScheduler|TenantRestrictions|TextInput|TimeLanguageSettings|Troubleshooting|Update|UserRights|VirtualizationBasedTechnology|WebThreatDefense|WiFi|WindowsLogon|WirelessDisplay|Location|TurnOffWindowsCopilot|DisableAIDataAnalysis|SetCopilotHardwareKey|AllowRecallEnablement|DisableClickToDo|DisableImageCreator|DisableCocreator|DisableGenerativeFill|WindowsAutopilot|WindowsConnectionManager|WindowsDefenderSecurityCenter|WindowsInkWorkspace|WindowsPowerShell|WindowsSandbox|WiredNetwork|ADMX_
+00000012	13.48631668	5520	All policies are allowed
+00000013	13.49285603	5520	Populating UpdatePolicy AllowList
+00000014	13.49310207	5520	SKU MDM licensing allow list string from SLAPI:
+00000015	13.49312973	5520	AboveLock|Accounts|ActiveXControls|ADMXIngest|AllowMessageSync|AppDeviceInventory|AppHVSI|ApplicationDefaults|AllowAllTrustedApps|AllowAppStoreAutoUpdate|AllowAutomaticAppArchiving|AllowDeveloperUnlock|AllowGameDVR|AllowSharedUserAppData|ApplicationRestrictions|Audit|ConfigureChatIcon|LaunchAppAfterLogOn|MSIAllowUserControlOverInstall|MSIAlwaysInstallWithElevatedPrivileges|RestrictAppDataToSystemVolume|RestrictAppToSystemVolume|AppRuntime|AttachmentManager|Authentication|Autoplay|BitLocker|BITS|Bluetooth|Browser|Camera|Cellular|CloudDesktop|Connectivity|ControlPolicyConflict|CredentialProviders|CredentialsDelegation|CredentialsUI|Cryptography|DataProtection|DataUsage|Defender|DeliveryOptimization|Desktop|DesktopAppInstaller|ConfigureSystemGuardLaunch|EnableVirtualizationBasedSecurity|DeviceHealthMonitoring|DeviceInstallation|DeviceLock|Display|DmaGuard|ErrorReporting|Eap|Education|EnterpriseCloudPrint|EventLogService|AllowClipboardHistory|AllowCopyPaste|AllowCortana|AllowDeviceDiscovery|AllowManualMDMUnenrollment|AllowSaveAsOfOfficeFiles|AllowScreenCapture|AllowSharingOfOfficeFiles|AllowSIMErrorDialogPromptWhenNoSIM|AllowSyncMySettings|AllowTailoredExperiencesWithDiagnosticData|AllowTaskSwitcher|AllowThirdPartySuggestionsInWindowsSpotlight|AllowVoiceRecording|DoNotShowFeedbackNotifications|DoNotSyncBrowserSettings|AllowFindMyDevice|ExploitGuard|FederatedAuthentication|Feeds|FileExplorer|FileSystem|Games|Handwriting|HumanPresence|InternetExplorer|Kerberos|KioskBrowser|Knobs|LanmanServer|LanmanWorkstation|Licensing|LocalPoliciesSecurityOptions|LocalSecurityAuthority|LocalUsersAndGroups|Lockdown|Maps|MemoryDump|MSSecurityGuide|MSSLegacy|Multitasking|NetworkIsolation|NetworkListManager|NewsAndInterests|Notifications|OneDrive|OOBE|Power|Printers|Privacy|RemoteAssistance|RemoteDesktopServices|RemoteDesktop|RemoteManagement|RemoteProcedureCall|RemoteShell|RestrictedGroups|Search|SecureBoot|Security|Settings|SettingsSync|SmartScreen|Speech|Start|Storage|Sudo|System|SystemServices|TaskManager|TaskScheduler|TenantRestrictions|TextInput|TimeLanguageSettings|Troubleshooting|Update|UserRights|VirtualizationBasedTechnology|WebThreatDefense|WiFi|WindowsLogon|WirelessDisplay|Location|TurnOffWindowsCopilot|DisableAIDataAnalysis|SetCopilotHardwareKey|AllowRecallEnablement|DisableClickToDo|DisableImageCreator|DisableCocreator|DisableGenerativeFill|WindowsAutopilot|WindowsConnectionManager|WindowsDefenderSecurityCenter|WindowsInkWorkspace|WindowsPowerShell|WindowsSandbox|WiredNetwork|ADMX_
+00000017	13.49322891	5520	All policies are allowed
+00000018	14.90257263	5520	Cloud Campaign Feature ->GetCachedPayload ENABLED
+00000019	14.91501427	5856	Cloud Campaign Feature ->GetCachedPayload ENABLED
+00000020	14.96001148	5856	Populating EnterprisePolicy AllowList
+00000021	14.96004963	5856	SKU MDM licensing allow list string from SLAPI:
+00000022	14.96008682	5520	Cloud Campaign Feature ->GetCachedPayload ENABLED
+00000023	14.96011353	5856	AboveLock|Accounts|ActiveXControls|ADMXIngest|AllowMessageSync|AppDeviceInventory|AppHVSI|ApplicationDefaults|AllowAllTrustedApps|AllowAppStoreAutoUpdate|AllowAutomaticAppArchiving|AllowDeveloperUnlock|AllowGameDVR|AllowSharedUserAppData|ApplicationRestrictions|Audit|ConfigureChatIcon|LaunchAppAfterLogOn|MSIAllowUserControlOverInstall|MSIAlwaysInstallWithElevatedPrivileges|RestrictAppDataToSystemVolume|RestrictAppToSystemVolume|AppRuntime|AttachmentManager|Authentication|Autoplay|BitLocker|BITS|Bluetooth|Browser|Camera|Cellular|CloudDesktop|Connectivity|ControlPolicyConflict|CredentialProviders|CredentialsDelegation|CredentialsUI|Cryptography|DataProtection|DataUsage|Defender|DeliveryOptimization|Desktop|DesktopAppInstaller|ConfigureSystemGuardLaunch|EnableVirtualizationBasedSecurity|DeviceHealthMonitoring|DeviceInstallation|DeviceLock|Display|DmaGuard|ErrorReporting|Eap|Education|EnterpriseCloudPrint|EventLogService|AllowClipboardHistory|AllowCopyPaste|AllowCortana|AllowDeviceDiscovery|AllowManualMDMUnenrollment|AllowSaveAsOfOfficeFiles|AllowScreenCapture|AllowSharingOfOfficeFiles|AllowSIMErrorDialogPromptWhenNoSIM|AllowSyncMySettings|AllowTailoredExperiencesWithDiagnosticData|AllowTaskSwitcher|AllowThirdPartySuggestionsInWindowsSpotlight|AllowVoiceRecording|DoNotShowFeedbackNotifications|DoNotSyncBrowserSettings|AllowFindMyDevice|ExploitGuard|FederatedAuthentication|Feeds|FileExplorer|FileSystem|Games|Handwriting|HumanPresence|InternetExplorer|Kerberos|KioskBrowser|Knobs|LanmanServer|LanmanWorkstation|Licensing|LocalPoliciesSecurityOptions|LocalSecurityAuthority|LocalUsersAndGroups|Lockdown|Maps|MemoryDump|MSSecurityGuide|MSSLegacy|Multitasking|NetworkIsolation|NetworkListManager|NewsAndInterests|Notifications|OneDrive|OOBE|Power|Printers|Privacy|RemoteAssistance|RemoteDesktopServices|RemoteDesktop|RemoteManagement|RemoteProcedureCall|RemoteShell|RestrictedGroups|Search|SecureBoot|Security|Settings|SettingsSync|SmartScreen|Speech|Start|Storage|Sudo|System|SystemServices|TaskManager|TaskScheduler|TenantRestrictions|TextInput|TimeLanguageSettings|Troubleshooting|Update|UserRights|VirtualizationBasedTechnology|WebThreatDefense|WiFi|WindowsLogon|WirelessDisplay|Location|TurnOffWindowsCopilot|DisableAIDataAnalysis|SetCopilotHardwareKey|AllowRecallEnablement|DisableClickToDo|DisableImageCreator|DisableCocreator|DisableGenerativeFill|WindowsAutopilot|WindowsConnectionManager|WindowsDefenderSecurityCenter|WindowsInkWorkspace|WindowsPowerShell|WindowsSandbox|WiredNetwork|ADMX_
+00000025	14.96021461	5856	All policies are allowed
+00000026	14.96124840	5856	Cloud Campaign Feature ->GetCachedPayload ENABLED
+00000027	14.99830532	5520	Cloud Campaign Feature ->GetCachedPayload ENABLED
+00000028	19.06022453	11100	param OnAnalyticsInfoReported called,
+00000029	19.23236847	7868	RecursiveDirectoryCreate( C:\Users\jongw\AppData\Local\Microsoft\Windows\SharedWebView\EBWebView directory exists )
+00000030	19.65056229	3840	Warning: AddWebResourceRequestedFilter without SourceKind parameter is deprecated! It does not behave as expected for iframes.Please use AddWebResourceRequestedFilterWithRequestSourceKinds instead. For more information, please see https://go.microsoft.com/fwlink/?linkid=2286319
+00000006	33.04529190	System	AO_STATE: DevType=2 capture=0 0->1
+00000007	33.04529953	System	AO_STATE: DevType=2 capture=0 1->2
+00000008	36.10984421	System	AO_STATE: DevType=3 capture=1 0->1
+00000009	36.10984802	System	AO_STATE: DevType=3 capture=1 1->2
+00000010	36.11362076	System	AO_STATE: DevType=3 capture=1 2->3
+00000011	36.11362076	System	AO_PIPE[A]: RegisterFormat MIC rate=48000 bps=16 ch=2 align=4 float=0 SameRate=1 PipeRate=48000 PipeCh=8
+00000012	36.11362457	System	[AoTransport] OnRun rt=FFFFD303DC250710 cap=1 spk=0 cable=1 rate=48000 fpe=960
+00000013	40.28006363	System	AO_STATE: DevType=4 capture=0 0->1
+00000014	40.28007126	System	AO_STATE: DevType=4 capture=0 1->2
+00000015	44.79262924	System	AO_STATE: DevType=5 capture=1 0->1
+00000016	44.79263687	System	AO_STATE: DevType=5 capture=1 1->2
+00000017	44.79619217	System	AO_STATE: DevType=5 capture=1 2->3
+00000018	44.79619598	System	AO_PIPE[B]: RegisterFormat MIC rate=48000 bps=16 ch=2 align=4 float=0 SameRate=1 PipeRate=48000 PipeCh=8
+00000019	44.79619980	System	[AoTransport] timer armed
+00000020	44.79619980	System	[AoTransport] OnRun rt=FFFFD303D87E6610 cap=1 spk=0 cable=1 rate=48000 fpe=960
+00000031	55.26904297	3748	CapMFX(0x415060B8) initialized as mode: {FC1CFC9B-B9D6-4CFA-B5E0-4BB2166878B2}, for discovery 1
+00000032	55.29294205	3748	CapEFX(0x415060B8) initialized as mode: {C18E2F7E-933D-4965-B7D1-1EEF228D2AF3}, for discovery 0
+00000033	55.30061340	3748	CapMFX(0x415060B8) initialized as mode: {FC1CFC9B-B9D6-4CFA-B5E0-4BB2166878B2}, for discovery 0
+00000034	55.30986404	3748	CapMFX(0x415060B8) initialized as mode: {C18E2F7E-933D-4965-B7D1-1EEF228D2AF3}, for discovery 0
+00000021	59.63659668	System	PAN: 8, Rx:6, Tx: 2
+00000022	60.75192261	System	AO_STATE: DevType=2 capture=0 2->3
+00000023	60.75192261	System	AO_PIPE[A]: RegisterFormat SPK rate=48000 bps=16 ch=2 align=4 float=0 SameRate=1 PipeRate=48000 PipeCh=8
+00000024	60.75193024	System	[AoTransport] OnRun rt=FFFFD303D87F2D90 cap=0 spk=1 cable=1 rate=48000 fpe=960
+00000025	60.75321579	System	AO_PIPE[A] WR: Fill=48/192000 Drop=0 Underrun=1182624 Start=1 ReqF=48 DoneF=48 RdF=1182624 SpkAct=1 MicAct=1
+00000026	61.75346375	System	AO_PIPE[A] WR: Fill=96/192000 Drop=0 Underrun=1182672 Start=1 ReqF=48 DoneF=48 RdF=48000 SpkAct=1 MicAct=1
+00000027	62.75363922	System	AO_PIPE[A] WR: Fill=48/192000 Drop=0 Underrun=1182672 Start=1 ReqF=48 DoneF=48 RdF=48048 SpkAct=1 MicAct=1
+00000028	63.75453568	System	AO_PIPE[A] WR: Fill=48/192000 Drop=0 Underrun=1182672 Start=1 ReqF=48 DoneF=48 RdF=48048 SpkAct=1 MicAct=1
+00000029	64.75476074	System	AO_PIPE[A] WR: Fill=48/192000 Drop=0 Underrun=1182672 Start=1 ReqF=48 DoneF=48 RdF=48000 SpkAct=1 MicAct=1
+00000030	65.75492859	System	AO_PIPE[A] WR: Fill=48/192000 Drop=0 Underrun=1182672 Start=1 ReqF=48 DoneF=48 RdF=48000 SpkAct=1 MicAct=1
+00000031	66.63800812	System	PAN: 6, Rx:4, Tx: 2
+00000032	66.75566101	System	AO_PIPE[A] WR: Fill=48/192000 Drop=0 Underrun=1182672 Start=1 ReqF=48 DoneF=48 RdF=48048 SpkAct=1 MicAct=1
+00000033	67.61790466	System	AO_STATE: DevType=4 capture=0 2->3
+00000034	67.61791229	System	AO_PIPE[B]: RegisterFormat SPK rate=48000 bps=16 ch=2 align=4 float=0 SameRate=1 PipeRate=48000 PipeCh=8
+00000035	67.61791229	System	[AoTransport] OnRun rt=FFFFD303D72D5010 cap=0 spk=1 cable=1 rate=48000 fpe=960
+00000036	67.61909485	System	AO_PIPE[B] WR: Fill=48/192000 Drop=0 Underrun=1095408 Start=1 ReqF=48 DoneF=48 RdF=1095408 SpkAct=1 MicAct=1
+00000037	67.75610352	System	AO_PIPE[A] WR: Fill=96/192000 Drop=0 Underrun=1182672 Start=1 ReqF=48 DoneF=48 RdF=48000 SpkAct=1 MicAct=1
+00000038	68.61910248	System	AO_PIPE[B] WR: Fill=96/192000 Drop=0 Underrun=1095456 Start=1 ReqF=48 DoneF=48 RdF=48000 SpkAct=1 MicAct=1
+00000039	68.75697327	System	AO_PIPE[A] WR: Fill=96/192000 Drop=0 Underrun=1182672 Start=1 ReqF=96 DoneF=96 RdF=48048 SpkAct=1 MicAct=1
+00000040	69.61991882	System	AO_PIPE[B] WR: Fill=48/192000 Drop=0 Underrun=1095456 Start=1 ReqF=48 DoneF=48 RdF=48048 SpkAct=1 MicAct=1
+00000041	69.75707245	System	AO_PIPE[A] WR: Fill=96/192000 Drop=0 Underrun=1182672 Start=1 ReqF=48 DoneF=48 RdF=48000 SpkAct=1 MicAct=1
+00000042	70.62086487	System	AO_PIPE[B] WR: Fill=48/192000 Drop=0 Underrun=1095456 Start=1 ReqF=48 DoneF=48 RdF=48048 SpkAct=1 MicAct=1
+00000043	70.75785065	System	AO_PIPE[A] WR: Fill=48/192000 Drop=0 Underrun=1182672 Start=1 ReqF=48 DoneF=48 RdF=48048 SpkAct=1 MicAct=1
+00000044	71.12846375	System	AO_STATE: DevType=4 capture=0 3->2
+00000045	71.12847137	System	[AoTransport] OnPause rt=FFFFD303D72D5010
+00000046	71.75830078	System	AO_PIPE[A] WR: Fill=48/192000 Drop=0 Underrun=1182672 Start=1 ReqF=48 DoneF=48 RdF=48048 SpkAct=1 MicAct=1
+00000047	72.39070892	System	AO_STATE: DevType=4 capture=0 2->3
+00000048	72.39070892	System	AO_PIPE[B]: RegisterFormat SPK rate=48000 bps=16 ch=2 align=4 float=0 SameRate=1 PipeRate=48000 PipeCh=8
+00000049	72.39071655	System	[AoTransport] OnRun rt=FFFFD303D72D5010 cap=0 spk=1 cable=1 rate=48000 fpe=960
+00000050	72.39179230	System	AO_PIPE[B] WR: Fill=48/192000 Drop=0 Underrun=1156080 Start=1 ReqF=48 DoneF=48 RdF=85056 SpkAct=1 MicAct=1
+00000051	72.75833893	System	AO_PIPE[A] WR: Fill=48/192000 Drop=0 Underrun=1182672 Start=1 ReqF=48 DoneF=48 RdF=48000 SpkAct=1 MicAct=1
+00000052	72.90099335	System	AO_STATE: DevType=4 capture=0 3->2
+00000053	72.90100098	System	[AoTransport] OnPause rt=FFFFD303D72D5010
+00000054	73.75920868	System	AO_PIPE[A] WR: Fill=48/192000 Drop=0 Underrun=1182672 Start=1 ReqF=48 DoneF=48 RdF=48048 SpkAct=1 MicAct=1
+00000055	74.75939941	System	AO_PIPE[A] WR: Fill=48/192000 Drop=0 Underrun=1182672 Start=1 ReqF=48 DoneF=48 RdF=48000 SpkAct=1 MicAct=1
+00000056	75.32935333	System	AO_STATE: DevType=4 capture=0 2->3
+00000057	75.32936096	System	AO_PIPE[B]: RegisterFormat SPK rate=48000 bps=16 ch=2 align=4 float=0 SameRate=1 PipeRate=48000 PipeCh=8
+00000058	75.32936096	System	[AoTransport] OnRun rt=FFFFD303D72D5010 cap=0 spk=1 cable=1 rate=48000 fpe=960
+00000059	75.32942963	System	AO_PIPE[B] WR: Fill=48/192000 Drop=0 Underrun=1272576 Start=1 ReqF=48 DoneF=48 RdF=140976 SpkAct=1 MicAct=1
+00000060	75.75968170	System	AO_PIPE[A] WR: Fill=48/192000 Drop=0 Underrun=1182672 Start=1 ReqF=48 DoneF=48 RdF=48000 SpkAct=1 MicAct=1
+00000061	76.33042908	System	AO_PIPE[B] WR: Fill=48/192000 Drop=0 Underrun=1272624 Start=1 ReqF=48 DoneF=48 RdF=48048 SpkAct=1 MicAct=1
+00000062	76.75975800	System	AO_PIPE[A] WR: Fill=48/192000 Drop=0 Underrun=1182672 Start=1 ReqF=48 DoneF=48 RdF=48000 SpkAct=1 MicAct=1
+00000063	77.33132172	System	AO_PIPE[B] WR: Fill=48/192000 Drop=0 Underrun=1272624 Start=1 ReqF=48 DoneF=48 RdF=48048 SpkAct=1 MicAct=1
+00000064	77.76053619	System	AO_PIPE[A] WR: Fill=48/192000 Drop=0 Underrun=1182672 Start=1 ReqF=48 DoneF=48 RdF=48048 SpkAct=1 MicAct=1
+00000065	78.22910309	System	AO_STATE: DevType=4 capture=0 3->2
+00000066	78.22910309	System	[AoTransport] OnPause rt=FFFFD303D72D5010
+00000067	78.76152039	System	AO_PIPE[A] WR: Fill=48/192000 Drop=0 Underrun=1182672 Start=1 ReqF=48 DoneF=48 RdF=48048 SpkAct=1 MicAct=1
+00000068	79.16222382	System	AO_STATE: DevType=2 capture=0 3->2
+00000069	79.16222382	System	[AoTransport] OnPause rt=FFFFD303D87F2D90
+00000070	88.47565460	System	AO_STATE: DevType=4 capture=0 2->3
+00000071	88.47566223	System	AO_PIPE[B]: RegisterFormat SPK rate=48000 bps=16 ch=2 align=4 float=0 SameRate=1 PipeRate=48000 PipeCh=8
+00000072	88.47566223	System	[AoTransport] OnRun rt=FFFFD303D72D5010 cap=0 spk=1 cable=1 rate=48000 fpe=960
+00000073	88.47712708	System	AO_PIPE[B] WR: Fill=96/192000 Drop=0 Underrun=1764432 Start=1 ReqF=96 DoneF=96 RdF=534960 SpkAct=1 MicAct=1
+00000074	89.47773743	System	AO_PIPE[B] WR: Fill=96/192000 Drop=0 Underrun=1764528 Start=1 ReqF=48 DoneF=48 RdF=48096 SpkAct=1 MicAct=1
+00000075	90.47827148	System	AO_PIPE[B] WR: Fill=192/192000 Drop=0 Underrun=1764528 Start=1 ReqF=48 DoneF=48 RdF=47952 SpkAct=1 MicAct=1
+00000076	91.47921753	System	AO_PIPE[B] WR: Fill=144/192000 Drop=0 Underrun=1764528 Start=1 ReqF=48 DoneF=48 RdF=48096 SpkAct=1 MicAct=1
+00000077	92.47968292	System	AO_PIPE[B] WR: Fill=192/192000 Drop=0 Underrun=1764528 Start=1 ReqF=48 DoneF=48 RdF=47952 SpkAct=1 MicAct=1
+00000078	93.02595520	System	AO_STATE: DevType=4 capture=0 3->2
+00000079	93.02595520	System	[AoTransport] OnPause rt=FFFFD303D72D5010
+00000080	93.11286163	System	AO_STATE: DevType=2 capture=0 2->1
+00000081	93.11287689	System	AO_STATE: DevType=2 capture=0 1->0
+00000082	93.11287689	System	[AoTransport] OnStop rt=FFFFD303D87F2D90
+00000083	93.11296844	System	[AoTransport] OnStop rt=FFFFD303D87F2D90
+00000084	93.11297607	System	AO_PIPE[A]: UnregisterFormat SPK bothStopped=0 Fill=0 Drop=0 Underrun=1852224
+00000085	101.31658936	System	AO_STATE: DevType=4 capture=0 2->3
+00000086	101.31659698	System	AO_PIPE[B]: RegisterFormat SPK rate=48000 bps=16 ch=2 align=4 float=0 SameRate=1 PipeRate=48000 PipeCh=8
+00000087	101.31659698	System	[AoTransport] OnRun rt=FFFFD303D72D5010 cap=0 spk=1 cable=1 rate=48000 fpe=960
+00000088	101.31764221	System	AO_PIPE[B] WR: Fill=48/192000 Drop=0 Underrun=2162352 Start=1 ReqF=48 DoneF=48 RdF=424272 SpkAct=1 MicAct=1
+00000089	101.33756256	System	AO_STATE: DevType=4 capture=0 3->2
+00000090	101.33757019	System	[AoTransport] OnPause rt=FFFFD303D72D5010
+00000091	101.33814240	System	AO_STATE: DevType=4 capture=0 2->1
+00000092	101.33815002	System	AO_STATE: DevType=4 capture=0 1->0
+00000093	101.33815002	System	[AoTransport] OnStop rt=FFFFD303D72D5010
+00000094	101.33819580	System	[AoTransport] OnStop rt=FFFFD303D72D5010
+00000095	101.33820343	System	AO_PIPE[B]: UnregisterFormat SPK bothStopped=0 Fill=48 Drop=0 Underrun=2162400
+00000096	104.76916504	System	AO_STATE: DevType=5 capture=1 3->2
+00000097	104.76917267	System	[AoTransport] OnPause rt=FFFFD303D87E6610
+00000098	104.76988983	System	AO_STATE: DevType=5 capture=1 2->1
+00000099	104.76989746	System	AO_STATE: DevType=5 capture=1 1->0
+00000100	104.76989746	System	[AoTransport] OnStop rt=FFFFD303D87E6610
+00000101	104.76995087	System	[AoTransport] OnStop rt=FFFFD303D87E6610
+00000102	104.76995087	System	AO_PIPE[B]: UnregisterFormat MIC bothStopped=1 Fill=0 Drop=0 Underrun=48
+00000035	110.09688568	9828	Populating UpdatePolicy AllowList
+00000036	110.09709167	9828	SKU MDM licensing allow list string from SLAPI:
+00000037	110.09711456	9828	AboveLock|Accounts|ActiveXControls|ADMXIngest|AllowMessageSync|AppDeviceInventory|AppHVSI|ApplicationDefaults|AllowAllTrustedApps|AllowAppStoreAutoUpdate|AllowAutomaticAppArchiving|AllowDeveloperUnlock|AllowGameDVR|AllowSharedUserAppData|ApplicationRestrictions|Audit|ConfigureChatIcon|LaunchAppAfterLogOn|MSIAllowUserControlOverInstall|MSIAlwaysInstallWithElevatedPrivileges|RestrictAppDataToSystemVolume|RestrictAppToSystemVolume|AppRuntime|AttachmentManager|Authentication|Autoplay|BitLocker|BITS|Bluetooth|Browser|Camera|Cellular|CloudDesktop|Connectivity|ControlPolicyConflict|CredentialProviders|CredentialsDelegation|CredentialsUI|Cryptography|DataProtection|DataUsage|Defender|DeliveryOptimization|Desktop|DesktopAppInstaller|ConfigureSystemGuardLaunch|EnableVirtualizationBasedSecurity|DeviceHealthMonitoring|DeviceInstallation|DeviceLock|Display|DmaGuard|ErrorReporting|Eap|Education|EnterpriseCloudPrint|EventLogService|AllowClipboardHistory|AllowCopyPaste|AllowCortana|AllowDeviceDiscovery|AllowManualMDMUnenrollment|AllowSaveAsOfOfficeFiles|AllowScreenCapture|AllowSharingOfOfficeFiles|AllowSIMErrorDialogPromptWhenNoSIM|AllowSyncMySettings|AllowTailoredExperiencesWithDiagnosticData|AllowTaskSwitcher|AllowThirdPartySuggestionsInWindowsSpotlight|AllowVoiceRecording|DoNotShowFeedbackNotifications|DoNotSyncBrowserSettings|AllowFindMyDevice|ExploitGuard|FederatedAuthentication|Feeds|FileExplorer|FileSystem|Games|Handwriting|HumanPresence|InternetExplorer|Kerberos|KioskBrowser|Knobs|LanmanServer|LanmanWorkstation|Licensing|LocalPoliciesSecurityOptions|LocalSecurityAuthority|LocalUsersAndGroups|Lockdown|Maps|MemoryDump|MSSecurityGuide|MSSLegacy|Multitasking|NetworkIsolation|NetworkListManager|NewsAndInterests|Notifications|OneDrive|OOBE|Power|Printers|Privacy|RemoteAssistance|RemoteDesktopServices|RemoteDesktop|RemoteManagement|RemoteProcedureCall|RemoteShell|RestrictedGroups|Search|SecureBoot|Security|Settings|SettingsSync|SmartScreen|Speech|Start|Storage|Sudo|System|SystemServices|TaskManager|TaskScheduler|TenantRestrictions|TextInput|TimeLanguageSettings|Troubleshooting|Update|UserRights|VirtualizationBasedTechnology|WebThreatDefense|WiFi|WindowsLogon|WirelessDisplay|Location|TurnOffWindowsCopilot|DisableAIDataAnalysis|SetCopilotHardwareKey|AllowRecallEnablement|DisableClickToDo|DisableImageCreator|DisableCocreator|DisableGenerativeFill|WindowsAutopilot|WindowsConnectionManager|WindowsDefenderSecurityCenter|WindowsInkWorkspace|WindowsPowerShell|WindowsSandbox|WiredNetwork|ADMX_

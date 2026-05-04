@@ -1,48 +1,48 @@
 ﻿{
     "config":  "Release",
-    "timestamp":  "2026-04-12 15:19:54",
+    "timestamp":  "2026-04-16 10:01:57",
     "artifacts":  {
                       "aocableb.inf":  {
-                                           "path":  "D:\\mywork\\Virtual-Audio-Driver\\Source\\Main\\x64\\Release\\CableB\\aocableb.inf",
-                                           "sha256":  "5670735A513C51C34963BD676261FAE79427B38FEE4464A97CD3ED5902510C3C",
-                                           "size":  13296,
-                                           "modified":  "2026-04-12 15:19:49"
+                                           "path":  "D:\\mywork\\ao-phase6\\x64\\Release\\CableB\\aocableb.inf",
+                                           "sha256":  "68E526025CF9ADAB96D91E482C667B23E6074C3DBD3F3474380FB7339375B7FE",
+                                           "size":  13292,
+                                           "modified":  "2026-04-16 10:01:54"
                                        },
                       "aocableb.sys":  {
-                                           "path":  "D:\\mywork\\Virtual-Audio-Driver\\Source\\Main\\x64\\Release\\CableB\\aocableb.sys",
-                                           "sha256":  "DC1A76EB3FB3FCCEBE244A22046ACCC5DF5AE63CFD8C1D758CBBE9A6AF542837",
-                                           "size":  96784,
-                                           "modified":  "2026-04-12 15:19:53"
+                                           "path":  "D:\\mywork\\ao-phase6\\x64\\Release\\CableB\\aocableb.sys",
+                                           "sha256":  "8D89175F82FAF8E453DD743BA0D2AF2D1A98C2588D83C4829196B3F20256F405",
+                                           "size":  105008,
+                                           "modified":  "2026-04-16 10:01:55"
                                        },
                       "Utilities.lib":  {
-                                            "path":  "D:\\mywork\\Virtual-Audio-Driver\\Source\\Utilities\\x64\\Release\\Utilities.lib",
-                                            "sha256":  "87C7C4937163EE8C30E592577CFFEFDAACED7BA017A51ACB80DD7113C8E997CD",
-                                            "size":  362572,
-                                            "modified":  "2026-04-12 15:19:48"
+                                            "path":  "D:\\mywork\\ao-phase6\\Source\\Utilities\\x64\\Release\\Utilities.lib",
+                                            "sha256":  "944BD21B9781F58C53DF025DCCA2B2B85A8BA4AA58B5F4AC063063CA8F766886",
+                                            "size":  410182,
+                                            "modified":  "2026-04-16 10:01:47"
                                         },
                       "aocablea.sys":  {
-                                           "path":  "D:\\mywork\\Virtual-Audio-Driver\\Source\\Main\\x64\\Release\\CableA\\aocablea.sys",
-                                           "sha256":  "8318D6CAFEED811D4302867B054F0EE3A40697C6DC9AF8312F98D480E26800E5",
-                                           "size":  96784,
-                                           "modified":  "2026-04-12 15:19:44"
+                                           "path":  "D:\\mywork\\ao-phase6\\x64\\Release\\CableA\\aocablea.sys",
+                                           "sha256":  "5F44731C903AC5B5F7EFD3C9F2078496E9F7A85C021705AEB79F28724BFCB7C9",
+                                           "size":  105008,
+                                           "modified":  "2026-04-16 10:01:52"
                                        },
                       "aocablea.inf":  {
-                                           "path":  "D:\\mywork\\Virtual-Audio-Driver\\Source\\Main\\x64\\Release\\CableA\\aocablea.inf",
-                                           "sha256":  "75FAFA4CDE435183FD47E482A4E45D8E8A75CAC58FAC4EF6B6D9156617D2D62E",
-                                           "size":  12944,
-                                           "modified":  "2026-04-12 15:19:40"
+                                           "path":  "D:\\mywork\\ao-phase6\\x64\\Release\\CableA\\aocablea.inf",
+                                           "sha256":  "997876911CDB7ED71C4923107F09A22E2918C859E2A02223B25CCC9A587ABBD6",
+                                           "size":  12942,
+                                           "modified":  "2026-04-16 10:01:51"
                                        },
                       "AOControlPanel.exe":  {
-                                                 "path":  "D:\\mywork\\Virtual-Audio-Driver\\Source\\ControlPanel\\x64\\Release\\AOControlPanel.exe",
-                                                 "sha256":  "91B5196163F8FA28F453C4DCF6C8CFA8C6E66839A93AE8D42520AB9D3325964A",
-                                                 "size":  152576,
-                                                 "modified":  "2026-04-12 03:29:17"
+                                                 "path":  "D:\\mywork\\ao-phase6\\x64\\Release\\AOControlPanel.exe",
+                                                 "sha256":  "3EAE63E0C9BC766A0230BC4C5ECA46FE507C8A35669A82C09AC7F0D54332C029",
+                                                 "size":  151552,
+                                                 "modified":  "2026-04-16 07:03:22"
                                              },
                       "Filters.lib":  {
-                                          "path":  "D:\\mywork\\Virtual-Audio-Driver\\Source\\Filters\\x64\\Release\\Filters.lib",
-                                          "sha256":  "33D49C59CC1456F236489704F2C4A6FF03CA9A1645A82975088EC837790918DE",
-                                          "size":  151614,
-                                          "modified":  "2026-04-12 15:19:49"
+                                          "path":  "D:\\mywork\\ao-phase6\\Source\\Filters\\x64\\Release\\Filters.lib",
+                                          "sha256":  "996961162AA42B50E92FDDA221533602920CE34D08FF81ACF35C3E317C935A91",
+                                          "size":  151374,
+                                          "modified":  "2026-04-16 07:03:19"
                                       }
                   },
     "platform":  "x64"

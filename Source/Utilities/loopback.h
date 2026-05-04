@@ -397,6 +397,25 @@ ULONG FramePipeWriteFromDma(
     const BYTE*     dmaData,        // contiguous DMA bytes in Speaker format
     ULONG           byteCount
 );
+
+// Phase 6 Y2-1: Ex variant with optional per-stream runtime hook for
+// fade envelope application. rtOpaque is an AO_STREAM_RT* passed
+// through as a void* to avoid cyclic includes between loopback.h and
+// transport_engine.h. When non-NULL, the callee invokes
+// AoCableApplyRenderFadeInScratch(rtOpaque, scratch, ...) between the
+// normalize-to-scratch step and the pipe-write step. When NULL, the
+// behavior is byte-identical to the legacy FramePipeWriteFromDma.
+//
+// The legacy FramePipeWriteFromDma is kept as a thin forward to this
+// function with rtOpaque == NULL so the existing ReadBytes caller is
+// unchanged. Y2-2 switches the authoritative cable render write over
+// to the Ex path via AoCableWriteRenderFromDma.
+ULONG FramePipeWriteFromDmaEx(
+    PFRAME_PIPE     pPipe,
+    const BYTE*     dmaData,
+    ULONG           byteCount,
+    PVOID           rtOpaque        // AO_STREAM_RT* or NULL
+);
 // ReadToDma: Mic DPC — pipe read + channel map + denormalize
 // Always fills byteCount bytes in DMA (silence on underrun)
 VOID FramePipeReadToDma(

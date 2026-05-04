@@ -1895,16 +1895,41 @@ VOID FramePipeUnregisterFormat(
 #pragma code_seg()
 
 //=============================================================================
-// FramePipeWriteFromDma — Speaker DPC batch: DMA bytes → normalize →
-//                         channel map → pipe write (DISPATCH_LEVEL)
+// FramePipeWriteFromDma / FramePipeWriteFromDmaEx
+//
+// Speaker DPC batch: DMA bytes → normalize → channel map → optional
+// Y2 fade envelope (Ex variant only) → pipe write. Runs at DISPATCH_LEVEL.
 //
 // Returns frames written (0 = rejected or error).
 // Caller loops over DMA wrap boundary; each call gets contiguous bytes.
+//
+// Phase 6 Y2-1: Ex variant takes an opaque AO_STREAM_RT* for fade hook.
+// Legacy non-Ex entry is a thin forward with rtOpaque == NULL, preserving
+// byte-identical behavior for the current legacy ReadBytes caller.
 //=============================================================================
+
+// Forward declaration of the Y2-1 fade adapter. Defined in
+// transport_engine.cpp; takes an opaque AO_STREAM_RT pointer so this TU
+// stays out of the transport struct layout. Safe to call with NULL.
+extern "C" VOID AoCableApplyRenderFadeInScratch(
+    PVOID   rtOpaque,
+    LONG*   scratch,
+    ULONG   sampleCount);
+
 ULONG FramePipeWriteFromDma(
     PFRAME_PIPE     pPipe,
     const BYTE*     dmaData,
     ULONG           byteCount)
+{
+    // Legacy path — byte-identical to pre-Y2 behavior. No fade envelope.
+    return FramePipeWriteFromDmaEx(pPipe, dmaData, byteCount, NULL);
+}
+
+ULONG FramePipeWriteFromDmaEx(
+    PFRAME_PIPE     pPipe,
+    const BYTE*     dmaData,
+    ULONG           byteCount,
+    PVOID           rtOpaque)
 {
     if (!pPipe || !pPipe->Initialized || !pPipe->SpeakerActive ||
         !dmaData || byteCount == 0)
@@ -1980,6 +2005,19 @@ ULONG FramePipeWriteFromDma(
                 for (ULONG ch = 0; ch < copyChannels; ch++)
                     dst[ch] = FpNorm32i(s32[ch]);
             }
+        }
+
+        // Phase 6 Y2-1 fade envelope hook. Applied on the scratch
+        // buffer AFTER normalize-to-INT32 and BEFORE the pipe write,
+        // matching VB FUN_140005634 → 51a8 order. rtOpaque is NULL on
+        // the legacy path (Y2-1 default), so the non-Ex entry is
+        // byte-identical to the pre-Y2 behavior.
+        if (rtOpaque)
+        {
+            AoCableApplyRenderFadeInScratch(
+                rtOpaque,
+                (LONG*)scratch,
+                chunk * pipeChannels);
         }
 
         // Write chunk to pipe (all-or-nothing per chunk)
