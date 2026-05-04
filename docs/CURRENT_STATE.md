@@ -1,10 +1,13 @@
 # AO Virtual Cable - Current State
 
-**Last updated:** 2026-04-16
-**Primary active design branch:** `feature/ao-phase6-core`
-**Primary active worktree:** `D:/mywork/ao-phase6`
-**Historical branch:** `feature/ao-fixed-pipe-rewrite`
+**Last updated:** 2026-04-25
+**Primary active branch:** `feature/ao-fixed-pipe-rewrite`
+**Primary active worktree:** `D:/mywork/Virtual-Audio-Driver`
 **Effective last-known-good baseline:** `439bbcd`
+
+(2026-04-25: `feature/ao-phase6-core` was merged into `feature/ao-fixed-pipe-rewrite`
+and deleted along with the `D:/mywork/ao-phase6` worktree. Single branch
+going forward.)
 
 ## Canonical docs
 

@@ -43,14 +43,14 @@ Do not touch:
 
 Primary edit set:
 
-- `D:/mywork/ao-phase6/Source/Utilities/transport_engine.h`
-- `D:/mywork/ao-phase6/Source/Utilities/transport_engine.cpp`
-- `D:/mywork/ao-phase6/Source/Main/minwavertstream.h`
-- `D:/mywork/ao-phase6/Source/Main/minwavertstream.cpp`
+- `D:/mywork/Virtual-Audio-Driver/Source/Utilities/transport_engine.h`
+- `D:/mywork/Virtual-Audio-Driver/Source/Utilities/transport_engine.cpp`
+- `D:/mywork/Virtual-Audio-Driver/Source/Main/minwavertstream.h`
+- `D:/mywork/Virtual-Audio-Driver/Source/Main/minwavertstream.cpp`
 
 Secondary only if needed later:
 
-- `D:/mywork/ao-phase6/Source/Utilities/loopback.cpp`
+- `D:/mywork/Virtual-Audio-Driver/Source/Utilities/loopback.cpp`
 
 ## Non-negotiable design rules
 

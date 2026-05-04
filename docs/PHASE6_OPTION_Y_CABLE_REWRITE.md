@@ -34,8 +34,8 @@ Everything else stays out of scope unless a later validation proves otherwise.
 
 Current safety baseline:
 
-- worktree: `D:/mywork/ao-phase6`
-- branch: `feature/ao-phase6-core`
+- worktree: `D:/mywork/Virtual-Audio-Driver`
+- branch: `feature/ao-fixed-pipe-rewrite`
 - commit: `6d9e083`
 - immediate prerequisite: `Z` revert and validation
 
@@ -85,17 +85,17 @@ For cable streams only, rewrite:
 
 ## Current MSVAD-derived cable code to retire or cable-no-op
 
-The references below are from the current Phase 6 worktree in `D:/mywork/ao-phase6`.
+The references below are from the current Phase 6 worktree in `D:/mywork/Virtual-Audio-Driver`.
 
 ### Fields in `CMiniportWaveRTStream`
 
 Current MSVAD-pattern fields still present:
 
-- `D:/mywork/ao-phase6/Source/Main/minwavertstream.h:74`
+- `D:/mywork/Virtual-Audio-Driver/Source/Main/minwavertstream.h:74`
   - `m_pNotificationTimer`
-- `D:/mywork/ao-phase6/Source/Main/minwavertstream.h:114`
+- `D:/mywork/Virtual-Audio-Driver/Source/Main/minwavertstream.h:114`
   - `m_pDpc`
-- `D:/mywork/ao-phase6/Source/Main/minwavertstream.h:145`
+- `D:/mywork/Virtual-Audio-Driver/Source/Main/minwavertstream.h:145`
   - `m_pTransportRt`
 
 Keep:
@@ -111,17 +111,17 @@ Retire or cable-no-op:
 
 Current MSVAD-pattern timer/DPC lifetime:
 
-- `D:/mywork/ao-phase6/Source/Main/minwavertstream.cpp:63`
+- `D:/mywork/Virtual-Audio-Driver/Source/Main/minwavertstream.cpp:63`
   - notification timer teardown path
-- `D:/mywork/ao-phase6/Source/Main/minwavertstream.cpp:125`
+- `D:/mywork/Virtual-Audio-Driver/Source/Main/minwavertstream.cpp:125`
   - DPC free path
-- `D:/mywork/ao-phase6/Source/Main/minwavertstream.cpp:329`
+- `D:/mywork/Virtual-Audio-Driver/Source/Main/minwavertstream.cpp:329`
   - notification timer allocation
-- `D:/mywork/ao-phase6/Source/Main/minwavertstream.cpp:359`
+- `D:/mywork/Virtual-Audio-Driver/Source/Main/minwavertstream.cpp:359`
   - DPC allocation
-- `D:/mywork/ao-phase6/Source/Main/minwavertstream.cpp:1593`
+- `D:/mywork/Virtual-Audio-Driver/Source/Main/minwavertstream.cpp:1593`
   - notification timer set/arm path
-- `D:/mywork/ao-phase6/Source/Main/minwavertstream.cpp:2480`
+- `D:/mywork/Virtual-Audio-Driver/Source/Main/minwavertstream.cpp:2480`
   - notification timer cancel path
 
 For cable streams, these paths should stop owning transport.
@@ -130,15 +130,15 @@ For cable streams, these paths should stop owning transport.
 
 Current transport/update ownership sites that are not allowed to remain authoritative for cable streams:
 
-- `D:/mywork/ao-phase6/Source/Main/minwavertstream.cpp:882`
+- `D:/mywork/Virtual-Audio-Driver/Source/Main/minwavertstream.cpp:882`
   - `UpdatePosition(ilQPC)` in packet/query path
-- `D:/mywork/ao-phase6/Source/Main/minwavertstream.cpp:1121`
+- `D:/mywork/Virtual-Audio-Driver/Source/Main/minwavertstream.cpp:1121`
   - `UpdatePosition(ilQPC)` before position/query return
-- `D:/mywork/ao-phase6/Source/Main/minwavertstream.cpp:1155`
+- `D:/mywork/Virtual-Audio-Driver/Source/Main/minwavertstream.cpp:1155`
   - `UpdatePosition(ilQPC)` inside `GetPositions`
-- `D:/mywork/ao-phase6/Source/Main/minwavertstream.cpp:1907`
+- `D:/mywork/Virtual-Audio-Driver/Source/Main/minwavertstream.cpp:1907`
   - `CMiniportWaveRTStream::UpdatePosition` body itself
-- `D:/mywork/ao-phase6/Source/Main/minwavertstream.cpp:2026`
+- `D:/mywork/Virtual-Audio-Driver/Source/Main/minwavertstream.cpp:2026`
   - cable publish-from-`m_ullLinearPosition`
 
 These are the core MSVAD-derived ownership points that must be removed, replaced, or turned into cable-specific wrappers around the new canonical helper.
@@ -147,15 +147,15 @@ These are the core MSVAD-derived ownership points that must be removed, replaced
 
 These surfaces are still important, but must be rewritten to funnel into one canonical cable advance helper:
 
-- `D:/mywork/ao-phase6/Source/Main/minwavertstream.cpp:866`
+- `D:/mywork/Virtual-Audio-Driver/Source/Main/minwavertstream.cpp:866`
   - `GetPosition`
-- `D:/mywork/ao-phase6/Source/Main/minwavertstream.cpp:913`
+- `D:/mywork/Virtual-Audio-Driver/Source/Main/minwavertstream.cpp:913`
   - `GetReadPacket`
-- `D:/mywork/ao-phase6/Source/Main/minwavertstream.cpp:998`
+- `D:/mywork/Virtual-Audio-Driver/Source/Main/minwavertstream.cpp:998`
   - `SetWritePacket`
-- `D:/mywork/ao-phase6/Source/Main/minwavertstream.cpp:1101`
+- `D:/mywork/Virtual-Audio-Driver/Source/Main/minwavertstream.cpp:1101`
   - `GetPacketCount`
-- `D:/mywork/ao-phase6/Source/Main/minwavertstream.cpp:1132`
+- `D:/mywork/Virtual-Audio-Driver/Source/Main/minwavertstream.cpp:1132`
   - `GetPositions`
 
 Important note:
@@ -284,7 +284,7 @@ Loud rule:
 
 Current location:
 
-- `D:/mywork/ao-phase6/Source/Main/minwavertstream.cpp:998`
+- `D:/mywork/Virtual-Audio-Driver/Source/Main/minwavertstream.cpp:998`
 
 Role in Y:
 
@@ -296,7 +296,7 @@ Role in Y:
 
 Current location:
 
-- `D:/mywork/ao-phase6/Source/Main/minwavertstream.cpp:913`
+- `D:/mywork/Virtual-Audio-Driver/Source/Main/minwavertstream.cpp:913`
 
 Role in Y:
 
@@ -308,7 +308,7 @@ Role in Y:
 
 Current location:
 
-- `D:/mywork/ao-phase6/Source/Main/minwavertstream.cpp:1132`
+- `D:/mywork/Virtual-Audio-Driver/Source/Main/minwavertstream.cpp:1132`
 
 Role in Y:
 
@@ -342,7 +342,7 @@ The important rule is:
 
 Current location:
 
-- `D:/mywork/ao-phase6/Source/Main/minwavertstream.cpp:866`
+- `D:/mywork/Virtual-Audio-Driver/Source/Main/minwavertstream.cpp:866`
 
 Role in Y:
 
@@ -354,7 +354,7 @@ Role in Y:
 
 Current location:
 
-- `D:/mywork/ao-phase6/Source/Main/minwavertstream.cpp:1101`
+- `D:/mywork/Virtual-Audio-Driver/Source/Main/minwavertstream.cpp:1101`
 
 Role in Y:
 
@@ -771,10 +771,10 @@ Scope:
 
 Files:
 
-- `D:/mywork/ao-phase6/Source/Utilities/transport_engine.h`
-- `D:/mywork/ao-phase6/Source/Utilities/transport_engine.cpp`
-- `D:/mywork/ao-phase6/Source/Main/minwavertstream.h`
-- `D:/mywork/ao-phase6/Source/Main/minwavertstream.cpp`
+- `D:/mywork/Virtual-Audio-Driver/Source/Utilities/transport_engine.h`
+- `D:/mywork/Virtual-Audio-Driver/Source/Utilities/transport_engine.cpp`
+- `D:/mywork/Virtual-Audio-Driver/Source/Main/minwavertstream.h`
+- `D:/mywork/Virtual-Audio-Driver/Source/Main/minwavertstream.cpp`
 
 Gate:
 
