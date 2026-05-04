@@ -1,0 +1,36 @@
+{
+  "phases": [
+    {
+      "dir": "0-baseline",
+      "status": "completed"
+    },
+    {
+      "dir": "1-int32-ring",
+      "status": "planned"
+    },
+    {
+      "dir": "2-single-pass-src",
+      "status": "planned"
+    },
+    {
+      "dir": "3-canonical-helper-shadow",
+      "status": "planned"
+    },
+    {
+      "dir": "4-render-coupling",
+      "status": "planned"
+    },
+    {
+      "dir": "5-capture-coupling",
+      "status": "planned"
+    },
+    {
+      "dir": "6-cleanup",
+      "status": "planned"
+    },
+    {
+      "dir": "7-quality-polish",
+      "status": "planned"
+    }
+  ]
+}
