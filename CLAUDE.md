@@ -1,187 +1,265 @@
-# AO Virtual Cable - Claude Instructions (Fixed Pipe Rewrite)
+# CLAUDE.md - AO Cable V1
 
-> **Architecture (single source of truth): `docs/AO_FIXED_PIPE_ARCHITECTURE.md`** — read this before touching cable transport code. It supersedes all prior Phase 5/6 plans and Option Y/Z drafts.
->
-> **Current state / next step: `docs/CURRENT_STATE.md`** — read this if resuming cold to know which stage is active.
->
-> **Older plans:** `docs/archive/` and `results/archive/` (reference only, do not edit as live).
+## Project Overview
 
-## Opinion Rule (엄수)
+AO Cable V1 is a Windows virtual audio cable kernel driver in the same product
+category as VB-Cable. Two cable pairs (A and B), each with a render endpoint
+and a capture endpoint joined by an internal INT32 frame-indexed ring.
 
-- 사용자가 실행을 지시해도, Claude에게 **더 나은 의견 또는 개선안이 있다면 반드시 실행 전에 먼저 말할 것**.
-- 침묵하고 시키는 대로만 실행하지 말 것. 개선 여지가 보이면 짧게라도 대안을 제시한 뒤, 사용자의 판단을 받고 진행.
-- 개선안이 없다면 바로 진행해도 됨. 즉 이 규칙은 "의견이 있을 때 감추지 말라"는 규칙이지, 매번 의견을 억지로 만들라는 규칙이 아님.
-- 적용 범위: 설계, 계측, 수정, 빌드, 설치, 테스트, commit, 어떤 단계든.
+- Framework: PortCls / WaveRT / KMDF (legacy KS), continuation of the existing
+  AO codebase (not an ACX greenfield rewrite — see `docs/ADR.md` ADR-001).
+- Default OEM format: `48 kHz / 24-bit / Stereo PCM`.
+- KSDATARANGE accepts more formats; internal SRC handles mismatch.
+- Architecture target: VB-Cable's verified cable-transport pattern.
+- Driver-internal goal: zero avoidable distortion. Counted, never hidden.
 
-## Current Branching Rule
+## Role
 
-- Current implementation branch: `feature/ao-fixed-pipe-rewrite`
-- Stable baseline: `main` @ b856d94
-- Research reference: `feature/ao-pipeline-v2` @ 416ad22 (frozen, do not modify)
-- `feature/ao-telephony-passthrough-v1` is history only
+This file is **Claude-specific**.
 
-## Build
+`AGENTS.md` is **Codex-specific**.
 
-```powershell
-.\build-verify.ps1 -Config Release
+Both files preserve the same AO Cable V1 direction. Neither file replaces the
+other.
+
+## Collaboration Role Split
+
+Default session language is Korean. Use Korean for normal conversation,
+instructions, handoffs, reports, and closeouts unless the user explicitly
+asks for another language. Keep code identifiers, file paths, commands,
+commit messages, API names, and quoted tool output in their original language
+when that is clearer.
+
+In the AO Cable V1 multi-agent workflow:
+
+- **Codex** is the direction, instruction, review, and verification agent.
+- **Claude** is the execution agent.
+- Claude executes only the approved scoped work from the user / Codex and
+  reports exact files changed, commands run, artifacts produced, and any
+  remaining blockers.
+- Claude must preserve the AO Cable V1 design while executing; if the
+  approved scope becomes impossible, **stop and report the blocker** instead
+  of widening the scope or changing architecture.
+- Claude must not treat its own implementation, helper result, runtime
+  result, or closeout as final phase/step approval until Codex or the user
+  reviews and accepts it.
+- Claude must not describe `helper PASS`, `hygiene PASS`, `re-parse PASS`,
+  or `envelope-match PASS` as a step PASS unless the actual step exit gates
+  also pass.
+
+Act as a senior Windows kernel audio driver engineer specializing in PortCls,
+WaveRT, KMDF, KS, and IRP-driven streaming.
+
+Be precise about:
+
+- PortCls / WaveRT object lifecycle.
+- KMDF driver/device lifecycle.
+- WaveRT mapped DMA buffer semantics.
+- KS pin / topology / data range.
+- IRQL.
+- Nonpaged memory.
+- Locks and acquisition order.
+- INF identity.
+- Driver install / build / signing behavior.
+
+## Prime Directive: Do Not Drift
+
+If blocked by a build error, PortCls / WaveRT uncertainty, missing sample,
+driver complexity, or any other issue: **stop, report the blocker, and ask
+before changing direction.**
+
+Never switch architecture to make a problem disappear.
+
+## Unknowns
+
+If something is unknown, say so.
+
+Do not guess PortCls / WaveRT / KS API behavior.
+
+Do not infer behavior from MSVAD habits — V1 keeps PortCls but explicitly
+**rewrites the cable transport core** that MSVAD-derived code shipped with.
+
+When uncertain:
+
+1. State the uncertainty clearly.
+2. Check installed WDK headers (`portcls.h`, `wdmaudio.h`, `ksmedia.h`),
+   Microsoft Learn audio docs, or local Microsoft samples.
+3. If still uncertain, report what was checked and what remains unknown.
+4. Ask for approval before proceeding with assumptions affecting
+   architecture, API usage, INF behavior, timing, memory, locking, or
+   stream semantics.
+
+## Forbidden Compromises
+
+Never:
+
+- Re-introduce the old packed 24-bit cable ring storage.
+- Re-introduce the 4-stage `ConvertToInternal -> SrcConvert ->
+  ConvertFromInternal -> LoopbackWrite` cable pipeline.
+- Re-introduce 8-tap sinc SRC with 2048-coefficient table for cable
+  streams.
+- Re-introduce `MicSink` dual-write.
+- Re-enable FormatMatch enforcement requiring Speaker == Mic == Internal.
+- Add a second cable transport owner outside `AoCableAdvanceByQpc`.
+- Let `GetPosition`/`GetPositions` advance audio without going through the
+  canonical helper.
+- Let the shared timer advance audio independently of the canonical helper.
+- Silently overwrite the ring on overflow (must hard-reject + counter).
+- Add hidden mixing, volume, mute, APO, DSP, AGC, EQ, limiter, or noise
+  suppression.
+- Hide underrun, overflow, zero-fill, drop, or DMA-overrun-guard hits as
+  success.
+- Pump audio from query callbacks without going through the canonical
+  helper.
+- Store `ms` as runtime state in cable transport math (frames are
+  authoritative).
+- Return stale ring data into a fresh capture session after STOP/RUN.
+- Change architecture only to fix a build error.
+
+## Edit Protocol
+
+Before modifying files:
+
+1. State what will change and which files.
+2. Explain why.
+3. Perform the edit.
+4. Summarize the result.
+
+Do not silently edit, delete, or change design direction.
+
+## Source Of Truth
+
+Technical / API authority order:
+
+1. Installed WDK PortCls / KS / KMDF headers (`portcls.h`, `wdmaudio.h`,
+   `ksmedia.h`, `wdf.h`).
+2. Microsoft Learn Windows audio + KS documentation.
+3. Microsoft official samples (PortCls / MSVAD / KMDF). Use as **API
+   reference only**, not as architecture template — V1 explicitly rewrites
+   MSVAD's cable transport.
+4. `docs/ADR.md`.
+5. `docs/AO_CABLE_V1_DESIGN.md`.
+6. `docs/AO_CABLE_V1_ARCHITECTURE.md`.
+7. `docs/PRD.md`.
+8. This `CLAUDE.md`.
+9. Phase step documents (`phases/<N>-name/step<N>.md`).
+
+Project direction authority:
+
+- Product goal: `docs/PRD.md`
+- Architecture decisions: `docs/ADR.md`
+- Architecture overview: `docs/AO_CABLE_V1_ARCHITECTURE.md`
+- Detailed design: `docs/AO_CABLE_V1_DESIGN.md`
+- Claude working rules: `CLAUDE.md` (this file)
+- Codex working rules: `AGENTS.md`
+
+If the design document conflicts with official PortCls / WaveRT docs, report
+the conflict and wait for approval.
+
+If official docs allow multiple valid choices and an ADR selects one for
+AO Cable V1, follow the ADR.
+
+## Implementation Order
+
+Phases are tracked in `phases/index.json`. Implementation order:
+
+1. Phase 0: baseline & evidence — **already completed**.
+2. Phase 1: INT32 frame-indexed cable ring + hard-reject overflow.
+3. Phase 2: single-pass linear-interp SRC (write + read).
+4. Phase 3: canonical advance helper in shadow mode.
+5. Phase 4: render coupling (audible flip).
+6. Phase 5: capture coupling (audible flip).
+7. Phase 6: cleanup of retired Phase 5/Step 3-4 scaffolding.
+8. Phase 7: quality polish, multi-channel, telephony metadata.
+
+Do not skip ahead before the current phase exits cleanly.
+
+Each phase has steps in `phases/<N>-name/step<N>.md` plus an `exit.md`.
+Use `python scripts/execute.py status <phase>` to inspect, `next` to print
+the prompt for the next pending step, and `mark` to flip step state.
+
+## Review Checklist
+
+Reject any change that:
+
+- Violates any item in **Forbidden Compromises** above.
+- Splits cable transport ownership across two paths.
+- Removes diagnostics for frame count, order, underrun, overflow, drop, or
+  DMA overrun guard.
+- Treats Phone Link end-to-end audio quality as proof of driver-internal
+  bit-perfect behavior.
+
+Detailed review policy:
+
+```text
+docs/REVIEW_POLICY.md
 ```
 
-## Driver Upgrade
+Codex reviews must not pass a phase or step on compile success and design-
+value matching alone.
 
-- Use `.\install.ps1 -Action upgrade` (NO `-AutoReboot` flag)
-- The no-reboot quiesce path (PREPARE_UNLOAD) is already implemented
-- Never use `-AutoReboot` unless explicitly asked
+Every non-trivial review must also validate:
 
-## Real-Time Call Quality Test
+- PortCls / WaveRT / KS API sequence vs installed WDK headers / Microsoft
+  samples.
+- Create / register / unregister pairing for every PortCls / KS object the
+  change touches.
+- Runtime observable proof for the phase goal.
+- Failure-path, ownership, lifetime, and unwind behavior — including
+  `KeFlushQueuedDpcs` on Pause/Stop and ref-count discipline on
+  `AO_STREAM_RT`.
+- INF, registry, and interface state when applicable.
+- A requirement trace matrix for the reviewed behavior.
 
-Live call test harness: `tests/live_call/`
+When Codex reports a missing register/unregister/create-pair step,
+cross-verify against installed WDK headers, Microsoft Learn, or the existing-
+correct AO code before fixing. If the finding is incorrect, report the
+disagreement with evidence.
 
-### Setup (once)
-```powershell
-cd tests/live_call
-cp .env.example .env   # set OPENAI_API_KEY, PHONE_LINK_DEVICE_ID
-pip install -r requirements.txt
-```
+## Git Policy
 
-`.env` 필수 설정:
-- `OPENAI_API_KEY` — OpenAI API key
-- `PHONE_LINK_DEVICE_ID` — Phone Link 연결 디바이스 ID (DeviceMetadataStorage.json에서 확인)
-- `PHONE_LINK_DIAL_MODE=hidden_uri_only` — hidden URI 다이얼 방식
-- `AMD_ENABLED=false` — 테스트 시 응답기 감지 비활성화
+AO Cable V1 uses **single-branch + commit-prefix** (per `docs/ADR.md`
+ADR-012). The active branch is `feature/ao-fixed-pipe-rewrite`. Detail in
+`docs/GIT_POLICY.md`.
 
-### Cable 전환
-`.env`에서 `AUDIO_CABLE_PROFILE=ao` 또는 `AUDIO_CABLE_PROFILE=vb`
+Summary:
 
-### Claude가 테스트 실행하는 방법
-```powershell
-cd tests/live_call && python run_test_call.py
-```
+- Do not commit directly to `main`. Shipping merges are a separate event.
+- Phase identity comes from `phases/<N>-name/` directory + commit prefix
+  (`phase1/step0`, `phase1/exit`, etc.).
+- Workflow per step: implement → review → fix BLOCKERs → re-review →
+  commit → mark `completed`.
+- Do not commit before review passes. Do not mark step `completed` before
+  commit.
+- Cross-verify reviewer findings against WDK headers, design documents, and
+  existing-correct AO code before fixing. If a finding is incorrect, report
+  the disagreement with evidence — do not blindly apply.
+- One-test-one-commit for runtime / helper validation. A failed test may be
+  committed (failure recorded), but commit message and step file must say
+  `FAIL` clearly.
+- Runtime artifacts under `tests/` remain untracked unless explicitly
+  promoted.
+- Never commit build artifacts, `.env`, secrets, or local WDK signing
+  bypass files.
 
-자동 흐름:
-1. 기본장치를 Cable A/B로 전환 (+ 다른 앱은 원래 장치로 역라우팅)
-2. Phone Link hidden URI로 테스트번호(01058289554) 발신
-3. 8초 대기 (상대방 수신 대기)
-4. TTS 직접 재생 테스트 (24k→48k 업샘플, Cable B에 직접 write)
-5. OpenAI Realtime API로 AI 대화 시작
-6. silence timeout 또는 max turns로 자동 종료
-7. 기본장치 복원
+## Session Continuity
 
-### 유저 역할
-전화 받고 통화 품질 보고: **clean / garbled / silent**
+Continue in the same session while the current phase/step context is clear.
 
-### Claude 모니터링
-- `tests/live_call/runtime_logs/test_call.log` — 전체 로그
-- conversation log 확인 (USER 전사 정확도, AI 응답)
-- `test_stream_monitor.py` — 드라이버 레벨 진단 (병행 실행)
+Use a new session when:
 
-### 현재 확인된 상태 (2026-04-12)
-- VB-Cable: 깨끗함 (TTS/AI 모두 정상, 전사 정확)
-- AO Cable: 왜곡 심함 (동일 경로, 드라이버 품질 문제 확정)
+- Conversation context becomes long enough that phase goals, blockers, or
+  file ownership may be confused.
+- Moving from phase planning/review into substantial implementation.
+- Moving from one phase step to another after a completed review.
+- PortCls/WaveRT API investigation becomes deep enough that focused fresh
+  context would reduce risk.
 
-## Key Files
+When starting a new session, include a short handoff summary:
 
-- `Source/Utilities/loopback.h` / `loopback.cpp` — ring buffer, format conversion, passthrough logic
-- `Source/Main/minwavertstream.cpp` — WaveRT stream state, DPC, timer, position tracking
-- `Source/Main/adapter.cpp` — IOCTL handlers, driver init
-- `Source/Main/ioctl.h` — shared status/config structures
-- `Source/ControlPanel/main.cpp` — control panel behavior and exposed driver settings
-- `test_stream_monitor.py` — live stream diagnostics
-- `tests/live_call/run_test_call.py` — one-command live call quality test
-- `tests/live_call/audio_router.py` — system default device switching for call routing
-
-## VB-Cable Reference (from reverse engineering)
-
-- `results/vbcable_pipeline_analysis.md` — full pipeline: DPC, SRC, ring, position
-- `results/vbcable_disasm_analysis.md` — SRC algorithm, ring struct layout
-- `results/ghidra_decompile/vbcable_all_functions.c` — complete decompile (12096 lines)
-- `docs/V2_RESEARCH_INDEX.md` — all research assets index
-
-## Diagnostics Rule
-
-When changing stream-status diagnostics, update these together:
-
-- `Source/Main/ioctl.h`
-- `Source/Main/adapter.cpp`
-- `test_stream_monitor.py`
-
-Do not trust hardcoded struct offsets without re-verifying layout.
-
-## Pre-Experiment Phone Link Connection Check (엄수)
-
-라이브콜 실험 전 **매번** Phone Link가 실제로 휴대폰과 연결되어 있는지 확인할 것. Phone Link 앱이 떠있어도 폰쪽 "Windows와 연결" 토글이 꺼져 있으면 dial이 나가지 않고 실험 전체가 무효가 됨. 이번 세션 실제 사고:
-
-- Phone Link 앱 자체는 PhoneExperienceHost PID 존재 + 메인 윈도우 있음
-- 그런데 폰쪽 설정이 꺼져 있어 "모바일 장치에서 Windows와 연결이 꺼져 있음" 에러 화면 표시
-- 현재 `phone_link_main_dialer_disconnected()` 헬퍼는 이 에러 화면을 miss함 (다른 automation id 사용)
-- dialer가 hidden URI를 성공적으로 launch해도 Phone Link가 dial 요청을 무시함
-
-확인 방법 (순서):
-1. Phone Link 앱 열어서 "통화" 탭 상태 시각 확인 — 다이얼 패드가 정상인지, "모바일 장치에서 Windows와 연결이 꺼져 있음" 에러 화면인지
-2. 에러 화면이면 폰 퀵세팅에서 "Windows와 연결" 토글 ON
-3. Phone Link 앱이 dialer 상태로 복구된 것 확인
-4. 그 다음에 run_test_call.py 실행
-
-TODO: `phone_link_dialer.py`의 연결 감지 헬퍼를 강화해서 이 에러 화면도 잡도록 하고, `run_test_call.py` 시작 시 hard-gate로 실행. 현재까지는 수동 확인 엄수.
-
-## Pre-Experiment Cable Check (엄수)
-
-라이브콜 실험 전 **매번** 시스템 기본장치가 AO Cable A/B인지 확인할 것. install.ps1의 restore 경로가 이전 세션의 default device(보통 VB-Audio)를 복원해버려 사용자도 모르게 VB 경로로 실험이 돌아가는 사고가 실제로 발생했음.
-
-확인해야 할 것:
-- **기본 재생장치** = "스피커 (AO Cable A)" — VB Cable A 아님
-- **기본 녹음장치** = "마이크 배열 (AO Cable B)" — VB Cable B 아님
-- 둘 다 AO가 아니면 실험 결과는 AO 드라이버가 아닌 VB baseline을 측정한 것이므로 **무효**
-
-확인 도구:
-```powershell
-# 빠른 체크
-Get-CimInstance -ClassName Win32_PnPEntity | Where-Object { $_.Name -like "*Cable*" -and $_.Status -eq "OK" }
-# 또는 설정 실행
-powershell -File C:\Users\jongw\AppData\Local\Temp\set_ao_by_name.ps1
-```
-
-install 직후에는 반드시 `set_ao_by_name.ps1` 실행. run 시작 전 로그에 AO Cable A/B default 전환이 기록되는지 확인.
-
-## Experiment Commit Rule (엄수)
-
-모든 실험은 진행하면서 commit 한다. 나중에 어느 phase/commit에서 어떤 결과가 나왔는지 찾아야 하므로:
-
-- **Source/test/config 변경은 실험 단위로 commit** — batch하지 말고 한 실험 끝나면 바로 commit
-- **실험 결과 파일명에 commit 식별자 붙이기**: `<phase>_<shorthash>_<test>_<point>.<ext>`
-  - 예: `phase5c_wip_run1_A_spk.wav` (commit이 없는 WIP은 `wip`, 또는 `<phase>_<shorthash>_...`)
-- **결과 파일도 commit** — wav/log/md 전부 repo에 포함 (대용량 우려 시 사용자에게 먼저 확인)
-- **memory에도 요약**: `project_remaining_tasks.md`에 phase별 결과 섹션 추가 (어느 commit에서 어떤 판정을 받았는지)
-- **git merge policy 병행**: 브랜치 생성/merge/rebase/push는 여전히 사전 보고 필요. 단순 commit은 이 규칙 아래서 proactive로 진행 가능.
-
-## Changelog Rule
-
-All code changes must be logged in:
-- `docs/PIPELINE_V2_CHANGELOG.md`
-
-Rules:
-- Write the entry BEFORE or IMMEDIATELY AFTER the code edit
-- Include: date, changed file(s), what changed, why
-- No exceptions — even small one-line fixes get logged
-
-## Fixed Pipe Rewrite Design Principles
-
-Full reasoning: `docs/AO_FIXED_PIPE_ARCHITECTURE.md` § 4. Summary:
-
-1. **INT32 frame-indexed ring** — 4 bytes/sample, ~19-bit normalized (not packed 24-bit)
-2. **Hard-reject on overflow** — increment counter, never silent overwrite
-3. **Single SRC per direction** — linear interpolation, GCD divisor (300/100/75)
-4. **DMA → scratch → ring** — linearize before processing
-5. **No MicSink, no dual-write** — ring is sole data path
-6. **Position recalculated on query** — every `GetPosition` invokes the canonical helper with current QPC
-7. **Canonical cable advance helper** (`AoCableAdvanceByQpc`) — single owner of transport+accounting+freshness; all entry points (query, timer, packet) funnel into it
-8. **8-frame minimum gate** — skip sub-sample noise
-9. **Frame-only units** — bytes and QPC are derived; `ms` only in comments / UI / logs
-10. **KeFlushQueuedDpcs before ring reset** — guarantees no in-flight DPC
-
-Also mandatory inside the canonical helper (non-optional):
-
-- 63/64-style drift correction
-- DMA overrun guard (skip if computed advance > sampleRate / 2 frames)
-- Scratch linearization step
-
-If any of the 10 principles is violated by a proposed change, surface it in the Opinion Rule conversation before implementing.
+- Current branch.
+- Current phase and step (`phases/<N>-name/step<N>.md`).
+- Last verified commit.
+- Required source-of-truth documents.
+- Active blockers.
+- Explicit forbidden work for the next step (cite from this file).
