@@ -1,8 +1,10 @@
 # AO Virtual Cable - Claude Instructions (Fixed Pipe Rewrite)
 
-> **Current state and roadmap: `docs/CURRENT_STATE.md`** — single source of truth for where we are (Phase 5c, about to start Phase 6) and what's next. Read this first if resuming cold.
+> **Architecture (single source of truth): `docs/AO_FIXED_PIPE_ARCHITECTURE.md`** — read this before touching cable transport code. It supersedes all prior Phase 5/6 plans and Option Y/Z drafts.
 >
-> **Phase 6 authoritative plan: `docs/PHASE6_PLAN.md`** (Codex-owned). Do not act on Phase 6 design hints from elsewhere — this file is the source of truth for the VB-equivalent shared-timer transport core.
+> **Current state / next step: `docs/CURRENT_STATE.md`** — read this if resuming cold to know which stage is active.
+>
+> **Older plans:** `docs/archive/` and `results/archive/` (reference only, do not edit as live).
 
 ## Opinion Rule (엄수)
 
@@ -163,15 +165,23 @@ Rules:
 
 ## Fixed Pipe Rewrite Design Principles
 
-Based on VB-Cable reverse engineering findings:
+Full reasoning: `docs/AO_FIXED_PIPE_ARCHITECTURE.md` § 4. Summary:
 
-1. **INT32 ring buffer** — 4 bytes/sample, ~19-bit normalized (not packed 24-bit)
-2. **Frame-indexed** — ring positions in frames, not bytes
-3. **Hard reject on overflow** — increment counter and return error, never silent overwrite
-4. **DMA → scratch → ring** — linearize DMA circular region before processing
-5. **Single SRC function** — direction flag for write/read, symmetric behavior
-6. **Linear interpolation SRC** — GCD ratio, stable first; sinc optimization later
-7. **No MicSink dual-write** — ring is the sole data path
-8. **Position on-query** — recalculate to current QPC in position handler
-9. **8-frame minimum gate** — skip sub-sample noise
-10. **KeFlushQueuedDpcs on Pause** — guarantee no DPC in-flight before ring reset
+1. **INT32 frame-indexed ring** — 4 bytes/sample, ~19-bit normalized (not packed 24-bit)
+2. **Hard-reject on overflow** — increment counter, never silent overwrite
+3. **Single SRC per direction** — linear interpolation, GCD divisor (300/100/75)
+4. **DMA → scratch → ring** — linearize before processing
+5. **No MicSink, no dual-write** — ring is sole data path
+6. **Position recalculated on query** — every `GetPosition` invokes the canonical helper with current QPC
+7. **Canonical cable advance helper** (`AoCableAdvanceByQpc`) — single owner of transport+accounting+freshness; all entry points (query, timer, packet) funnel into it
+8. **8-frame minimum gate** — skip sub-sample noise
+9. **Frame-only units** — bytes and QPC are derived; `ms` only in comments / UI / logs
+10. **KeFlushQueuedDpcs before ring reset** — guarantees no in-flight DPC
+
+Also mandatory inside the canonical helper (non-optional):
+
+- 63/64-style drift correction
+- DMA overrun guard (skip if computed advance > sampleRate / 2 frames)
+- Scratch linearization step
+
+If any of the 10 principles is violated by a proposed change, surface it in the Opinion Rule conversation before implementing.

@@ -5,179 +5,83 @@
 **Primary active worktree:** `D:/mywork/Virtual-Audio-Driver`
 **Effective last-known-good baseline:** `439bbcd`
 
-(2026-04-25: `feature/ao-phase6-core` was merged into `feature/ao-fixed-pipe-rewrite`
-and deleted along with the `D:/mywork/ao-phase6` worktree. Single branch
-going forward.)
+## Source of truth
 
-## Canonical docs
+| Topic | File |
+|---|---|
+| **Architecture (single source)** | `docs/AO_FIXED_PIPE_ARCHITECTURE.md` |
+| Current state / next step (this file) | `docs/CURRENT_STATE.md` |
+| VB-Cable evidence (Ghidra) | `results/vbcable_pipeline_analysis.md`, `results/vbcable_disasm_analysis.md`, `results/vbcable_capture_contract_answers.md`, `results/ghidra_decompile/`, `results/ghidra_logs/` |
+| VB-Cable evidence (WinDbg) | `results/phase6_vb_verification.md`, `results/vb_session.log` |
+| Live-call test harness | `tests/live_call/run_test_call.py` |
+| Driver-level diagnostics | `test_stream_monitor.py` |
+| Changelog | `docs/PIPELINE_V2_CHANGELOG.md` |
+| Older planning (archived) | `docs/archive/`, `results/archive/` |
 
-- **Design source of truth:** `docs/PHASE6_PLAN.md`
-- **Detailed Option Y rewrite spec:** `docs/PHASE6_OPTION_Y_CABLE_REWRITE.md`
-- **VB runtime parity findings:** `docs/VB_PARITY_DEBUG_RESULTS.md`
-- **Current status / roadmap:** this file
-- **Historical commit-by-commit record:** `docs/PIPELINE_V2_CHANGELOG.md`
-- **Older architecture history:** `docs/AO_V2_ARCHITECTURE_PLAN.md`
-
-If two documents disagree:
-
-1. runtime evidence
-2. `docs/PHASE6_PLAN.md` for architecture/design intent
-3. `docs/CURRENT_STATE.md` for current execution state and roadmap
-4. `docs/PIPELINE_V2_CHANGELOG.md` for historical record
+If two documents disagree, the architecture doc wins. If the architecture doc
+is silent on a topic, runtime evidence wins. If runtime evidence is silent,
+this file (CURRENT_STATE.md) provides the operational answer.
 
 ## Where we are
 
-### Known-good baseline
+The cable-stream rewrite has its design frozen. The next step is implementation Stage 1.
 
-`439bbcd` remains the effective last-known-good baseline for the phone path.
+### Confirmed
 
-That does not mean it is perfect. It means:
+- VB-Cable Ghidra static analysis complete (12,096 lines decompile, 297 functions)
+- VB-Cable WinDbg dynamic verification done under live TTS payload
+- AO vs VB head-to-head live call: **VB clean, AO garbled** on the same path → driver-core problem confirmed
+- All historical Phase 5 / Step 3-4 / Option Z / Option Y attempts are recorded and archived
+- Branches consolidated to single `feature/ao-fixed-pipe-rewrite`
+- Single architecture document `docs/AO_FIXED_PIPE_ARCHITECTURE.md` consolidates all prior planning
 
-- it is the current safe behavioral baseline
-- later Step 3/4 timer-owned transport experiments regressed from it
-- all new design work must compare back to it
+### Active branch state
 
-### Phase 5 status
+`feature/ao-fixed-pipe-rewrite` currently contains the last stable Phase 6 Y2-2 implementation (render audible flag flipped to helper, capture remains on legacy path). Y3 attempts are reverted.
 
-`2c733f1` is the archived failed Phase 5 attempt.
+## Implementation stages
 
-What failed:
+See `docs/AO_FIXED_PIPE_ARCHITECTURE.md` § 15 for full stage definitions and gates.
 
-- moving transport ownership to a query/timer-owned path
-- treating transport cadence as something external to the stream update chain
+| Stage | Scope | Status |
+|---|---|---|
+| 0 | Baseline & evidence | ✓ done |
+| 1 | INT32 frame-indexed ring + hard-reject overflow | next |
+| 2 | Single-pass SRC (linear interpolation, GCD divisor) | pending |
+| 3 | Canonical advance helper (shadow mode) | pending (partly present as Y1 scaffolding, needs reconciliation) |
+| 4 | Render coupling (audible) | pending (currently Y2-2 on the branch — needs revisit per new principles) |
+| 5 | Capture coupling | pending |
+| 6 | Cleanup | pending |
+| 7 | Quality polish (post-rewrite) | future |
 
-What remains useful:
+Do not skip stages. Each gate is mandatory.
 
-- historical evidence
-- some scaffolding ideas
-- lessons learned about what not to do
+## Immediate next step
 
-But Phase 5 is not a design baseline anymore.
+**Stage 1 — Ring rewrite (INT32, frame-indexed, hard-reject).**
 
-### Phase 6 status
+Edit targets:
 
-Phase 6 Step 1 skeleton succeeded.
+- `Source/Utilities/loopback.h` — `FRAME_PIPE` struct fields
+- `Source/Utilities/loopback.cpp` — ring storage, format normalization, overflow handling
 
-What is already proven:
+Before starting Stage 1, the implementer should:
 
-- engine lifecycle scaffolding can exist safely
-- stream register/unregister works
-- shared timer skeleton can be loaded without BSOD
+1. Re-read `docs/AO_FIXED_PIPE_ARCHITECTURE.md` § 4 (principles), § 6 (data structures), § 10 (SRC), Appendix A (offset map).
+2. Run `.\build-verify.ps1 -Config Release` on the current branch to confirm clean baseline.
+3. Run `tests/live_call/run_test_call.py` once on AO (current state) and once on VB to refresh the quality reference.
 
-What failed:
+## Key operational rules
 
-- Phase 6 Step 3/4 timer-owned transport
+These come from CLAUDE.md and remain in effect:
 
-Current understanding:
+- **Pre-experiment Cable check** (default device must be AO Cable A/B, not VB)
+- **Pre-experiment Phone Link connection check** (phone-side toggle ON)
+- **Experiment commit rule** (commit each experiment with phase+shorthash; result files in repo)
+- **Build process** (`build-verify.ps1`, no `-AutoReboot`)
+- **Diagnostics rule** (`ioctl.h` + `adapter.cpp` + `test_stream_monitor.py` updated together)
+- **Changelog rule** (every code change logged in `docs/PIPELINE_V2_CHANGELOG.md`)
 
-- the Step 3/4 regression was not just one bad constant
-- it was not solved by "better publish cursor" alone
-- the core mistake was **decoupling transport from the update chain**
+## Bottom line
 
-In other words:
-
-- one path advanced accounting/cursor state
-- another path later moved audio on its own cadence
-
-That separation is now considered the structural regression source.
-
-## Current decision
-
-The project is now on:
-
-### `Z`
-
-Revert the failed Step 3/4 data movement and recover Step 1 / Phase 4 quality while keeping the reusable engine skeleton.
-
-### `Y`
-
-Rebuild Phase 6 as **update-chain-coupled transport**, not timer-owned transport.
-
-This means:
-
-- main transport owner is the canonical cable advance path
-- query path and shared timer both remain active call sources
-- frame delta, gate, cursor/accounting, and transport move together
-- shared timer must not become a second owner
-
-It explicitly does **not** mean:
-
-- "just lower the timer to 1 ms"
-- "make the shared timer own everything"
-- "keep timer-owned transport and tune constants"
-
-## Immediate next steps
-
-1. Finish `Z`
-   - restore legacy cable speaker `ReadBytes` from `UpdatePosition`
-   - restore legacy cable mic `WriteBytes` from `UpdatePosition`
-   - stop timer callback from dispatching render/capture movement
-   - keep Step 1 skeleton
-
-2. Validate `Z`
-   - build/install
-   - local loopback
-   - live call
-   - confirm Step 3/4 regression disappears
-
-3. Start `Y1`
-   - add update-chain shadow hook only
-   - no audio movement change yet
-   - follow `docs/PHASE6_OPTION_Y_CABLE_REWRITE.md` for exact cable-only removal scope and phase gates
-
-4. Start `Y2`
-   - move render transport into update-coupled helper
-   - validate before touching capture
-
-5. Start `Y3`
-   - move capture transport into update-coupled helper
-   - reuse good startup/headroom/recovery ideas only inside the new coupled design
-
-## Current quality gate
-
-We are **not** in cleanup/tuning-only territory yet.
-
-The active quality gate is:
-
-- recover from the failed timer-owned Step 3/4 experiment
-- prove that update-chain-coupled migration can match or beat the `439bbcd` baseline
-
-Until that happens:
-
-- Step 5/6 style cleanup is not the main work
-- timer-owned transport is not the design baseline
-- "VB-equivalent" means structural coupling with hybrid call sources, not simply a faster timer
-
-## Runtime evidence snapshot
-
-The current VB runtime evidence is recorded in `docs/VB_PARITY_DEBUG_RESULTS.md`.
-
-What is already strong enough to act on:
-
-- A side looks query-heavier
-- B side is timer-dominant hybrid
-- `+0x22b0` is a real hot payload primitive
-- hot-path WinDbg breakpoints are intrusive enough to distort quality judgment
-
-What still remains open before claiming full VB identity:
-
-- packet notification contract
-- capture branch parity
-- full lifecycle reset semantics beyond register/unregister entry
-
-## Stage B and later
-
-After Phase 6 lands cleanly:
-
-1. broader channel acceptance
-2. broader format acceptance
-3. telephony features such as AMD
-4. ControlPanel runtime configuration polish
-
-These are intentionally downstream of Phase 6.
-
-## One-line summary
-
-Current project direction is:
-
-**recover from the failed timer-owned experiment, then rebuild Phase 6 so query and timer both funnel into one canonical cable advance path instead of maintaining separate ownership models.**
+**Architecture is frozen. Stage 1 is the next implementation step. Single source of truth is `docs/AO_FIXED_PIPE_ARCHITECTURE.md`.**
