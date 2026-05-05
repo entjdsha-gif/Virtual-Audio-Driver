@@ -16,24 +16,38 @@ benchmark suite confirms PRD success criteria.
 
 ## Phase 7 → main merge
 
-Per `docs/GIT_POLICY.md` § 5:
+Per `docs/GIT_POLICY.md` § 6 (V1 ship merge — ADR-014):
 
 ```powershell
 git checkout main
 git merge --no-ff feature/ao-fixed-pipe-rewrite
 ```
 
-The merge commit message must include:
+The merge commit message must include the ADR-014 verified block:
 
 ```text
+V1 ship merge (M6)
+
+V1 classification: <PASS / PASS_WITH_CAVEATS>
+
 Verified:
-- build-verify.ps1 -Config Release
-- install.ps1 -Action upgrade
-- live-call parity with VB
-- benchmark suite PASS
+- build-verify.ps1 -Config Release: <hash> built clean
+- install.ps1 -Action upgrade: <date>, machine <id>
+- live-call parity with VB: tests/phase5-runtime/<run>/judgment
+- benchmark suite PASS: phases/7-quality-polish/step4 artifacts
+- M6 checklist: phases/7-quality-polish/step5 fully checked
+- Phase 1-7 each merged with verified blocks (see git log
+  --first-parent feature/ao-fixed-pipe-rewrite)
 
 Known blockers:
-- (any documented residual risk)
+- <any documented residual risk> | none
+
+Non-claims:
+- this merge does NOT replace V2 (separate ACX track).
+- this merge does NOT promise zero-drift parity with VB binary
+  (only behavioral parity per the design).
+
+Co-Authored-By: <agent identity>
 ```
 
 ## Beyond V1

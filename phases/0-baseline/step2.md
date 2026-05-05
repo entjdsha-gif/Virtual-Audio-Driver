@@ -27,11 +27,17 @@ implementation work in Phase 1.
      `docs/PIPELINE_V2_CHANGELOG.md`, `docs/EVIDENCE_INVENTORY.md`.
 2. Adopted the V2-project planning layout (V1 context):
    - `docs/PRD.md` — product identity / scope / success criteria.
-   - `docs/ADR.md` — 12 architecture decisions.
+   - `docs/ADR.md` — 12 architecture decisions (at the time of this
+     step; later extended to 14 — ADR-013 timer period, ADR-014
+     per-phase branch model superseding ADR-012).
    - `docs/AO_CABLE_V1_ARCHITECTURE.md` — system overview.
    - `docs/AO_CABLE_V1_DESIGN.md` — file-level + struct-level detail.
    - `docs/REVIEW_POLICY.md` — review standard.
-   - `docs/GIT_POLICY.md` — single-branch + commit-prefix.
+   - `docs/GIT_POLICY.md` — single-branch + commit-prefix at this
+     step's time. Switched to per-phase-branch + verified-merge by
+     ADR-014 between Phase 0 exit and Phase 1 entry; the historical
+     single-branch model recorded here is the policy under which
+     Phase 0 actually ran.
 3. Replaced agent guidance:
    - `CLAUDE.md` (V1 context, V1 forbidden-drift list).
    - `AGENTS.md` (Codex counterpart, same shared rules).

@@ -31,4 +31,4 @@ extension, signing pipeline finalization, M6 shipping prep.
 
 After Phase 7 reaches the M6 milestone, the user may decide to
 merge `feature/ao-fixed-pipe-rewrite` into `main` per
-`docs/GIT_POLICY.md` § 5.
+`docs/GIT_POLICY.md` § 6 (V1 ship merge — ADR-014).

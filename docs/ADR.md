@@ -674,9 +674,16 @@ transport path. `ms` is allowed only in:
 
 ## ADR-012: Single Branch + Commit Prefix For Phase Isolation
 
-Status: accepted
+Status: **superseded by ADR-014** (per-phase branch + verified-merge model)
 
-### Context
+> Original decision retained below for historical context.
+> The single-branch model worked for the planning consolidation phase
+> (Phase 0 + 7 rounds of doc review), but Phase 1+ implementation
+> warrants per-phase branch isolation so a phase that goes badly can
+> be rolled back without disturbing planning history. See ADR-014 for
+> the new contract.
+
+### Context (historical)
 
 V2 (`ao-cable-v2-step2b-merge`) uses `phase/<N>-name` git branches with
 `--no-ff` merges to master. The model fits a multi-developer or
@@ -686,7 +693,7 @@ V1 just consolidated multiple worktrees and parallel branches back into
 one (`feature/ao-fixed-pipe-rewrite`) to remove coordination overhead.
 Reintroducing per-phase branches re-creates the problem we just solved.
 
-### Decision
+### Decision (historical, superseded)
 
 V1 uses a **single active development branch + commit-prefix** model:
 
@@ -698,22 +705,24 @@ V1 uses a **single active development branch + commit-prefix** model:
 - Frozen reference branches (`feature/ao-pipeline-v2`,
   `feature/ao-telephony-passthrough-v1`) stay frozen.
 
-Full rules in `docs/GIT_POLICY.md`.
-
-### Rationale
+### Rationale (historical)
 
 - single branch removes worktree management overhead.
 - phase isolation is achieved by directory + commit-prefix structure,
   which is enough for a single-developer / single-AI-pair workflow.
-- merging to `main` is reserved for shipping milestones (M1/M2/M6, etc.),
-  which is a small number of events per year.
 
-### Consequences
+### Why superseded
 
-- this is a deliberate divergence from V2 git policy. Reviews comparing
-  V1 to V2 must not flag the absence of phase branches as a violation.
-- if V1 ever scales to multi-developer, this ADR will be reconsidered;
-  for now, single-branch is correct.
+In practice, the planning fixes accumulated as a sequence of small
+review-driven commits on `feature/ao-fixed-pipe-rewrite`. That worked
+because the changes were isolated to docs and the only risk was
+"a typo gets committed". Phase 1+ involves driver source edits that
+can break audio in subtle ways — runtime regressions, BSODs under
+specific format combinations, install/load races. Rollback granularity
+of "the whole phase" is more useful than "one commit at a time" when
+debugging a regression spotted only at phase exit. ADR-014 adopts the
+V2-style per-phase branch with a verified-merge contract that records
+exactly what was checked at each phase boundary.
 
 ---
 
@@ -775,3 +784,190 @@ This applies to:
 - Reverting to 20 ms timer to "smooth jitter" without an ADR
   superseding this one.
 - A second timer at a different period.
+
+---
+
+## ADR-014: Per-Phase Branch + Verified-Merge (V2-style, V1-adapted)
+
+Status: accepted (supersedes ADR-012)
+
+### Context
+
+ADR-012 chose a single-branch + commit-prefix model for V1 to remove
+worktree management overhead during the planning consolidation phase.
+That choice was correct for Phase 0 + the seven rounds of doc-only
+review fixes that produced the current `feature/ao-fixed-pipe-rewrite`
+HEAD, because the work was small, mechanical, and contained to docs.
+
+Phase 1+ is different. Driver source edits land on the audible path,
+and a regression caught only at phase exit (e.g., a BSOD under specific
+KSDATARANGE intersection, a fade-envelope ordering bug, a packed-24
+remnant) is easier to roll back as "one phase" than as "N untangled
+commits". V2 (`ao-cable-v2-step2b-merge`) faced the same constraint
+from Phase 0 and adopted per-phase branches with verified-merge commits
+to master. Their `git log --graph master` at HEAD `2809f94` shows the
+working result: each phase merge commit captures a `Verified:` block
+and a `Known blockers:` block that is the rollback target if a
+regression appears later.
+
+### Decision
+
+V1 adopts a **per-phase branch model with V2-style verified merges**,
+adapted for V1's pre-existing `main` baseline.
+
+#### Branch roles
+
+| Branch | Role | When it changes |
+|---|---|---|
+| `main` | pre-rewrite shipping reference. **Unchanged** during Phase 1-6. | Once: V1 ship event at Phase 7 exit (`--no-ff` merge from `feature/ao-fixed-pipe-rewrite`). |
+| `feature/ao-fixed-pipe-rewrite` | **V1's integration target** — plays the role V2's `master` plays. All phase branches merge here with `--no-ff`. | Phase merges (every phase exit) + short-lived `docs/...` / `fix/...` branch merges. |
+| `phase/<N>-name` | Phase work branch. Branches off `feature/ao-fixed-pipe-rewrite`, merges back at phase exit. | Phase implementation commits (`phaseN/stepM:`, `phaseN/fix:`, `phaseN: close <classification>`). |
+| `docs/<topic>` | Short-lived doc-only fix branch. Used when a doc update spans multiple phases or doesn't belong to any phase. | One-off, deleted after merge. |
+| `fix/<scope>` | Short-lived bug-fix branch outside a phase (rare). | One-off, deleted after merge. |
+| `feature/ao-pipeline-v2`, `feature/ao-telephony-passthrough-v1` | Frozen reference branches. **Never modified.** | Never. |
+
+#### Branch naming
+
+Phase branch name = `phase/<N>-<directory-name>`, matching
+`phases/<N>-name/`:
+
+```text
+phase/1-int32-ring
+phase/2-single-pass-src
+phase/3-canonical-helper-shadow
+phase/4-render-coupling
+phase/5-capture-coupling
+phase/6-cleanup
+phase/7-quality-polish
+```
+
+V2's "branch name must not collide with design phase name" rule
+(V2 ADR / GIT_POLICY) does not apply to V1 — V1's `phases/<N>-name`
+directory naming is already unambiguous.
+
+#### Commit prefix (within a phase branch)
+
+```text
+phaseN/stepM: <imperative summary>
+phaseN/fix: <imperative summary>            (post-review or hotfix)
+phaseN: close <classification>              (final closeout commit)
+```
+
+`<classification>` is a short status token chosen at phase close, e.g.
+`PASS`, `PASS_WITH_CAVEATS`, `BLOCKED`, `CONVERSION_CLEAN` (V2-style).
+
+#### Merge contract
+
+Phase branch → integration target:
+
+```powershell
+git checkout feature/ao-fixed-pipe-rewrite
+git merge --no-ff phase/N-name
+```
+
+`--no-ff` is mandatory. Squash is forbidden — phase history must remain
+visible on the integration line so future bisects can land inside a
+specific step's commit.
+
+The merge commit message **must** include the V2-style verified block:
+
+```text
+Merge phase/N: <one-line description> (<CLASSIFICATION>)
+
+Phase N classification: <CLASSIFICATION>
+
+Verified:
+- <numbered build / install / runtime / IOCTL / live-call check>
+- ...
+
+Known blockers:
+- <item> | none
+
+Non-claims:
+- <what this merge does NOT prove>
+
+Co-Authored-By: <agent identity>
+```
+
+`Verified:` lines must be specific enough that a reviewer six months
+later can re-run them. `Non-claims:` is the safety rail against
+"merged ⇒ everything works" misreading.
+
+#### Workflow per step (within a phase branch)
+
+```text
+1. Implement the step on phase/N-name.
+2. Self-check: build, IOCTL probe, acceptance criteria from step file.
+3. Request Codex review.
+4. Cross-verify findings against WDK headers, design docs, RE evidence.
+   Disagree-with-evidence is allowed; do not blindly apply.
+5. If BLOCKER found: fix on the same phase branch, request re-review.
+   Do not commit the fix before re-review passes.
+6. Review passes: commit with phaseN/stepM: prefix.
+7. python scripts/execute.py mark <phase-dir> <step> completed --message "..."
+```
+
+Do not commit before review. Do not mark `completed` before commit.
+
+#### Final ship merge (Phase 7 exit)
+
+```powershell
+git checkout main
+git merge --no-ff feature/ao-fixed-pipe-rewrite
+```
+
+The merge commit message follows the same Verified / Known blockers /
+Non-claims structure, scoped to the V1 ship gate (M6 checklist from
+`phases/7-quality-polish/step5.md`).
+
+### Rationale
+
+- **Phase rollback granularity.** A regression caught at Phase 4 live
+  call can be reverted by `git revert <merge-commit>` on
+  `feature/ao-fixed-pipe-rewrite`, restoring the pre-Phase-4 state in
+  one step. Under ADR-012 the same operation requires a commit-range
+  revert that is harder to reason about.
+- **`Verified:` block as commit-time documentation.** What was actually
+  checked at phase exit is recorded next to the merge that landed it.
+  Six months later this is the only ground truth — phase exit doc
+  files can drift, but the merge commit is immutable.
+- **V2 parity for phase-internal workflow.** Phase commits (`phaseN/stepM:`)
+  and Codex review cycle are identical to V2. Only the merge target
+  differs (V1: `feature/ao-fixed-pipe-rewrite`; V2: `master`).
+- **`main` preserved as pre-rewrite reference.** V1 is rewriting an
+  existing shipping codebase. Keeping `main` untouched until ship lets
+  any pre-rewrite bug investigation reproduce against the exact
+  shipped binary without `git revert` gymnastics. V2 didn't have this
+  concern (greenfield).
+
+### Consequences
+
+- `feature/ao-fixed-pipe-rewrite` is no longer a "work" branch — it
+  becomes an **integration** branch. Direct commits to it are
+  reserved for short-lived `docs/...` / `fix/...` branch merges and
+  the V1 ship merge. Phase implementation commits go on phase
+  branches.
+- The seven rounds of doc-only fixes already on
+  `feature/ao-fixed-pipe-rewrite` (commits 91c8070 through aaf585a)
+  are accepted as the integration baseline at the moment ADR-014
+  takes effect. This ADR-014 commit itself is the last direct commit
+  to `feature/ao-fixed-pipe-rewrite` before per-phase branching
+  begins.
+- `docs/GIT_POLICY.md`, `CLAUDE.md`, `AGENTS.md`, and the relevant
+  phase exit docs are updated in the same commit as this ADR so the
+  doc set stays self-consistent.
+- ADR-012 is marked superseded but retained as a historical record of
+  the prior decision and the reason for the switch.
+
+### Forbidden as a result
+
+- Direct commits to `feature/ao-fixed-pipe-rewrite` for phase
+  implementation work. Phase work goes on `phase/N-name`.
+- Direct commits to `main` of any kind. `main` only changes via the
+  V1 ship merge.
+- Squash merging a phase branch (loses per-step bisect granularity).
+- Fast-forward merging a phase branch (loses the `Verified:` block
+  attached to the merge commit).
+- Merging a phase branch whose Codex review still has open BLOCKERs.
+- Merging a phase branch whose final closeout commit
+  (`phaseN: close <classification>`) is missing.

@@ -3,7 +3,8 @@
 ## Goal
 
 Final pre-merge checklist before `feature/ao-fixed-pipe-rewrite`
-merges to `main` per `docs/GIT_POLICY.md` § 5.
+merges to `main` per `docs/GIT_POLICY.md` § 6 (V1 ship merge —
+ADR-014).
 
 ## Planned Files
 

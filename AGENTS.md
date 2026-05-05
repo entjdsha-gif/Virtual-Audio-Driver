@@ -246,30 +246,88 @@ references.
 
 ## Git Policy
 
-AO Cable V1 uses **single-branch + commit-prefix** (per `docs/ADR.md`
-ADR-012). Active branch: `feature/ao-fixed-pipe-rewrite`. Full rules in
-`docs/GIT_POLICY.md`.
+AO Cable V1 uses **per-phase branches + verified merges** (per
+`docs/ADR.md` ADR-014, supersedes ADR-012). Full rules in
+`docs/GIT_POLICY.md`. Mirrors V2's `phase/<N>-name + --no-ff merge to
+master` pattern, adapted so V1's `main` (pre-rewrite shipping
+reference) stays untouched until V1 ship event.
 
-Key rules:
+### Branch roles
 
-- Do not commit directly to `main`. Shipping merges are a separate event.
-- Use commit prefixes that match the phase/step (`phase1/step0`,
-  `phase1/exit`).
-- Workflow: implement → review → fix BLOCKERs → re-review → commit →
-  mark `completed`.
-- Do not commit before review passes.
-- Do not mark step `completed` before commit.
-- Cross-verify review findings against WDK headers, design documents,
-  and existing-correct AO code before applying. If a finding is incorrect
-  or imprecise, report the disagreement with evidence — do not let Claude
-  blindly apply.
-- One-test-one-commit for runtime / helper validation. Failed tests may
-  be committed (failure recorded) but the commit message and step file
-  must say `FAIL` clearly.
-- Runtime artifacts under `tests/` remain untracked unless explicitly
+- `main` — pre-rewrite shipping reference. Untouched during Phase 1-6.
+  One `--no-ff` merge from `feature/ao-fixed-pipe-rewrite` at V1 ship.
+- `feature/ao-fixed-pipe-rewrite` — V1's integration target (the
+  V1-side equivalent of V2's `master`). Phase branches merge here.
+- `phase/<N>-name` — phase implementation branches (`phase/1-int32-ring`,
+  ..., `phase/7-quality-polish`).
+- `docs/<topic>`, `fix/<scope>` — short-lived support branches.
+- `feature/ao-pipeline-v2`, `feature/ao-telephony-passthrough-v1` —
+  frozen reference; never modify.
+
+### Workflow per step
+
+```text
+1. Implement on phase/N-name.
+2. Self-check (build, IOCTL, acceptance).
+3. Request Codex review.
+4. Cross-verify findings against WDK headers, design docs, RE evidence.
+   If a finding is incorrect or imprecise, Claude must report the
+   disagreement with evidence — do not blindly apply.
+5. If BLOCKER (verified): fix, re-review. Do not commit fix before
+   re-review passes.
+6. Review passes: commit phaseN/stepM: <msg>.
+7. python scripts/execute.py mark <phase-dir> <step> completed.
+```
+
+Do not commit before review. Do not mark `completed` before commit.
+
+### Phase merge contract
+
+At phase exit:
+
+```powershell
+git checkout feature/ao-fixed-pipe-rewrite
+git merge --no-ff phase/N-name
+```
+
+Merge commit body **must** include:
+- `Phase N classification: <CLASSIFICATION>` (PASS / PASS_WITH_CAVEATS
+  / BLOCKED / phase-specific token).
+- `Verified:` block — each line specific enough that a reviewer six
+  months later can re-run it (build hash, install date, IOCTL probe
+  output ref, live-call evidence path).
+- `Known blockers:` (or `none`).
+- `Non-claims:` — what this merge does NOT prove.
+- `Co-Authored-By:` trailer for AI-contributed commits.
+
+`--no-ff` mandatory; squash and fast-forward forbidden (per V2
+practice). Phase merge commit IS the rollback target for that phase
+(`git revert <merge-sha>` undoes the whole phase atomically).
+
+### V1 ship merge
+
+Only at Phase 7 exit, user-approved. Same Verified / Known blockers /
+Non-claims structure scoped to M6 ship gate.
+
+### Forbidden
+
+- Direct commits to `main` during Phase 1-6.
+- Direct commits to `feature/ao-fixed-pipe-rewrite` for phase
+  implementation work.
+- Squash or fast-forward merge of phase branches.
+- Force-push to `main` or `feature/ao-fixed-pipe-rewrite`.
+- Skipping hooks (`--no-verify`) or signing without explicit user
+  authorization for the specific commit.
+- Committing build artifacts, secrets, local WDK signing bypass files.
+
+### Other rules
+
+- One-test-one-commit for runtime validation. Failed tests may be
+  committed (failure recorded); commit message and step file must say
+  `FAIL` clearly.
+- Runtime artifacts under `tests/` untracked unless explicitly
   promoted.
-- Never let build artifacts, secrets, or local WDK signing bypass files
-  be committed.
+- Co-author trailer required when an AI agent contributed.
 
 ## Session Continuity
 

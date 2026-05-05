@@ -210,29 +210,83 @@ disagreement with evidence.
 
 ## Git Policy
 
-AO Cable V1 uses **single-branch + commit-prefix** (per `docs/ADR.md`
-ADR-012). The active branch is `feature/ao-fixed-pipe-rewrite`. Detail in
-`docs/GIT_POLICY.md`.
+AO Cable V1 uses **per-phase branches + verified merges** (per
+`docs/ADR.md` ADR-014, supersedes ADR-012). Detail in
+`docs/GIT_POLICY.md`. Plays the role V2's `master` model plays, adapted
+for V1's pre-rewrite `main` baseline.
 
-Summary:
+### Branch roles
 
-- Do not commit directly to `main`. Shipping merges are a separate event.
-- Phase identity comes from `phases/<N>-name/` directory + commit prefix
-  (`phase1/step0`, `phase1/exit`, etc.).
-- Workflow per step: implement → review → fix BLOCKERs → re-review →
-  commit → mark `completed`.
-- Do not commit before review passes. Do not mark step `completed` before
-  commit.
-- Cross-verify reviewer findings against WDK headers, design documents, and
-  existing-correct AO code before fixing. If a finding is incorrect, report
-  the disagreement with evidence — do not blindly apply.
-- One-test-one-commit for runtime / helper validation. A failed test may be
-  committed (failure recorded), but commit message and step file must say
-  `FAIL` clearly.
+- `main` — pre-rewrite shipping reference. **Untouched during Phase
+  1-6.** Receives one `--no-ff` merge from
+  `feature/ao-fixed-pipe-rewrite` at V1 ship event (Phase 7 exit).
+- `feature/ao-fixed-pipe-rewrite` — V1's integration branch. Phase
+  branches merge here. No direct phase-implementation commits.
+- `phase/<N>-name` — phase work branches (`phase/1-int32-ring`,
+  `phase/2-single-pass-src`, ..., `phase/7-quality-polish`). Created
+  from integration HEAD at phase entry; merged back at phase exit.
+- `docs/<topic>` / `fix/<scope>` — short-lived branches for cross-phase
+  doc fixes or non-phase bug fixes. Merge back to integration with
+  `--no-ff`, delete after merge.
+- `feature/ao-pipeline-v2`, `feature/ao-telephony-passthrough-v1` —
+  frozen reference. Never modify.
+
+### Workflow per step (within a phase branch)
+
+1. Implement on `phase/N-name`.
+2. Self-check: build, IOCTL, acceptance criteria.
+3. Request Codex review.
+4. Cross-verify findings against WDK headers, design docs, RE evidence.
+   Disagree-with-evidence is allowed; do not blindly apply.
+5. If BLOCKER (verified): fix, re-review. **Do not commit fix before
+   re-review passes.**
+6. Review passes: commit `phaseN/stepM: <msg>`.
+7. `python scripts/execute.py mark <phase-dir> <step> completed
+   --message "..."`
+
+Do not commit before review. Do not mark `completed` before commit.
+
+### Phase merge
+
+At phase exit, after the closeout commit
+(`phaseN: close <CLASSIFICATION>`) on the phase branch:
+
+```powershell
+git checkout feature/ao-fixed-pipe-rewrite
+git merge --no-ff phase/N-name
+```
+
+Merge commit message **must** include `Phase N classification:`,
+`Verified:` (build, install, IOCTL, runtime, exit.md acceptance —
+each line specific enough to re-run), `Known blockers:`, `Non-claims:`.
+Squash and fast-forward are forbidden. See `docs/GIT_POLICY.md` § 5
+for the full template.
+
+### V1 ship merge
+
+Only at Phase 7 exit, user-approved. `feature/ao-fixed-pipe-rewrite`
+→ `main` with the same `Verified` / `Known blockers` / `Non-claims`
+block scoped to the M6 ship gate.
+
+### Forbidden
+
+- Direct commits to `main` during Phase 1-6.
+- Direct commits to `feature/ao-fixed-pipe-rewrite` for phase
+  implementation work.
+- Squash or fast-forward merge of phase branches.
+- Force-push to `main` or `feature/ao-fixed-pipe-rewrite`.
+- Skipping git hooks (`--no-verify`) or signing (`--no-gpg-sign`)
+  unless user explicitly authorizes a specific commit.
+- Committing build artifacts, `.env`, secrets, local WDK signing
+  bypass files.
+
+### Other rules
+
+- One-test-one-commit for runtime validation. A failed test may be
+  committed (failure recorded); commit message and step file must
+  say `FAIL` clearly.
 - Runtime artifacts under `tests/` remain untracked unless explicitly
   promoted.
-- Never commit build artifacts, `.env`, secrets, or local WDK signing
-  bypass files.
 
 ## Session Continuity
 
