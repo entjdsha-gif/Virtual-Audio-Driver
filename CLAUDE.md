@@ -220,7 +220,7 @@ for V1's pre-rewrite `main` baseline.
 - `main` — pre-rewrite shipping reference. **Untouched during Phase
   1-6.** Receives one `--no-ff` merge from
   `feature/ao-fixed-pipe-rewrite` at V1 ship event (Phase 7 exit).
-- `feature/ao-fixed-pipe-rewrite` — V1's integration branch. Phase
+- `feature/ao-fixed-pipe-rewrite` — V1's integration target. Phase
   branches merge here. No direct phase-implementation commits.
 - `phase/<N>-name` — phase work branches (`phase/1-int32-ring`,
   `phase/2-single-pass-src`, ..., `phase/7-quality-polish`). Created
@@ -233,7 +233,7 @@ for V1's pre-rewrite `main` baseline.
 
 ### Workflow per step (within a phase branch)
 
-1. Implement on `phase/N-name`.
+1. Implement on `phase/<N>-name`.
 2. Self-check: build, IOCTL, acceptance criteria.
 3. Request Codex review.
 4. Cross-verify findings against WDK headers, design docs, RE evidence.
@@ -253,20 +253,42 @@ At phase exit, after the closeout commit
 
 ```powershell
 git checkout feature/ao-fixed-pipe-rewrite
-git merge --no-ff phase/N-name
+git merge --no-ff phase/<N>-name
 ```
 
-Merge commit message **must** include `Phase N classification:`,
-`Verified:` (build, install, IOCTL, runtime, exit.md acceptance —
-each line specific enough to re-run), `Known blockers:`, `Non-claims:`.
-Squash and fast-forward are forbidden. See `docs/GIT_POLICY.md` § 5
-for the full template.
+Merge commit body **must** include all of:
+
+- `Phase N classification: <CLASSIFICATION>` (PASS / PASS_WITH_CAVEATS
+  / BLOCKED / phase-specific token).
+- `Verified:` block — each line specific enough that a reviewer six
+  months later can re-run it (build hash, install date, IOCTL probe
+  output ref, live-call evidence path, per-step exit.md acceptance
+  with evidence pointer).
+- `Known blockers:` (or `none`).
+- `Non-claims:` — what this merge does NOT prove.
+- `Co-Authored-By:` trailer for AI-contributed commits.
+
+`--no-ff` mandatory; squash and fast-forward forbidden (loses per-step
+bisect granularity and the `Verified:` block). The phase merge commit
+IS the rollback target for that phase
+(`git revert <merge-sha>` undoes the whole phase atomically). See
+`docs/GIT_POLICY.md` § 5 for the full message template.
 
 ### V1 ship merge
 
-Only at Phase 7 exit, user-approved. `feature/ao-fixed-pipe-rewrite`
-→ `main` with the same `Verified` / `Known blockers` / `Non-claims`
-block scoped to the M6 ship gate.
+Only at Phase 7 exit, after the M6 shipping checklist
+(`phases/7-quality-polish/step5.md`) is fully checked and the user
+explicitly approves:
+
+```powershell
+git checkout main
+git merge --no-ff feature/ao-fixed-pipe-rewrite
+```
+
+Merge commit body **must** include the same five blocks as the phase
+merge contract above, scoped to the V1 ship gate. The exact template
+is in `phases/7-quality-polish/exit.md` § "Phase 7 → main merge"; do
+not improvise. `--no-ff` mandatory; squash and fast-forward forbidden.
 
 ### Forbidden
 

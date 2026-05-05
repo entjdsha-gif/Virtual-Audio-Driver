@@ -9,7 +9,7 @@ Authority: ADR-014 (supersedes ADR-012)
 during Phase 1-6 and only receives the V1 ship merge at Phase 7 exit.
 Do not commit directly to `main`.
 
-`feature/ao-fixed-pipe-rewrite` is **V1's integration branch** — it
+`feature/ao-fixed-pipe-rewrite` is **V1's integration target** — it
 plays the role V2's `master` plays in V2's git policy. All phase
 branches merge here with `--no-ff`. Direct commits to this branch are
 reserved for short-lived `docs/...` / `fix/...` branch merges and the
@@ -26,12 +26,12 @@ what it does and which validation remains blocked.
 
 ### Active
 
-- `main` — pre-rewrite shipping baseline. **Untouched during Phase 1-6.**
+- `main` — pre-rewrite shipping reference. **Untouched during Phase 1-6.**
   Receives one `--no-ff` merge from `feature/ao-fixed-pipe-rewrite` at
   V1 ship event (Phase 7 exit).
-- `feature/ao-fixed-pipe-rewrite` — V1's integration branch. Phase
+- `feature/ao-fixed-pipe-rewrite` — V1's integration target. Phase
   branches merge here. Holds the seven-round planning baseline (commits
-  through `aaf585a`) plus the ADR-014 policy switch commit (this commit).
+  through `aaf585a`) plus the ADR-014 policy switch commit.
 
 ### Phase branches
 
@@ -76,7 +76,7 @@ These branch off `feature/ao-fixed-pipe-rewrite`, merge back with
 
 - Direct commits to `main` of any kind during Phase 1-6.
 - Direct commits to `feature/ao-fixed-pipe-rewrite` for phase
-  implementation work. Phase work goes on `phase/N-name`.
+  implementation work. Phase work goes on `phase/<N>-name`.
 - Squash merges (loses per-step bisect granularity).
 - Fast-forward merges of phase branches (loses the `Verified:` block
   attached to the merge commit).
@@ -145,7 +145,7 @@ The `.gitignore` enforces most of these.
 ## 4. Workflow per step
 
 ```text
-1. Implement the step on phase/N-name.
+1. Implement the step on phase/<N>-name.
 2. Self-check: build, IOCTL probe, acceptance criteria from step file.
 3. Request Codex review.
 4. Cross-verify each finding against WDK headers, design docs, RE evidence.
@@ -169,7 +169,7 @@ At phase exit, after the phase exit gate is met and the phase has a
 
 ```powershell
 git checkout feature/ao-fixed-pipe-rewrite
-git merge --no-ff phase/N-name
+git merge --no-ff phase/<N>-name
 ```
 
 `--no-ff` is mandatory. Squash is forbidden.
@@ -211,7 +211,7 @@ that is Phase 5").
 After the merge commit lands, the phase branch may be deleted locally:
 
 ```powershell
-git branch -d phase/N-name
+git branch -d phase/<N>-name
 ```
 
 The merge commit and per-step commits remain on
@@ -295,7 +295,7 @@ audit traceable.
 phase entry:
   git checkout feature/ao-fixed-pipe-rewrite
   git pull          # if remote is set up
-  git checkout -b phase/N-name
+  git checkout -b phase/<N>-name
 
 phase work (per step):
   <implement, review, fix, re-review>
@@ -307,8 +307,8 @@ phase exit:
   <ensure exit.md acceptance checked>
   git commit -m "phaseN: close <CLASSIFICATION>"     # closeout commit
   git checkout feature/ao-fixed-pipe-rewrite
-  git merge --no-ff phase/N-name                     # with Verified block
-  git branch -d phase/N-name                         # optional cleanup
+  git merge --no-ff phase/<N>-name                     # with Verified block
+  git branch -d phase/<N>-name                         # optional cleanup
 
 V1 ship (Phase 7 exit only, user-approved):
   git checkout main

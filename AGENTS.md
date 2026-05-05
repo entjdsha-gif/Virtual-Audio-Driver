@@ -267,7 +267,7 @@ reference) stays untouched until V1 ship event.
 ### Workflow per step
 
 ```text
-1. Implement on phase/N-name.
+1. Implement on phase/<N>-name.
 2. Self-check (build, IOCTL, acceptance).
 3. Request Codex review.
 4. Cross-verify findings against WDK headers, design docs, RE evidence.
@@ -287,7 +287,7 @@ At phase exit:
 
 ```powershell
 git checkout feature/ao-fixed-pipe-rewrite
-git merge --no-ff phase/N-name
+git merge --no-ff phase/<N>-name
 ```
 
 Merge commit body **must** include:
@@ -306,8 +306,21 @@ practice). Phase merge commit IS the rollback target for that phase
 
 ### V1 ship merge
 
-Only at Phase 7 exit, user-approved. Same Verified / Known blockers /
-Non-claims structure scoped to M6 ship gate.
+Only at Phase 7 exit, after the M6 shipping checklist
+(`phases/7-quality-polish/step5.md`) is fully checked and the user
+explicitly approves:
+
+```powershell
+git checkout main
+git merge --no-ff feature/ao-fixed-pipe-rewrite
+```
+
+Merge commit body **must** include the same five blocks as the phase
+merge contract above (`Phase / V1 classification`, `Verified:`,
+`Known blockers:`, `Non-claims:`, `Co-Authored-By:`), scoped to the
+V1 ship gate. The exact template is in
+`phases/7-quality-polish/exit.md` § "Phase 7 → main merge"; do not
+improvise. `--no-ff` mandatory; squash and fast-forward forbidden.
 
 ### Forbidden
 

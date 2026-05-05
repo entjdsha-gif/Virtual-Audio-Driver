@@ -862,7 +862,7 @@ Phase branch → integration target:
 
 ```powershell
 git checkout feature/ao-fixed-pipe-rewrite
-git merge --no-ff phase/N-name
+git merge --no-ff phase/<N>-name
 ```
 
 `--no-ff` is mandatory. Squash is forbidden — phase history must remain
@@ -896,7 +896,7 @@ later can re-run them. `Non-claims:` is the safety rail against
 #### Workflow per step (within a phase branch)
 
 ```text
-1. Implement the step on phase/N-name.
+1. Implement the step on phase/<N>-name.
 2. Self-check: build, IOCTL probe, acceptance criteria from step file.
 3. Request Codex review.
 4. Cross-verify findings against WDK headers, design docs, RE evidence.
@@ -962,7 +962,7 @@ Non-claims structure, scoped to the V1 ship gate (M6 checklist from
 ### Forbidden as a result
 
 - Direct commits to `feature/ao-fixed-pipe-rewrite` for phase
-  implementation work. Phase work goes on `phase/N-name`.
+  implementation work. Phase work goes on `phase/<N>-name`.
 - Direct commits to `main` of any kind. `main` only changes via the
   V1 ship merge.
 - Squash merging a phase branch (loses per-step bisect granularity).
