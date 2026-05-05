@@ -108,22 +108,24 @@ AO Cable V1 direction is fixed:
 
 ## Forbidden Compromises
 
-Never compromise by:
+The canonical V1 forbidden-compromises list lives in
+**`docs/REVIEW_POLICY.md` § 2**. Codex reviews must reject any change
+that violates any item in that list. If new forbidden items are
+identified, add them to REVIEW_POLICY § 2 (single source of truth) and
+do not duplicate them across multiple files.
 
-- Re-introducing packed 24-bit cable ring storage.
-- Re-introducing the 4-stage cable conversion pipeline.
-- Re-introducing 8-tap sinc SRC for cable streams.
-- Re-introducing `MicSink` dual-write.
-- Re-enabling FormatMatch enforcement.
-- Adding a second cable transport owner outside the canonical helper.
-- Adding hidden mixing, volume, mute, APO, DSP, AGC, EQ, limiter, noise
-  suppression, or echo cancellation.
-- Changing the goal to "close enough".
-- Hiding underrun, overflow, zero-fill, drop, or DMA-overrun-guard hits as
-  success.
-- Pumping or advancing audio from query callbacks without going through the
-  canonical helper.
-- Changing architecture only to make a build error disappear.
+Quick recap of the highest-impact items (REVIEW_POLICY § 2 is binding):
+
+- No packed 24-bit cable ring; no 4-stage cable pipeline; no sinc SRC
+  for cable; no `MicSink` dual-write; no FormatMatch enforcement.
+- No second cable transport owner outside `AoCableAdvanceByQpc`.
+- No silent ring overflow (hard-reject + counter only).
+- No hidden mixing / volume / mute / APO / DSP / AGC / EQ / limiter /
+  NS / echo cancellation in the cable path.
+- No `ms` in cable transport runtime state.
+- No stale ring data into a fresh capture session after STOP/RUN.
+- No "change goal to close enough" or "change architecture to make a
+  build error disappear."
 
 ## Blocker Protocol
 

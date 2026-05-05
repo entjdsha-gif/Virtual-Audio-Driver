@@ -30,17 +30,10 @@ Phase 0 exits when all of the following are true. All passed.
 
 ## Forbidden Work In Phase 1
 
-(Lifted from `CLAUDE.md` / `AGENTS.md` "Forbidden Compromises". Listed
-here so the Phase 1 implementer does not need to re-read every doc.)
-
-- No re-introduction of packed 24-bit ring storage.
-- No re-introduction of the 4-stage cable conversion pipeline.
-- No re-introduction of 8-tap sinc SRC for cable streams.
-- No re-introduction of `MicSink` dual-write.
-- No FormatMatch enforcement.
-- No second cable transport owner outside the canonical helper.
-- No silent ring overflow (must hard-reject + counter).
-- No `ms` in cable transport runtime state.
+The full canonical forbidden-compromises list lives in
+`docs/REVIEW_POLICY.md` § 2. Phase 1 implementers and reviewers must
+read that section before starting; this exit document does not
+duplicate it.
 
 ## Next
 

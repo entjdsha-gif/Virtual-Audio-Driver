@@ -346,8 +346,11 @@ Plus, mandatory invariants inside the helper:
 9. DMA overrun guard (skip if `advance > sampleRate / 2`)
 
 **No second path is allowed to "publish state for another cadence to move
-later."** The shared timer DPC, query path, and packet surface all call
-this same function and that is the only cable transport entry point.
+later."** In V1 the shared timer DPC and query path are the wired call
+sources; both funnel into this function. The `AO_ADVANCE_PACKET` enum
+value is reserved for a future event-driven WaveRT packet caller and has
+no wiring in V1 phases 0-6 (deferred to Phase 7). Whatever caller is added
+later must funnel into the same function — no new transport owner.
 
 ### Rationale
 
@@ -381,9 +384,11 @@ QPC.
 
 VB-Cable, on `GetPosition`, recalculates position to the **current QPC**
 inside the position spinlock before returning. VB also rebases the
-notional sample clock every 100 ticks against QPC (the 63/64 phase
-correction). And VB applies an 8-frame minimum gate to prevent
-sub-sample-jitter from causing irregular tiny transfers.
+notional sample clock periodically against fresh QPC (the long-window
+rebase, ~128 seconds at 48 kHz, see Decision 2 below) and applies a
+63/64 phase correction to the per-tick deadline. And VB applies an
+8-frame minimum gate to prevent sub-sample-jitter from causing
+irregular tiny transfers.
 
 ### Decision
 
@@ -394,11 +399,26 @@ V1 implements all three:
    AO_ADVANCE_QUERY, 0)` inside the position spinlock before reading
    `MonoFramesLow` / `MonoFramesMirror`. Returned values reflect "now".
 
-2. **63/64 phase correction + 100-tick rebase** — inside
-   `AoCableAdvanceByQpc`, the timer cadence is phase-corrected
-   (`base + (count * interval) * 63/64`) and the notional baseline is
-   rebased against fresh QPC every 100 ticks (or whenever
-   `elapsedFrames >= sampleRate << 7`).
+2. **63/64 phase correction + long-window QPC rebase** — inside
+   `AoCableAdvanceByQpc`, two distinct mechanisms work together:
+   - Per-tick phase correction: the timer cadence is phase-corrected
+     against QPC drift (`base + (count * interval) * 63/64`), so
+     small per-tick scheduling jitter does not accumulate. This is
+     applied every helper invocation.
+   - Long-window QPC rebase: when the elapsed frames exceed
+     `sampleRate << 7` (i.e. 128 seconds of stream time at any rate),
+     the helper resets `AnchorQpc100ns` to the current QPC and zeros
+     `PublishedFramesSinceAnchor`. This bounds the integer growth of
+     the elapsed-frames computation and re-syncs the notional clock
+     against wall time. (At 48 kHz this fires once every ~128 s; at
+     192 kHz also every ~128 s of stream time.)
+
+   The two mechanisms are independent: the 63/64 correction is per-
+   tick fine adjustment; the long-window rebase is a coarse periodic
+   re-sync. Earlier drafts mistakenly described the rebase as "every
+   100 ticks" — that came from a 1-ms-tick × 100 = 100 ms reading
+   that did not match the `<< 7` constant. The actual trigger is
+   `elapsedFrames >= sampleRate << 7`.
 
 3. **8-frame minimum gate** — `if (advance < 8): return` skips
    sub-sample-precision noise. At 48 kHz, 8 frames = 167 µs.
@@ -641,3 +661,64 @@ Full rules in `docs/GIT_POLICY.md`.
   V1 to V2 must not flag the absence of phase branches as a violation.
 - if V1 ever scales to multi-developer, this ADR will be reconsidered;
   for now, single-branch is correct.
+
+---
+
+## ADR-013: Shared Transport Engine Timer Period — 1 ms
+
+Status: accepted
+
+### Context
+
+VB-Cable's transport timer fires every 1 ms (`ExSetTimer` with period
+`10000` × 100 ns = 1 ms — verified in
+`results/vbcable_pipeline_analysis.md` § 2.1 and the Ghidra decompile
+`FUN_1400065b8`).
+
+The current AO Cable V1 source (inherited from Phase 6 Y2-2 work) uses
+a 20 ms tick (`AO_TE_REFERENCE_RATE = 48000` /
+`AO_TE_EVENT_FRAMES_AT_REF = 960` in
+`Source/Utilities/transport_engine.cpp`). 20 ms was chosen during the
+failed Step 3/4 timer-owned transport experiment as a "safer" cadence;
+it does not match VB and does not match V1's design intent (see
+ADR-002 — VB is the cable transport reference).
+
+### Decision
+
+The shared transport engine timer period is **1 ms** (10 000 × 100 ns).
+
+This applies to:
+
+- `AO_TRANSPORT_ENGINE::PeriodQpc` — initialized to 1 ms in QPC ticks
+  at engine init.
+- `ExSetTimer(...)` invocation in `AoTransportEngineInit` — period
+  argument is `10000` (100 ns units).
+- The timer DPC body — must complete each tick well within 1 ms to
+  avoid back-to-back queueing.
+
+### Rationale
+
+- VB parity (ADR-002): VB's 1 ms cadence is verified and works on
+  millions of installs.
+- 1 ms granularity supports the 8-frame minimum gate (ADR-007) at
+  every supported sample rate.
+- Position-on-query (ADR-007) reduces the tick-rate dependency for
+  perceived latency, so the dominant constraint becomes "tick fast
+  enough to keep ring fill steady" — 1 ms easily satisfies this.
+
+### Consequences
+
+- Phase 3 Step 3 (`phases/3-canonical-helper-shadow/step3.md`)
+  acceptance criterion ("`DbgShadowTimerHits` increases at 1 ms
+  cadence") is now consistent with the engine period.
+- The current 20 ms code is changed to 1 ms during Phase 3
+  Step 3 (or earlier as part of engine timer setup).
+- DPC execution under 1 ms cadence requires the helper body to be
+  tight — this is already a constraint per ADR-006 / ARCHITECTURE
+  § 8 (no allocations, no waits at DISPATCH_LEVEL).
+
+### Forbidden as a result
+
+- Reverting to 20 ms timer to "smooth jitter" without an ADR
+  superseding this one.
+- A second timer at a different period.

@@ -91,30 +91,22 @@ When uncertain:
 
 ## Forbidden Compromises
 
-Never:
+The canonical V1 forbidden-compromises list lives in
+**`docs/REVIEW_POLICY.md` § 2**. Read it. Treat it as binding.
 
-- Re-introduce the old packed 24-bit cable ring storage.
-- Re-introduce the 4-stage `ConvertToInternal -> SrcConvert ->
-  ConvertFromInternal -> LoopbackWrite` cable pipeline.
-- Re-introduce 8-tap sinc SRC with 2048-coefficient table for cable
-  streams.
-- Re-introduce `MicSink` dual-write.
-- Re-enable FormatMatch enforcement requiring Speaker == Mic == Internal.
-- Add a second cable transport owner outside `AoCableAdvanceByQpc`.
-- Let `GetPosition`/`GetPositions` advance audio without going through the
-  canonical helper.
-- Let the shared timer advance audio independently of the canonical helper.
-- Silently overwrite the ring on overflow (must hard-reject + counter).
-- Add hidden mixing, volume, mute, APO, DSP, AGC, EQ, limiter, or noise
-  suppression.
-- Hide underrun, overflow, zero-fill, drop, or DMA-overrun-guard hits as
-  success.
-- Pump audio from query callbacks without going through the canonical
-  helper.
-- Store `ms` as runtime state in cable transport math (frames are
-  authoritative).
-- Return stale ring data into a fresh capture session after STOP/RUN.
-- Change architecture only to fix a build error.
+Quick recap (REVIEW_POLICY § 2 is the source of truth if any item drifts):
+
+- No packed 24-bit cable ring; no 4-stage cable pipeline; no sinc SRC for
+  cable; no `MicSink` dual-write; no FormatMatch enforcement.
+- No second cable transport owner outside `AoCableAdvanceByQpc`.
+  Query path, shared timer, and any future packet caller all funnel
+  into the canonical helper.
+- No silent ring overflow (hard-reject + counter only).
+- No hidden mixing, volume, mute, APO, DSP, AGC, EQ, limiter, NS,
+  echo cancellation in the cable path.
+- No `ms` in cable transport runtime state. Frames are authoritative.
+- No stale ring data into a fresh capture session after STOP/RUN.
+- No "change architecture to make a build error disappear."
 
 ## Edit Protocol
 

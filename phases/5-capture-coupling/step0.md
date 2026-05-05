@@ -42,13 +42,10 @@ if (rt->IsCapture) {
     rt->MonoFramesLow    += advance;
     rt->MonoFramesMirror += advance;
 
-    /* Packet notification (only if armed). */
-    if (rt->NotifyArmed && !rt->NotifyFired &&
-        ((rt->DmaCursorFrames * rt->BlockAlign) % rt->DmaBufferSize
-            == rt->NotifyBoundaryBytes)) {
-        rt->NotifyFired = 1;
-        AoInvokePortclsNotify(rt->PortNotifyCtx, 8);
-    }
+    /* V1 scope: shared-mode capture (Phone Link) never arms packet
+     * notification. NotifyArmed stays 0; do not implement the
+     * dispatch in Phase 5. Notification arming + dispatch is deferred
+     * to Phase 7 if a future event-driven client demands it. */
 }
 ```
 

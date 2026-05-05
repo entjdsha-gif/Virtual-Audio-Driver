@@ -80,6 +80,14 @@ typedef struct _FRAME_PIPE {
     // Lifetime
     KSPIN_LOCK  Lock;                  // protects all fields below
 
+    // Internal pipe format — fixed at FramePipeInitCable time, never
+    // changes for the life of the pipe. Both write SRC and read SRC
+    // use this rate as their reference; client-side rates are converted
+    // against it.
+    ULONG       InternalRate;          // ring sample rate, Hz (registry-driven)
+    USHORT      InternalBitsPerSample; // ring sample width — always 32 (INT32)
+    LONG        InternalBlockAlign;    // = (InternalBitsPerSample/8) * Channels
+
     // Latency / capacity (frames)
     LONG        TargetLatencyFrames;   // registry-driven (typ. 7168 @ 48k)
     LONG        WrapBound;             // current ring depth, frames
@@ -100,6 +108,10 @@ typedef struct _FRAME_PIPE {
     SIZE_T      DataAllocBytes;
 } FRAME_PIPE, *PFRAME_PIPE;
 ```
+
+`InternalRate` is the single field used everywhere as the pipe's "internal
+sample rate." Phase 1 Step 0 sets `InternalRate` and `InternalBitsPerSample`
+at `FramePipeInitCable` time; subsequent code reads them as constants.
 
 ### 2.2 Public API (target)
 
@@ -342,7 +354,7 @@ typedef struct _AO_TRANSPORT_ENGINE {
     BOOLEAN       Initialized;
     BOOLEAN       Running;
 
-    LONGLONG      PeriodQpc;          // 1 ms in QPC ticks (computed at init)
+    LONGLONG      PeriodQpc;          // 1 ms in QPC ticks per ADR-013
     LONGLONG      NextTickQpc;
     LONGLONG      LastTickQpc;        // for drift correction
 

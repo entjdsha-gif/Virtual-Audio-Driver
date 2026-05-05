@@ -19,20 +19,69 @@ Edit only:
 
 ## Test Matrix
 
-```text
-      Output rate
-      8000  16000 22050 44100 48000 96000 192000
-8000   X     X     -     X     X     X     X
-16000  X     X     -     X     X     X     X
-22050  -     -     X     X     -     X     -
-44100  X     X     X     X     X     X     X
-48000  X     X     -     X     X     X     X
-96000  X     X     -     X     X     X     X
-192000 X     X     -     X     -     X     X
-```
+The matrix covers every rate listed in `docs/ADR.md` ADR-008 (10 rates):
+8000, 16000, 22050, 32000, 44100, 48000, 88200, 96000, 176400, 192000.
 
-`X` = supported via GCD divisor 300, 100, or 75. `-` = unsupported pair
-(should return `STATUS_NOT_SUPPORTED` cleanly without garbled output).
+### Group classification (per GCD divisor coverage)
+
+Each rate belongs to one or more divisor groups (300, 100, 75):
+
+| Rate | ÷ 300 | ÷ 100 | ÷ 75 |
+|---|---|---|---|
+| 8000  |   |  ✓ |   |
+| 16000 |   |  ✓ |   |
+| 22050 |   |    | ✓ |
+| 32000 |   |  ✓ |   |
+| 44100 | ✓ |  ✓ | ✓ |
+| 48000 | ✓ |  ✓ | ✓ |
+| 88200 | ✓ |  ✓ | ✓ |
+| 96000 | ✓ |  ✓ | ✓ |
+| 176400| ✓ |  ✓ | ✓ |
+| 192000| ✓ |  ✓ | ✓ |
+
+A pair `(src, dst)` is **supported** when both rates share **at least
+one divisor**. The picker tries 300, then 100, then 75 (per `pickGCD`
+in `loopback.cpp`).
+
+### Resulting support matrix
+
+| src \ dst | 8k | 16k | 22.05k | 32k | 44.1k | 48k | 88.2k | 96k | 176.4k | 192k |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 8k     | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| 16k    | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| 22.05k | ✗ | ✗ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| 32k    | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| 44.1k  | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| 48k    | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| 88.2k  | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| 96k    | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| 176.4k | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| 192k   | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+
+Wait — `192k ↔ 22.05k`: 192000 ÷ 75 = 2560 ✓ ; 22050 ÷ 75 = 294 ✓.
+That pair **is** supported. The `192k ↔ 22.05k` cell should read ✓.
+The same logic applies to 8k/16k/32k (Group {÷100 only}) ↔ 22.05k
+(Group {÷75 only}) — those four pairs are the **only** `✗` cells in
+the matrix (and their mirrors).
+
+### Unsupported pairs (definitive list)
+
+- `22.05k ↔ 8k`
+- `22.05k ↔ 16k`
+- `22.05k ↔ 32k`
+
+(plus their mirrored direction). These return `STATUS_NOT_SUPPORTED`
+cleanly without garbled output.
+
+### Implementer's verification rule
+
+For each pair the test should:
+- supported → assert `STATUS_SUCCESS` + bit-stable round trip on a sine.
+- unsupported → assert `STATUS_NOT_SUPPORTED` returned at first call,
+  output buffer untouched.
+
+If the matrix above disagrees with `pickGCD` output, the matrix is
+authoritative — fix `pickGCD`.
 
 For each `X` cell, the test:
 

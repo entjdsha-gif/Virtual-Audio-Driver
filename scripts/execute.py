@@ -112,7 +112,7 @@ def build_prompt(phase: str, step_num: int | None) -> str:
     ]
 
     parts: list[str] = []
-    parts.append("# AO Cable V2 Harness Prompt")
+    parts.append("# AO Cable V1 Harness Prompt")
     parts.append("")
     parts.append("Follow CLAUDE.md first, then AGENTS.md. If anything is unknown, say it is unknown and stop rather than guessing.")
     parts.append("Do not edit files before telling the user exactly what will change.")
@@ -167,7 +167,7 @@ def mark_step(phase: str, step_num: int, status: str, message: str) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="AO Cable V2 harness step helper")
+    parser = argparse.ArgumentParser(description="AO Cable V1 harness step helper")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_status = sub.add_parser("status", help="Show phase status")

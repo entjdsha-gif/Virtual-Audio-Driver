@@ -52,8 +52,9 @@ each tick (per ADR-011 unit policy: in frames, not ms).
 
 - Three-file atomic edit per `docs/REVIEW_POLICY.md` § 7.
 - Tolerance is 8 frames; values outside tolerance count as
-  divergence. The 100-tick rebase will reset the comparison; that's
-  expected.
+  divergence. The long-window QPC rebase (~128 s of stream time at any
+  rate, per ADR-007) will reset the comparison anchor; that is expected
+  and not a divergence event.
 - Do not act on divergence counter in the helper (do not skip the
   helper if it diverges). It is observability only.
 

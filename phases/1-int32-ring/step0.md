@@ -25,11 +25,29 @@ Edit only:
   `FramePipeFree`, `FramePipeResetCable` to allocate / free / zero the
   new struct shape. Existing ring read/write entry points remain wired
   to the old code path for now (Step 1 swaps them).
+- `Source/Main/adapter.cpp` — `IOCTL_AO_GET_STREAM_STATUS` handler:
+  any read of an `AO_V2_DIAG` field that came from a removed
+  `FRAME_PIPE` member (e.g. `RenderPumpDriveCount`,
+  `RenderLegacyDriveCount`, pump-shadow counters) must be replaced
+  with a literal `0` until Phase 6 cleanup retires those `AO_V2_DIAG`
+  fields entirely. This keeps the IOCTL ABI stable for V1/V2 callers
+  during the rewrite. **Do not** delete the `AO_V2_DIAG` fields here;
+  that is Phase 6 Step 0.
+- `test_stream_monitor.py` — if any displayed counter now reads as
+  literal `0` permanently, mark it `[deprecated, see Phase 6]` so
+  operators do not chase ghost values.
+
+Per `docs/REVIEW_POLICY.md` § 7, the three files
+(`Source/Main/ioctl.h`, `Source/Main/adapter.cpp`,
+`test_stream_monitor.py`) are updated together as one atomic change
+when the schema or its sources move. In this step, `ioctl.h` does
+not change (the field set stays — just sourced as `0`); the other two
+do change.
 
 Do not touch in this step:
 
 - `Source/Main/minwavertstream.cpp`
-- `Source/Main/adapter.cpp`
+- `Source/Main/ioctl.h` (no schema change)
 - `Source/Utilities/transport_engine.cpp`
 
 ## Required Edits
@@ -40,6 +58,10 @@ Do not touch in this step:
    ```c
    typedef struct _FRAME_PIPE {
        KSPIN_LOCK  Lock;
+
+       ULONG       InternalRate;
+       USHORT      InternalBitsPerSample;  // always 32 (INT32 ring)
+       LONG        InternalBlockAlign;
 
        LONG        TargetLatencyFrames;
        LONG        WrapBound;
@@ -64,9 +86,11 @@ Do not touch in this step:
    return `STATUS_NOT_IMPLEMENTED`.
 
 3. In `Source/Utilities/loopback.cpp`:
-   - `FramePipeInitCable(pipe, initialFrames, channels)` allocates
-     `Data` as `initialFrames * channels * sizeof(LONG)` from non-paged
-     pool, sets `TargetLatencyFrames = WrapBound = initialFrames`,
+   - `FramePipeInitCable(pipe, internalRate, channels, initialFrames)`
+     allocates `Data` as `initialFrames * channels * sizeof(LONG)`
+     from non-paged pool, sets `InternalRate = internalRate`,
+     `InternalBitsPerSample = 32`, `InternalBlockAlign = 4 * channels`,
+     `TargetLatencyFrames = WrapBound = initialFrames`,
      `FrameCapacityMax = max(initialFrames, registry-driven max)`,
      zeros `WritePos/ReadPos/OverflowCounter/UnderrunCounter/
      UnderrunFlag`, initializes the spinlock.

@@ -9,7 +9,7 @@
 ## Goal
 
 Implement the `AoCableAdvanceByQpc` body fully — drift correction,
-QPC → frames math, 8-frame gate, 100-tick rebase, DMA overrun guard,
+QPC → frames math, 8-frame gate, long-window QPC rebase (~128 s), DMA overrun guard,
 scratch linearization, ring write/read, position update — but keep
 **audible** cable transport on the legacy path. The helper writes
 **shadow** state (its own bookkeeping fields) and bumps debug counters
@@ -59,7 +59,7 @@ AoCableAdvanceByQpc(PAO_STREAM_RT rt,
         return;
     }
 
-    /* 100-tick rebase */
+    /* long-window rebase (~128 s of stream time at any rate) */
     if (elapsed >= ((ULONGLONG)rt->SampleRate << 7)) {
         rt->PublishedFramesSinceAnchor = 0;
         rt->AnchorQpc100ns = nowQpc100ns;

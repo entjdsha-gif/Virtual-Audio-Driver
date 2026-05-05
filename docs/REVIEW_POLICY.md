@@ -33,7 +33,11 @@ Do not mark a step complete only because the code compiles.
 Do not mark a phase complete until the phase exit behavior is observable or a
 documented blocker explicitly prevents runtime validation.
 
-## 2. Forbidden Drift
+## 2. Forbidden Drift (canonical list)
+
+This list is the single source of truth for V1 forbidden-compromises.
+`CLAUDE.md`, `AGENTS.md`, `.claude/commands/review.md`, and per-phase
+`exit.md` files reference this section instead of restating the list.
 
 Reject any change that:
 
@@ -47,15 +51,21 @@ Reject any change that:
 - Lets `GetPosition`/`GetPositions` advance audio without going through the
   canonical helper.
 - Lets the shared timer advance audio independently of the canonical helper.
+- Pumps audio from query callbacks without going through the canonical
+  helper.
 - Silently overwrites the ring on overflow (must be hard-reject + counter).
-- Hides underrun, overflow, or DMA overrun-guard hits as success.
+- Hides underrun, overflow, drop, zero-fill, or DMA overrun-guard hits as
+  success.
+- Adds hidden mixing, volume, mute, APO, DSP, AGC, EQ, limiter, noise
+  suppression, or echo cancellation to the cable path.
 - Stores `ms` as a runtime-state field in cable transport math (frames are
   authoritative; `ms` only in comments / UI / logs).
-- Returns stale ring data to a new capture session after Stop/Start.
+- Returns stale ring data into a fresh capture session after Stop/Start.
 - Treats Phone Link end-to-end audio quality as proof of driver-internal
   bit-perfect behavior.
 - Copies fresh code from `feature/ao-pipeline-v2` (frozen reference) without
   cherry-pick discipline.
+- Changes architecture only to make a build error disappear.
 
 ## 3. API Sequence Validation
 

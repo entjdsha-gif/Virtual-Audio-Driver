@@ -138,7 +138,7 @@ AoCableAdvanceByQpc(rt, nowQpcRaw, reason, flags) {
 
     if (advance < 8) { unlock; return; }                      // 8-frame gate
 
-    if (elapsed >= ((uint64_t)rt->SampleRate << 7)) {         // 100-tick rebase
+    if (elapsed >= ((uint64_t)rt->SampleRate << 7)) {         // ~128 s long-window rebase
         rt->PublishedFramesSinceAnchor = 0;
         rt->AnchorQpc100ns             = nowQpc100ns;
     }
@@ -164,11 +164,13 @@ AoCableAdvanceByQpc(rt, nowQpcRaw, reason, flags) {
         copy_scratch_to_dma_with_wrap(rt, bytes);
         advance_capture_cursors(rt, advance, bytes);
 
-        if (rt->NotifyArmed && !rt->NotifyFired &&
-            ((rt->DmaCursor % rt->RingSizeFrames) == rt->NotifyBoundaryBytes)) {
-            rt->NotifyFired = 1;
-            AoInvokePortclsNotify(rt->PortNotifyCtx, 8);
-        }
+        // V1 scope: shared-mode capture clients (Phone Link path) never
+        // arm packet notification, so NotifyArmed stays 0 and the
+        // dispatch below is unreachable. Event-driven packet
+        // notification dispatch (the bridge that calls back into PortCls
+        // when the cursor crosses NotifyBoundaryBytes) is deferred to
+        // Phase 7. Until then NotifyArmed/NotifyFired/NotifyBoundaryBytes
+        // are reserved fields populated by future code.
     }
 
     rt->MonoFramesLow              += advance;
@@ -187,7 +189,7 @@ AoCableAdvanceByQpc(rt, nowQpcRaw, reason, flags) {
 | `AO_ADVANCE_QUERY` | `GetPosition` / `GetPositions` (cable streams only) |
 | `AO_ADVANCE_TIMER_RENDER` | shared timer DPC, render-side cable stream entry |
 | `AO_ADVANCE_TIMER_CAPTURE` | shared timer DPC, capture-side cable stream entry |
-| `AO_ADVANCE_PACKET` | event-driven WaveRT packet surface (only when armed) |
+| `AO_ADVANCE_PACKET` | event-driven WaveRT packet surface (deferred to Phase 7; reserved enum value, no caller wired in V1 phases 0-6) |
 
 The internal logic is reason-agnostic for transport; reason exists for
 diagnostics counters and ordering rules.
@@ -227,7 +229,8 @@ One per cable (A, B). Storage and indexing per ADR-003:
 
 Single global instance. Owns:
 
-- shared timer (`ExAllocateTimer` + `ExSetTimer`, period 1 ms)
+- shared timer (`ExAllocateTimer` + `ExSetTimer`, period **1 ms** per
+  ADR-013)
 - active-stream registry (linked list under `EngineLock`)
 - timer DPC dispatcher that snapshots active list, takes per-stream refs,
   drops engine lock, calls `AoCableAdvanceByQpc` per stream under per-stream
@@ -240,20 +243,40 @@ into the canonical helper.
 
 | Lock | Protects | Acquired by |
 |---|---|---|
-| `EngineLock` | active-stream list, ref-count discipline, timer state | engine init / shutdown / DPC snapshot |
-| Per-stream `PositionLock` | `AO_STREAM_RT` cursor / counter / fade fields | canonical helper |
-| `FRAME_PIPE` lock | ring read / write positions | ring write/read SRC functions |
+| `EngineLock` | active-stream list, ref-count discipline, shared timer state | engine init / shutdown / DPC snapshot |
+| Stream `m_PositionSpinLock` | per-stream WaveRT-facing fields (`m_KsState`, position publication, etc.) | `CMiniportWaveRTStream` member functions (SetState, GetPosition, GetPositions, ...) |
+| Runtime `AO_STREAM_RT::PositionLock` | per-stream cable-runtime cursor / counter / fade fields | canonical helper `AoCableAdvanceByQpc` |
+| `FRAME_PIPE::Lock` | ring read / write positions, ring data, counters | ring write/read SRC functions |
 
 Acquisition order (top → bottom; never invert):
 
 ```text
-EngineLock  →  PositionLock  →  FRAME_PIPE lock
+EngineLock
+  →  m_PositionSpinLock  (stream, WaveRT-facing)
+       →  AO_STREAM_RT::PositionLock  (cable runtime)
+            →  FRAME_PIPE::Lock  (ring)
 ```
 
-The canonical helper takes per-stream `PositionLock` for the duration of
-one advance. Inside, it calls into the ring SRC which briefly takes
-`FRAME_PIPE` lock. Engine lock is released before the helper runs (per
-DPC dispatcher pattern).
+In practice:
+
+- The DPC dispatcher acquires `EngineLock` only to snapshot the active
+  list + bump ref-counts, then **releases it** before calling the helper.
+  The helper runs without `EngineLock`.
+- The query path (`GetPositions` cable branch) acquires
+  `m_PositionSpinLock` first, then calls the helper which acquires
+  `AO_STREAM_RT::PositionLock` nested. Both stream and runtime locks
+  are held briefly across the helper body.
+- Inside the helper, the ring SRC functions briefly take
+  `FRAME_PIPE::Lock` to advance `WritePos`/`ReadPos` and write/read
+  ring data. They release before returning to the helper.
+
+The two "Position" locks (stream-side `m_PositionSpinLock` vs runtime-
+side `AO_STREAM_RT::PositionLock`) are intentionally separate: the
+stream lock guards WaveRT-facing miniport state that PortCls may touch
+on its own threads; the runtime lock guards cable-transport-only state
+that only the canonical helper touches. Keeping them distinct lets the
+helper run from the timer DPC without contending with PortCls's own
+calls into `m_PositionSpinLock`.
 
 DPC vs destructor race is closed by ref-counting on `AO_STREAM_RT`:
 engine `RefCount++` on snapshot, `RefCount--` after helper returns;

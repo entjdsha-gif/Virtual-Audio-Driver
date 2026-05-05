@@ -6,8 +6,13 @@
 - [ ] Build clean.
 - [ ] Live call test: `DbgShadowQueryHits` and `DbgShadowTimerHits`
       both increase steadily during a live call. Helper is reached.
-- [ ] `<Cable>_<R/C>_ShadowDivergenceCount` is 0 (or near 0) in
-      steady-state speech for at least one full live call.
+- [ ] `<Cable>_<R/C>_ShadowDivergenceCount` is **≤ 5 increments per
+      minute** during steady-state speech for at least one full live
+      call. Any single increment indicates a per-tick advance delta
+      that exceeded the 8-frame gate tolerance defined in
+      `phases/3-canonical-helper-shadow/step4.md`. ≤ 5/minute is
+      consistent with normal scheduler jitter; > 5/minute indicates a
+      cursor / drift bug that must be fixed before Phase 4.
 - [ ] No audible regression vs Phase 2 exit baseline. Helper is in
       shadow mode and must not touch audible behavior.
 - [ ] No BSOD / hang / deadlock under stream open/close stress.

@@ -14,21 +14,10 @@ Review the most recent step or change against AO Cable V1 rules.
 
 ## Forbidden Drift Checklist
 
-Reject any change that:
-
-- Re-introduces packed 24-bit ring storage.
-- Re-introduces the 4-stage `ConvertToInternal -> SrcConvert -> ConvertFromInternal -> LoopbackWrite` pipeline.
-- Re-introduces sinc SRC with the 2048-coefficient table for cable streams.
-- Re-introduces `MicSink` dual-write (ring + DMA push at the same time).
-- Re-introduces FormatMatch enforcement that requires Speaker == Mic == Internal.
-- Adds a second cable transport owner outside `AoCableAdvanceByQpc`.
-- Allows query callbacks (`GetPosition`, `GetPositions`) to advance audio without going through the canonical helper.
-- Allows the shared timer to advance audio independently of the canonical helper.
-- Silently overwrites the ring on overflow (must be hard-reject + counter).
-- Hides underrun, overflow, or DMA overrun-guard hits as success.
-- Treats Phone Link end-to-end audio quality as proof of driver-internal correctness.
-- Returns stale ring data to a new capture session after Stop/Start.
-- Stores `ms` as runtime state in cable transport math (frames are authoritative).
+Use **`docs/REVIEW_POLICY.md` § 2** as the canonical V1 forbidden list.
+That section is the source of truth; do not duplicate items here. Run
+through every bullet in § 2 against the change under review and report
+any violation as a `BLOCKER`.
 
 ## Required Validation
 
