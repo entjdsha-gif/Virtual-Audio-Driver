@@ -555,10 +555,26 @@ the destructor. `AoTransportOnPauseEx` is **only** for PAUSE — never
 called from STOP or the destructor (it would skip the state reset
 that those paths require).
 
-`AoTransportFreeStreamRt` is ref-count-aware: if the engine timer
-DPC or query path currently holds a transient ref, the actual free
-is deferred until the transient ref releases (DESIGN § 5.4 ref-count
-recap).
+`AoTransportFreeStreamRt` is ref-count-aware: it drops the caller's
+ref and actually frees only when `RefCount` hits 0. The two helper
+invocation paths use **different** teardown mechanisms (per DESIGN
+§ 5.4 "Helper invocation paths"):
+
+- **Engine timer DPC** is excluded by `AoTransportUnregister`
+  (drops engine ref) followed by `KeFlushQueuedDpcs` (drains any
+  in-flight DPC). The DPC takes its transient ref under
+  `EngineLock`, so `RefCount` reflects DPC activity.
+- **Query path** (`GetPosition` / `GetPositions`) is excluded by
+  publishing `m_pTransportRt = NULL` under `m_PositionSpinLock`.
+  Query path **does not** take a `RefCount` — it is serialized
+  against unwind through `m_PositionSpinLock` instead. Do not add a
+  query-path `RefCount++` "for safety": it would force every
+  `GetPosition` to do an interlocked op without changing the
+  observable race window.
+
+The full unwind ordering (Step A query exclusion → Step B DPC
+exclusion → Step C DMA teardown → Step D destructor's owner-ref
+release) is in DESIGN § 5.4 "Unwind contract".
 
 ### Rationale
 

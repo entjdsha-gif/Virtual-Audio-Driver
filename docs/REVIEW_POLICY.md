@@ -198,9 +198,22 @@ Lifecycle (per ADR-009):
   STOP handler runs KeFlushQueuedDpcs + AoTransportOnStopEx.
 - Destructor runs KeFlushQueuedDpcs + AoTransportOnStopEx +
   AoTransportFreeStreamRt (owner ref drops).
-- FreeAudioBuffer ordering: Unregister -> KeFlushQueuedDpcs ->
-  wait RefCount == 1 (owner-only) -> publish DmaBuffer = NULL ->
-  FreeAudioBuffer (DESIGN § 5.4).
+- FreeAudioBuffer ordering — Step A through Step D from DESIGN § 5.4
+  (no exceptions):
+  Step A. exclude query path:
+    acquire(m_PositionSpinLock) -> m_pTransportRt = NULL ->
+    release(m_PositionSpinLock).
+  Step B. exclude DPC path:
+    AoTransportUnregister(rt) -> KeFlushQueuedDpcs().
+    After Step B the contract requires RefCount == 1 (owner-only);
+    assert, do not wait.
+  Step C. tear down DMA-buffer state:
+    rt->DmaBuffer = NULL -> FreeAudioBuffer().
+  Step D. destructor only:
+    AoTransportFreeStreamRt(rt) (owner ref drops 1 -> 0, frees rt).
+- Query path is NOT in RefCount. m_pTransportRt publish under
+  m_PositionSpinLock is what excludes it; do NOT review for a
+  "RefCount++ in GetPosition" — that would be wrong.
 ```
 
 If runtime validation is blocked by signing, package verification, hardware,

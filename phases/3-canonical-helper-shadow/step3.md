@@ -49,9 +49,10 @@ VOID AoTransportTimerCallback(PEX_TIMER timer)
             ? AO_ADVANCE_TIMER_CAPTURE
             : AO_ADVANCE_TIMER_RENDER;
         AoCableAdvanceByQpc(rt, nowQpcRaw.QuadPart, reason, 0);
-        if (InterlockedDecrement(&rt->RefCount) == 0) {
-            AoTransportFreeStreamRtFinal(rt);
-        }
+        AoTransportFreeStreamRt(rt);   /* drops the transient DPC ref;
+                                        * frees if last ref (matches the
+                                        * single-deallocator contract in
+                                        * DESIGN § 4.2). */
     }
 }
 ```

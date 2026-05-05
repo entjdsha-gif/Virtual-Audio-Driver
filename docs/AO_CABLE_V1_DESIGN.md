@@ -377,16 +377,21 @@ snapshot.DmaBufferSize = m_ulDmaBufferSize;
 
 AoTransportOnRunEx(&snapshot);   // engine RefCount++ on this rt; add to active
 
-// PAUSE
+// PAUSE  (per ADR-009: drain DPCs before mutating runtime state)
+KeFlushQueuedDpcs();
 AoTransportOnPauseEx(rt);        // mark inactive; keep allocation
+                                 //   (RUN→PAUSE→RUN reuses ring; do NOT reset state)
 
-// STOP
+// STOP   (per ADR-009: drain DPCs before mutating runtime state)
+KeFlushQueuedDpcs();
 AoTransportOnStopEx(rt);         // mark inactive; AoCableResetRuntimeFields(rt)
+                                 //   (RUN→STOP→RUN starts fresh)
 
-// Destructor
+// Destructor — for the FreeAudioBuffer path that runs alongside, see § 5.4
+//   Step A (query exclusion) → Step B (DPC exclusion) → Step C (DMA teardown)
 KeFlushQueuedDpcs();
 AoTransportOnStopEx(rt);          // idempotent
-AoTransportFreeStreamRt(rt);      // RefCount-- ; free if last
+AoTransportFreeStreamRt(rt);      // RefCount-- ; frees rt if last (Step D)
 ```
 
 `AoCableResetRuntimeFields` zeros: `MonoFramesLow`, `MonoFramesMirror`,
@@ -431,6 +436,16 @@ NTSTATUS AoTransportEngineInit(VOID);
 VOID     AoTransportEngineCleanup(VOID);
 
 PAO_STREAM_RT AoTransportAllocStreamRt(PCMiniportWaveRTStream stream);
+
+/* Drops the caller's ref on `rt` (`InterlockedDecrement(&rt->RefCount)`).
+ * Frees `rt` only if that drop brings RefCount to 0. Called from:
+ *   - destructor (drops the owner ref; if engine ref already gone via
+ *     AoTransportUnregister, this is the final release and frees);
+ *   - timer DPC after the helper returns (drops the transient DPC ref;
+ *     normally the engine + owner refs are still held, so does not free —
+ *     but covers the destructor-races-DPC corner case).
+ * There is **only one** deallocator: do not introduce
+ * `AoTransportFreeStreamRtFinal` or any "Final" variant. */
 VOID          AoTransportFreeStreamRt(PAO_STREAM_RT rt);
 
 VOID AoTransportOnRunEx (const AO_STREAM_SNAPSHOT* snapshot);
@@ -469,10 +484,9 @@ VOID AoTransportTimerCallback(PEX_TIMER timer)
         reason = rt->IsCapture ? AO_ADVANCE_TIMER_CAPTURE
                                : AO_ADVANCE_TIMER_RENDER;
         AoCableAdvanceByQpc(rt, nowQpcRaw.QuadPart, reason, 0);
-        InterlockedDecrement(&rt->RefCount);
-        if (rt->RefCount == 0) {
-            AoTransportFreeStreamRtFinal(rt);
-        }
+        AoTransportFreeStreamRt(rt);   // drops the transient DPC ref;
+                                       //   frees if this was the last ref
+                                       //   (destructor-races-DPC corner case)
     }
 }
 ```
