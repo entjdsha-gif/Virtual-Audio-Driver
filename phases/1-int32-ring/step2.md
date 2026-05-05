@@ -80,9 +80,22 @@ AoRingReadToScratch(PFRAME_PIPE pipe, BYTE* scratch, ULONG frames,
 ## Acceptance Criteria
 
 - [ ] Build clean.
-- [ ] Round-trip test (Step 1 write → Step 2 read at same rate) is
-      bit-exact for 16-bit and 32-bit input. 8-bit and 24-bit may show
-      ≤1 LSB delta from the lossy 19-bit normalization (intentional).
+- [ ] Round-trip test (Step 1 write → Step 2 read at same rate)
+      against the per-bit-depth dispatch in DESIGN § 2.5:
+      - **8-bit and 16-bit input: bit-exact** (full range fits inside
+        the 19-bit ring representation, so the `<<n` / `>>n` pair is
+        a no-op round trip).
+      - **24-bit input: top 19 bits preserved, bottom 5 bits zeroed.**
+        `(int << 8) >> 13` on write loses bits 0-4; `int << 5` on read
+        cannot restore them. This is the intentional lossy
+        normalization (ADR-003 / DESIGN § 2.5); test asserts the top
+        19 bits match.
+      - **32-bit PCM input: top 19 bits preserved, bottom 13 bits
+        zeroed.** `int >> 13` on write loses bits 0-12; `int << 13`
+        on read cannot restore them. Same intentional lossy
+        normalization; test asserts the top 19 bits match. **Do not**
+        assert bit-exact 32-bit round trip — that contradicts the
+        19-bit ring invariant.
 - [ ] Forced underrun (read more frames than available) returns
       `STATUS_SUCCESS`, scratch is silence-filled, `UnderrunCounter`
       incremented, `UnderrunFlag = 1`.

@@ -190,10 +190,17 @@ Position / cadence:
 - Shared timer is one of multiple call sources; not the only owner.
 - QPC timestamps are monotonic.
 
-Lifecycle:
+Lifecycle (per ADR-009):
 - RUN -> PAUSE -> RUN keeps the ring usable.
-- RUN -> STOP -> RUN resets monotonic counters and ring.
-- Destructor runs KeFlushQueuedDpcs before AoTransportFreeStreamRt.
+  PAUSE handler runs KeFlushQueuedDpcs + AoTransportOnPauseEx.
+  PAUSE must NOT call AoTransportOnStopEx (would reset state).
+- RUN -> STOP -> RUN resets monotonic counters, cursor, fade, and ring.
+  STOP handler runs KeFlushQueuedDpcs + AoTransportOnStopEx.
+- Destructor runs KeFlushQueuedDpcs + AoTransportOnStopEx +
+  AoTransportFreeStreamRt (owner ref drops).
+- FreeAudioBuffer ordering: Unregister -> KeFlushQueuedDpcs ->
+  wait RefCount == 1 (owner-only) -> publish DmaBuffer = NULL ->
+  FreeAudioBuffer (DESIGN § 5.4).
 ```
 
 If runtime validation is blocked by signing, package verification, hardware,

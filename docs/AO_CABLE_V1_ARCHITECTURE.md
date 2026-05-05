@@ -293,9 +293,14 @@ that only the canonical helper touches. Keeping them distinct lets the
 helper run from the timer DPC without contending with PortCls's own
 calls into `m_PositionSpinLock`.
 
-DPC vs destructor race is closed by ref-counting on `AO_STREAM_RT`:
-engine `RefCount++` on snapshot, `RefCount--` after helper returns;
-destructor calls `KeFlushQueuedDpcs` first (per ADR-009).
+DPC vs unwind race is closed by ref-counting on `AO_STREAM_RT`:
+engine `RefCount++` on snapshot, `RefCount--` after helper returns.
+Per ADR-009, **all three** of PAUSE, STOP, and destructor call
+`KeFlushQueuedDpcs` before mutating per-stream state — PAUSE pairs it
+with `AoTransportOnPauseEx` (keep allocation), STOP and destructor
+pair it with `AoTransportOnStopEx` (reset state). The destructor
+additionally drops the owner ref via `AoTransportFreeStreamRt`. The
+`FreeAudioBuffer` unwind ordering is in DESIGN § 5.4.
 
 ## 9. Lifecycle
 
@@ -347,7 +352,11 @@ can convert (per ADR-008):
 
 - rates: 8000, 16000, 22050, 32000, 44100, 48000, 88200, 96000, 176400,
   192000 Hz
-- bits: 8, 16, 24 (PCM int) and 32 (PCM int / IEEE float)
+- bits: 8 (PCM uint), 16 (PCM int), 24 (packed PCM int), 32 (PCM int)
+- subtype: `KSDATAFORMAT_SUBTYPE_PCM` only.
+  `KSDATAFORMAT_SUBTYPE_IEEE_FLOAT` is **not** advertised; the
+  intersection handler must reject IEEE_FLOAT requests with
+  `STATUS_NO_MATCH` (per ADR-008 + DESIGN § 2.5).
 - channels: 1, 2
 
 Unsupported requests get `STATUS_NOT_SUPPORTED` cleanly (no fall-back
@@ -372,10 +381,26 @@ The IOCTL `IOCTL_AO_GET_STREAM_STATUS` returns:
 
 - `AO_STREAM_STATUS` (V1, always present): per-endpoint Active /
   SampleRate / BitsPerSample / Channels.
-- `AO_V2_DIAG` (V2 extension, when caller buffer is large enough): per-
-  endpoint counters: GatedSkip, OverJump, FramesProcessed, PumpInvocation,
-  ShadowDivergence, FeatureFlags, plus per-render-side Pump/Legacy drive
-  counts.
+- `AO_V2_DIAG` (extension, when caller buffer is large enough). The
+  schema is per-endpoint; the cable rewrite (Phase 1+) adds the
+  following observable surface:
+
+  | Field (per cable, R/C) | Meaning | Origin |
+  |---|---|---|
+  | `<Cable>_<R/C>_OverflowCount` | Hard-reject hits in `AoRingWriteFromScratch` | Phase 1 Step 5 |
+  | `<Cable>_<R/C>_UnderrunCount` | Read-insufficient hits in `AoRingReadToScratch` | Phase 1 Step 5 |
+  | `<Cable>_<R/C>_UnderrunFlag` | UCHAR; 1 = drained recovery, 0 = normal (50%-`WrapBound` hysteresis observable) | Phase 1 Step 5 |
+  | `<Cable>_<R/C>_RingFillFrames` | Live `(WritePos − ReadPos)` wrap-corrected | Phase 1 Step 5 |
+  | `<Cable>_<R/C>_WrapBoundFrames` | Current `WrapBound` (= `TargetLatencyFrames` after reconcile settles) | Phase 1 Step 5 |
+  | `<Cable>_<R/C>_ShadowDivergenceCount` | Helper-vs-legacy advance disagreement count (8-frame tolerance) | Phase 3 Step 4 |
+  | (legacy / pre-rewrite) | `GatedSkip`, `OverJump`, `FramesProcessed`, `PumpInvocation`, etc. | Pre-Phase 1 fields; zero-filled until Phase 6 retires them |
+
+  `RingFillFrames` is the steady-state live-latency band, **not** a
+  target value (REVIEW_POLICY § 2 forbids treating
+  `WrapBoundFrames`/`TargetLatencyFrames` as a target fill).
+  `UnderrunFlag` separates "underran once and recovered" from "stuck
+  in drained recovery"; both can show identical `UnderrunCount` but
+  are very different live states.
 
 Schema lives in `Source/Main/ioctl.h`. Diagnostics rule (REVIEW_POLICY § 7):
 `ioctl.h`, `adapter.cpp`, and `test_stream_monitor.py` must be updated

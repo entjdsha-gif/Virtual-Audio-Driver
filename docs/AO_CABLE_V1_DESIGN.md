@@ -197,11 +197,31 @@ return STATUS_SUCCESS;
 
 ### 2.4 Read SRC algorithm (`AoRingReadToScratch`)
 
-Same structure, inverted direction. Underrun handling:
+Same structure, inverted direction.
 
 ```c
 acquire(pipe->Lock);
 reconcile_wrapbound_to_target(pipe);
+
+// GCD divisor selection FIRST. Read direction maps client (dst) rate
+// onto pipe internal (src) rate, so the relevant ratios are:
+//   srcRatio = pipe->InternalRate / divisor   (ring side)
+//   dstRatio = dstRate            / divisor   (client side)
+divisor = pickGCD(pipe->InternalRate, dstRate, [300, 100, 75]);
+if (divisor < 0) {
+    release(pipe->Lock);
+    return STATUS_INVALID_PARAMETER;
+}
+srcRatio = pipe->InternalRate / divisor;
+dstRatio = dstRate            / divisor;
+
+// `frames` is the OUTPUT (client) frame count requested. Convert to
+// the INPUT (ring) frame count needed before any availability check —
+// for 48k ring → 96k client (upsample read), 96 client frames need
+// 48 ring frames (#2 from re-review of a038ad6). The naive
+// `frames > AoRingAvailableFrames` check would falsely trip underrun
+// when the ring has plenty.
+ringFramesNeeded = ((uint64_t)frames * srcRatio) / dstRatio;
 
 if (pipe->UnderrunFlag) {
     if (AoRingAvailableFrames(pipe) < pipe->WrapBound / 2) {
@@ -212,7 +232,7 @@ if (pipe->UnderrunFlag) {
     pipe->UnderrunFlag = 0;     // exit recovery
 }
 
-if (frames > AoRingAvailableFrames(pipe)) {
+if (ringFramesNeeded > AoRingAvailableFrames(pipe)) {
     pipe->UnderrunCounter += 1;
     pipe->UnderrunFlag = 1;
     zero_fill(scratch, frames * dstBlockAlign);
@@ -220,7 +240,13 @@ if (frames > AoRingAvailableFrames(pipe)) {
     return STATUS_SUCCESS;
 }
 
-// SRC + format-specific denormalization (>>11/+0x80, >>3, <<5+pack3, copy)
+// SRC + format-specific denormalization per § 2.5
+//   8 PCM:  (int >> 11) + 0x80
+//   16 PCM: int >> 3
+//   24 PCM: int << 5 then 3-byte pack
+//   32 PCM: int << 13   (NOT direct copy — restores the 19-bit
+//                        normalization shift applied on write)
+// Uses pipe->ReadSrcPhase + pipe->ReadSrcResidual[] persistent state.
 read_and_advance_readpos(pipe, scratch, frames, dstRate, dstChannels, dstBits);
 
 release(pipe->Lock);
@@ -560,29 +586,65 @@ while a transport DPC or canonical helper is mid-call holding a transient
 ref to the same `AO_STREAM_RT`, the DPC will dereference an unmapped
 buffer (use-after-free, BSOD).
 
+### Ref-count model recap
+
+`AO_STREAM_RT::RefCount` partitions into:
+
+- **Owner ref** (`+1` at `AoTransportAllocStreamRt`, `-1` at
+  `AoTransportFreeStreamRt` in the destructor) — exactly one for the
+  life of the struct.
+- **Engine ref** (`+1` at `AoTransportOnRunEx` registration, `-1` at
+  `AoTransportUnregister`) — present only while the rt is on the
+  engine's active list.
+- **Transient helper refs** (`+1` when the engine timer DPC or the
+  query path snapshots the rt under engine lock, `-1` after the helper
+  returns) — short-lived, only during a helper invocation.
+
+Steady states:
+
+| State | Engine ref | Helper ref | Owner ref | Total |
+|---|---|---|---|---|
+| Idle on active list, no helper running | 1 | 0 | 1 | **2** |
+| Helper executing (DPC or query) | 1 | 1 | 1 | 3 (transient) |
+| After Unregister, DPCs drained | 0 | 0 | 1 | **1** (owner-only) |
+| After destructor's final release | 0 | 0 | 0 | **0** (free) |
+
+### Unwind contract
+
 The unwind contract on every path that reaches `FreeAudioBuffer`
 (destructor, `KSSTATE_STOP` from a session that allocated, error rollback
 from `AllocateAudioBuffer` failure):
 
 ```c
 // Required ordering — no exceptions:
-1. AoTransportUnregister(m_pTransportRt);  // remove from engine active list
-                                           // (engine timer DPC stops snapshotting this rt)
-2. KeFlushQueuedDpcs();                    // drain any DPC that already snapshotted
-                                           // and is mid-helper-call
-3. Wait until rt->RefCount == 0            // any transient helper ref completes
-                                           // (engine-side ref-count discipline,
-                                           //  ADR-009 § Consequences)
-4. m_pTransportRt->DmaBuffer     = NULL;   // publish "buffer is gone" before unmap
-   m_pTransportRt->DmaBufferSize = 0;      //   so any late observer sees NULL, not stale
-5. FreeAudioBuffer();                      // PortCls unmaps; the buffer is gone.
+1. AoTransportUnregister(m_pTransportRt);   // remove from engine active list
+                                            //   (drops engine ref: 2 → 1).
+                                            // Engine timer DPC stops snapshotting
+                                            //   this rt on its next tick.
+2. KeFlushQueuedDpcs();                     // drain any DPC that already snapshotted
+                                            //   before step 1 took effect.
+3. Wait until rt->RefCount == 1             // owner-only state. After step 2 this
+                                            //   is normally already true; the wait
+                                            //   covers the query-path race where a
+                                            //   user-mode GetPosition call snapshotted
+                                            //   under engine lock just before step 1.
+                                            // Spin or KeWaitForSingleObject on a
+                                            //   per-stream event signaled when the
+                                            //   final transient ref drops; do NOT
+                                            //   wait for ==0 (owner ref is still
+                                            //   held — you ARE the owner).
+4. m_pTransportRt->DmaBuffer     = NULL;    // publish "buffer is gone" before unmap
+   m_pTransportRt->DmaBufferSize = 0;       //   so any late observer sees NULL.
+5. FreeAudioBuffer();                       // PortCls unmaps; the buffer is gone.
 6. (destructor only) AoTransportFreeStreamRt(rt);
+                                            //   drops the owner ref: 1 → 0, frees rt.
 ```
 
 The transport helper must additionally guard reads of `rt->DmaBuffer`
 and treat `NULL` as "this stream is unmapping; no-op the render/capture
 copy this tick." This guard is cheap (a single compare under
-`PositionLock`) and closes the late-DPC race. (Review #11 of 8afa59a.)
+`PositionLock`) and closes the late-DPC race. (Review #11 of 8afa59a;
+ref-count semantics tightened by re-review #3 of a038ad6.)
 
 ---
 

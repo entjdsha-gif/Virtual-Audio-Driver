@@ -522,19 +522,39 @@ per-stream cursor state.
 
 ### Decision
 
-V1 lifecycle ordering:
+V1 lifecycle ordering. **PAUSE, STOP, and destructor each have a
+distinct contract**; they are not interchangeable:
 
 ```text
-Stream destructor (or PAUSE/STOP):
-    1. KeFlushQueuedDpcs()                 // drain any in-flight DPC
-    2. AoTransportOnStopEx(rt)              // zero monotonic / cursor / fade state
-    3. (destructor only) AoTransportFreeStreamRt(rt)
+KSSTATE_PAUSE (RUN → PAUSE):
+    1. KeFlushQueuedDpcs()           // drain any in-flight DPC
+    2. AoTransportOnPauseEx(rt)      // mark inactive; KEEP allocation;
+                                     //   do NOT reset monotonic/cursor state
+                                     //   (RUN → PAUSE → RUN keeps the ring
+                                     //    usable, per REVIEW_POLICY § 5)
+
+KSSTATE_STOP (RUN → STOP):
+    1. KeFlushQueuedDpcs()           // drain any in-flight DPC
+    2. AoTransportOnStopEx(rt)       // mark inactive; reset monotonic
+                                     //   counters / cursor / fade / SRC
+                                     //   state on the FRAME_PIPE
+                                     //   (RUN → STOP → RUN starts fresh)
+
+Stream destructor:
+    1. KeFlushQueuedDpcs()           // drain any in-flight DPC
+    2. AoTransportOnStopEx(rt)       // idempotent state reset
+    3. AoTransportFreeStreamRt(rt)   // owner ref drops (1 → 0), free
 ```
 
-`AoTransportOnStopEx` is idempotent — safe to call from PAUSE, STOP, and
-destructor. `AoTransportFreeStreamRt` is ref-count-aware: if the engine
-timer DPC currently holds a transient ref, the actual free is deferred
-until the DPC releases.
+`AoTransportOnStopEx` is idempotent and may be called from STOP and
+the destructor. `AoTransportOnPauseEx` is **only** for PAUSE — never
+called from STOP or the destructor (it would skip the state reset
+that those paths require).
+
+`AoTransportFreeStreamRt` is ref-count-aware: if the engine timer
+DPC or query path currently holds a transient ref, the actual free
+is deferred until the transient ref releases (DESIGN § 5.4 ref-count
+recap).
 
 ### Rationale
 
