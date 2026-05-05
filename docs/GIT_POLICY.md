@@ -5,9 +5,9 @@ Authority: ADR-014 (supersedes ADR-012)
 
 ## 1. Principle
 
-`main` is the **pre-rewrite shipping reference**. It is unchanged
-during Phase 1-6 and only receives the V1 ship merge at Phase 7 exit.
-Do not commit directly to `main`.
+`main` is the **pre-rewrite shipping reference**. It is **untouched
+during Phase 1-6** and only receives the V1 ship merge at Phase 7
+exit. Do not commit directly to `main`.
 
 `feature/ao-fixed-pipe-rewrite` is **V1's integration target** — it
 plays the role V2's `master` plays in V2's git policy. All phase
@@ -220,19 +220,67 @@ The merge commit and per-step commits remain on
 ## 6. V1 ship merge (Phase 7 exit only)
 
 Merging `feature/ao-fixed-pipe-rewrite` → `main` is a separate event,
-gated on Phase 7 step 5 (M6 shipping checklist):
+gated on Phase 7 step 5 (M6 shipping checklist).
+
+### 6.1 Approval gate
+
+All five must hold before the ship merge runs:
 
 ```text
 1. All Phase 1-7 step files marked completed in phases/index.json.
 2. Each phase has a successful `Merge phase/N` commit on
-   feature/ao-fixed-pipe-rewrite.
+   feature/ao-fixed-pipe-rewrite (visible via
+   `git log --first-parent feature/ao-fixed-pipe-rewrite`).
 3. Build / install / sign verification passes on a clean machine.
-4. Live-call quality reaches the target (docs/PRD.md success criteria).
+4. Live-call quality reaches the target (docs/PRD.md success
+   criteria).
 5. The user explicitly approves the merge.
 ```
 
-Use `git merge --no-ff` and the same `Verified` / `Known blockers` /
-`Non-claims` block, scoped to the V1 ship gate.
+### 6.2 Command
+
+```powershell
+git checkout main
+git merge --no-ff feature/ao-fixed-pipe-rewrite
+```
+
+`--no-ff` mandatory; squash and fast-forward forbidden.
+
+### 6.3 Merge commit body (canonical template)
+
+The merge commit body **must** match this template (verbatim copy of
+`phases/7-quality-polish/exit.md` § "Phase 7 → main merge"; if either
+copy is updated, both must be updated together to stay in sync):
+
+```text
+V1 ship merge (M6)
+
+V1 classification: <PASS / PASS_WITH_CAVEATS>
+
+Verified:
+- build-verify.ps1 -Config Release: <hash> built clean
+- install.ps1 -Action upgrade: <date>, machine <id>
+- live-call parity with VB: tests/phase5-runtime/<run>/judgment
+- benchmark suite PASS: phases/7-quality-polish/step4 artifacts
+- M6 checklist: phases/7-quality-polish/step5 fully checked
+- Phase 1-7 each merged with verified blocks (see git log
+  --first-parent feature/ao-fixed-pipe-rewrite)
+
+Known blockers:
+- <any documented residual risk> | none
+
+Non-claims:
+- this merge does NOT replace V2 (separate ACX track).
+- this merge does NOT promise zero-drift parity with VB binary
+  (only behavioral parity per the design).
+
+Co-Authored-By: <agent identity>
+```
+
+Do not improvise the merge message. Either copy this template
+verbatim and fill the placeholders, or copy from
+`phases/7-quality-polish/exit.md` § "Phase 7 → main merge" — the two
+are kept word-for-word identical.
 
 ## 7. Cherry-picks
 

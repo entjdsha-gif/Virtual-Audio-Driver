@@ -819,7 +819,7 @@ adapted for V1's pre-existing `main` baseline.
 
 | Branch | Role | When it changes |
 |---|---|---|
-| `main` | pre-rewrite shipping reference. **Unchanged** during Phase 1-6. | Once: V1 ship event at Phase 7 exit (`--no-ff` merge from `feature/ao-fixed-pipe-rewrite`). |
+| `main` | pre-rewrite shipping reference. **Untouched during Phase 1-6.** | Once: V1 ship event at Phase 7 exit (`--no-ff` merge from `feature/ao-fixed-pipe-rewrite`). |
 | `feature/ao-fixed-pipe-rewrite` | **V1's integration target** — plays the role V2's `master` plays. All phase branches merge here with `--no-ff`. | Phase merges (every phase exit) + short-lived `docs/...` / `fix/...` branch merges. |
 | `phase/<N>-name` | Phase work branch. Branches off `feature/ao-fixed-pipe-rewrite`, merges back at phase exit. | Phase implementation commits (`phaseN/stepM:`, `phaseN/fix:`, `phaseN: close <classification>`). |
 | `docs/<topic>` | Short-lived doc-only fix branch. Used when a doc update spans multiple phases or doesn't belong to any phase. | One-off, deleted after merge. |
@@ -911,14 +911,41 @@ Do not commit before review. Do not mark `completed` before commit.
 
 #### Final ship merge (Phase 7 exit)
 
+Approval gate (all five must hold):
+
+```text
+1. All Phase 1-7 step files marked completed in phases/index.json.
+2. Each phase has a successful `Merge phase/N` commit on
+   feature/ao-fixed-pipe-rewrite.
+3. Build / install / sign verification passes on a clean machine.
+4. Live-call quality reaches the target (docs/PRD.md success criteria).
+5. The user explicitly approves the merge.
+```
+
+Command:
+
 ```powershell
 git checkout main
 git merge --no-ff feature/ao-fixed-pipe-rewrite
 ```
 
-The merge commit message follows the same Verified / Known blockers /
-Non-claims structure, scoped to the V1 ship gate (M6 checklist from
-`phases/7-quality-polish/step5.md`).
+Merge commit body **must** match the canonical V1 ship template,
+which is kept word-for-word identical between
+`docs/GIT_POLICY.md` § 6.3 and `phases/7-quality-polish/exit.md`
+§ "Phase 7 → main merge". The five required blocks are:
+
+- `V1 classification: <PASS / PASS_WITH_CAVEATS>`
+- `Verified:` block (build hash, install date+machine, live-call
+  parity reference, benchmark suite reference, M6 checklist
+  reference, Phase 1-7 merge log reference).
+- `Known blockers:` (or `none`).
+- `Non-claims:` (does NOT replace V2; does NOT promise zero-drift
+  binary parity with VB; etc.).
+- `Co-Authored-By:` trailer.
+
+`--no-ff` mandatory; squash and fast-forward forbidden. Do not
+improvise the merge message — copy the template verbatim from one of
+the two canonical sources cited above.
 
 ### Rationale
 
