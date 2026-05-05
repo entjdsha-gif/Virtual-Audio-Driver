@@ -144,19 +144,26 @@ The `.gitignore` enforces most of these.
 
 ## 4. Workflow per step
 
+This is the canonical 7-step workflow. ADR-014, CLAUDE.md, and
+AGENTS.md reproduce the same block verbatim — if it changes here,
+update those three docs in the same commit to keep them in sync.
+
 ```text
 1. Implement the step on phase/<N>-name.
 2. Self-check: build, IOCTL probe, acceptance criteria from step file.
 3. Request Codex review.
-4. Cross-verify each finding against WDK headers, design docs, RE evidence.
-   Disagree-with-evidence is allowed; do not blindly apply incorrect
-   findings.
-5. If BLOCKER found and verified correct: fix on the same phase branch,
-   request re-review. **Do not commit the fix before re-review passes.**
+4. Cross-verify each finding against WDK headers, design docs, RE
+   evidence. Disagree-with-evidence is allowed; do not blindly apply
+   incorrect findings.
+5. If BLOCKER found and verified correct: fix on the same phase
+   branch, request re-review. Do not commit the fix before
+   re-review passes.
 6. Review passes: commit with phaseN/stepM: prefix.
 7. python scripts/execute.py mark <phase-dir> <step> completed
        --message "..."
 ```
+
+Do not commit before review. Do not mark `completed` before commit.
 
 If a step's commit has already landed when a review finding arrives
 (e.g. cross-doc audit catches drift later), the fix is a separate

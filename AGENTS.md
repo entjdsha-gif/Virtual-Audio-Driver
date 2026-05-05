@@ -266,17 +266,22 @@ reference) stays untouched until V1 ship event.
 
 ### Workflow per step
 
+Verbatim with `docs/GIT_POLICY.md` § 4 (canonical source — keep all
+four canonical docs identical):
+
 ```text
-1. Implement on phase/<N>-name.
-2. Self-check (build, IOCTL, acceptance).
+1. Implement the step on phase/<N>-name.
+2. Self-check: build, IOCTL probe, acceptance criteria from step file.
 3. Request Codex review.
-4. Cross-verify findings against WDK headers, design docs, RE evidence.
-   If a finding is incorrect or imprecise, Claude must report the
-   disagreement with evidence — do not blindly apply.
-5. If BLOCKER (verified): fix, re-review. Do not commit fix before
+4. Cross-verify each finding against WDK headers, design docs, RE
+   evidence. Disagree-with-evidence is allowed; do not blindly apply
+   incorrect findings.
+5. If BLOCKER found and verified correct: fix on the same phase
+   branch, request re-review. Do not commit the fix before
    re-review passes.
-6. Review passes: commit phaseN/stepM: <msg>.
-7. python scripts/execute.py mark <phase-dir> <step> completed.
+6. Review passes: commit with phaseN/stepM: prefix.
+7. python scripts/execute.py mark <phase-dir> <step> completed
+       --message "..."
 ```
 
 Do not commit before review. Do not mark `completed` before commit.
