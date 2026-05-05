@@ -575,20 +575,58 @@ NTSTATUS SetState(KSSTATE NewState)
 
 ### 5.3 Destructor
 
+The destructor is one of the unwind paths that must execute the full
+**Step A → Step D** contract from § 5.4. Do **not** simplify this
+example: order matters for closing the query-path race, the
+DPC-path race, and the DMA-buffer race in turn.
+
 ```c
 ~CMiniportWaveRTStream()
 {
-    KeFlushQueuedDpcs();   // critical: drain in-flight engine DPCs
+    if (m_pTransportRt == NULL) {
+        // Stream never reached RUN, or already torn down. Nothing to do
+        // for the cable transport state; fall through to remaining cleanup.
+    } else {
+        // --- Step A: exclude the query path ---
+        // Acquire m_PositionSpinLock so any in-progress GetPosition /
+        // GetPositions call (which holds this lock end-to-end across the
+        // helper) finishes before we proceed. Atomically null out
+        // m_pTransportRt so future query path calls see NULL and no-op.
+        KIRQL psIrql;
+        KeAcquireSpinLock(&m_PositionSpinLock, &psIrql);
+        PAO_STREAM_RT rtSnapshot = m_pTransportRt;
+        m_pTransportRt           = NULL;
+        KeReleaseSpinLock(&m_PositionSpinLock, psIrql);
 
-    if (m_pTransportRt) {
-        AoTransportOnStopEx(m_pTransportRt);    // idempotent
-        AoTransportFreeStreamRt(m_pTransportRt);
-        m_pTransportRt = NULL;
+        // --- Step B: exclude the DPC path ---
+        AoTransportUnregister(rtSnapshot);   // drops engine ref (2 → 1)
+        KeFlushQueuedDpcs();                 // drain any DPC mid-helper-call
+        ASSERT(rtSnapshot->RefCount == 1);   // owner-only state
+
+        // Idempotent state reset before tearing down the DMA buffer.
+        // Safe at RefCount == 1 because both paths are excluded.
+        AoTransportOnStopEx(rtSnapshot);
+
+        // --- Step C: tear down the DMA-buffer-shaped state ---
+        rtSnapshot->DmaBuffer     = NULL;    // publish before unmap
+        rtSnapshot->DmaBufferSize = 0;
+        FreeAudioBuffer();                   // PortCls unmaps
+
+        // --- Step D: drop the owner ref ---
+        AoTransportFreeStreamRt(rtSnapshot); // RefCount: 1 → 0; frees rt
     }
 
-    // remaining cleanup (DMA buffer, port stream release, etc.)
+    // remaining cleanup (port stream release, etc.)
 }
 ```
+
+The non-obvious ordering rule: `AoTransportFreeStreamRt` is the
+**last** step on this path (Step D), not an early "while we're
+cleaning up the rt" call. Calling Free before Step C would let
+PortCls unmap the DMA buffer while a stale pointer still lived
+inside `rtSnapshot`; calling it before Step B would let an in-flight
+DPC dereference freed memory. (Round 7 finding #1 caught a previous
+draft that did Free before DMA cleanup.)
 
 ### 5.4 `FreeAudioBuffer` ordering (DMA buffer lifetime)
 
