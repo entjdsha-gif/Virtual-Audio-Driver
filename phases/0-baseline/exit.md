@@ -8,7 +8,8 @@ Phase 0 exits when all of the following are true. All passed.
 
 - [x] VB-Cable RE evidence committed and reviewed (Step 0).
 - [x] Single branch / single worktree in effect (Step 1).
-- [x] V1 planning files in place (Step 2): PRD, ADR (12), ARCHITECTURE,
+- [x] V1 planning files in place (Step 2): PRD, ADR (12 at exit;
+      ADR-013 added during Phase 0 review fix bundle), ARCHITECTURE,
       DESIGN, REVIEW_POLICY, GIT_POLICY, CLAUDE.md, AGENTS.md, slash
       commands, phase scaffolding, execute.py.
 - [x] Build sanity on `feature/ao-fixed-pipe-rewrite` HEAD: `.\build-verify.ps1
@@ -21,7 +22,7 @@ Phase 0 exits when all of the following are true. All passed.
 - Confirmed VB target shape for the cable transport core.
 - Stable code baseline at the merge of phase6-core into
   `feature/ao-fixed-pipe-rewrite`.
-- Clean planning structure: PRD locks goal, ADR-001..012 lock decisions,
+- Clean planning structure: PRD locks goal, ADR-001..013 lock decisions,
   ARCHITECTURE locks system shape, DESIGN locks file/struct/function
   shape.
 - Working build / install / signing pipeline.

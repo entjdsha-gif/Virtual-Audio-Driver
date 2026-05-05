@@ -117,8 +117,9 @@ at `FramePipeInitCable` time; subsequent code reads them as constants.
 
 ```c
 NTSTATUS FramePipeInitCable(PFRAME_PIPE pipe,
-                            LONG initialFrames,
-                            LONG channels);
+                            ULONG       internalRate,
+                            LONG        channels,
+                            LONG        initialFrames);
 
 VOID     FramePipeFree(PFRAME_PIPE pipe);
 
