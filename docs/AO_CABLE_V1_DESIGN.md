@@ -586,9 +586,37 @@ while a transport DPC or canonical helper is mid-call holding a transient
 ref to the same `AO_STREAM_RT`, the DPC will dereference an unmapped
 buffer (use-after-free, BSOD).
 
+### Helper invocation paths and how each is excluded from teardown
+
+Two paths reach `AoCableAdvanceByQpc(rt, ...)`:
+
+1. **Engine timer DPC.** Snapshots the active list under `EngineLock`,
+   `RefCount++` per snapshotted rt, releases `EngineLock`, calls the
+   helper, then `RefCount--`. The transient ref is taken under engine
+   lock, so it is observable via `RefCount`.
+2. **Query path.** `CMiniportWaveRTStream::GetPosition` /
+   `GetPositions` (and the no-op `UpdatePosition` cable shim from
+   Phase 4 Step 1) hold the stream's `m_PositionSpinLock` end-to-end
+   across the helper call. They read `m_pTransportRt` *under that
+   lock* and pass it to the helper. The query path **does not**
+   touch `RefCount` and **does not** acquire `EngineLock`.
+
+These two paths require **different teardown mechanisms**:
+
+- DPC path is excluded by `AoTransportUnregister` (drops engine ref,
+  removes rt from active list) followed by `KeFlushQueuedDpcs`
+  (drains any DPC mid-helper-call).
+- Query path is excluded by atomically nullifying `m_pTransportRt`
+  under `m_PositionSpinLock`. After the publish, any new query reads
+  `NULL` and short-circuits; any in-progress query already finishes
+  the helper because the unwind acquires `m_PositionSpinLock` to
+  perform the publish, which blocks until the in-progress query
+  releases.
+
 ### Ref-count model recap
 
-`AO_STREAM_RT::RefCount` partitions into:
+`AO_STREAM_RT::RefCount` partitions into **two** components — note
+that the query path is intentionally **not** represented here:
 
 - **Owner ref** (`+1` at `AoTransportAllocStreamRt`, `-1` at
   `AoTransportFreeStreamRt` in the destructor) — exactly one for the
@@ -596,18 +624,22 @@ buffer (use-after-free, BSOD).
 - **Engine ref** (`+1` at `AoTransportOnRunEx` registration, `-1` at
   `AoTransportUnregister`) — present only while the rt is on the
   engine's active list.
-- **Transient helper refs** (`+1` when the engine timer DPC or the
-  query path snapshots the rt under engine lock, `-1` after the helper
-  returns) — short-lived, only during a helper invocation.
+- **Transient DPC ref** (`+1` when the engine timer DPC snapshots
+  the rt under `EngineLock`, `-1` after the helper returns) —
+  short-lived, only during a DPC-driven helper invocation. The
+  query path is excluded from this row by design (it uses
+  `m_pTransportRt` publish ordering instead).
 
 Steady states:
 
-| State | Engine ref | Helper ref | Owner ref | Total |
+| State | Engine ref | DPC ref | Owner ref | Total |
 |---|---|---|---|---|
-| Idle on active list, no helper running | 1 | 0 | 1 | **2** |
-| Helper executing (DPC or query) | 1 | 1 | 1 | 3 (transient) |
-| After Unregister, DPCs drained | 0 | 0 | 1 | **1** (owner-only) |
+| Idle on active list, no DPC running | 1 | 0 | 1 | **2** |
+| DPC executing | 1 | 1 | 1 | 3 (transient) |
+| After Unregister + KeFlushQueuedDpcs | 0 | 0 | 1 | **1** (owner-only) |
 | After destructor's final release | 0 | 0 | 0 | **0** (free) |
+
+A query path call in flight does NOT change these totals.
 
 ### Unwind contract
 
@@ -617,26 +649,35 @@ from `AllocateAudioBuffer` failure):
 
 ```c
 // Required ordering — no exceptions:
-1. AoTransportUnregister(m_pTransportRt);   // remove from engine active list
+
+// --- Step A: exclude the query path ---
+acquire(m_PositionSpinLock);
+PAO_STREAM_RT rtSnapshot = m_pTransportRt;
+m_pTransportRt           = NULL;            // publish: future query path
+                                            //   reads NULL and no-ops.
+release(m_PositionSpinLock);                // any in-progress query that was
+                                            //   holding this lock has finished
+                                            //   the helper and released by now.
+
+// --- Step B: exclude the DPC path ---
+1. AoTransportUnregister(rtSnapshot);       // remove from engine active list
                                             //   (drops engine ref: 2 → 1).
                                             // Engine timer DPC stops snapshotting
                                             //   this rt on its next tick.
 2. KeFlushQueuedDpcs();                     // drain any DPC that already snapshotted
                                             //   before step 1 took effect.
-3. Wait until rt->RefCount == 1             // owner-only state. After step 2 this
-                                            //   is normally already true; the wait
-                                            //   covers the query-path race where a
-                                            //   user-mode GetPosition call snapshotted
-                                            //   under engine lock just before step 1.
-                                            // Spin or KeWaitForSingleObject on a
-                                            //   per-stream event signaled when the
-                                            //   final transient ref drops; do NOT
-                                            //   wait for ==0 (owner ref is still
-                                            //   held — you ARE the owner).
-4. m_pTransportRt->DmaBuffer     = NULL;    // publish "buffer is gone" before unmap
-   m_pTransportRt->DmaBufferSize = 0;       //   so any late observer sees NULL.
-5. FreeAudioBuffer();                       // PortCls unmaps; the buffer is gone.
-6. (destructor only) AoTransportFreeStreamRt(rt);
+
+// At this point RefCount must equal 1 (owner-only). Both paths excluded.
+ASSERT(rtSnapshot->RefCount == 1);
+
+// --- Step C: tear down the DMA-buffer-shaped state ---
+3. rtSnapshot->DmaBuffer     = NULL;        // defense in depth — even with
+   rtSnapshot->DmaBufferSize = 0;           //   step A done, an unforeseen
+                                            //   helper caller would see NULL.
+4. FreeAudioBuffer();                       // PortCls unmaps; the buffer is gone.
+
+// --- Step D: only the destructor frees rt ---
+5. (destructor only) AoTransportFreeStreamRt(rtSnapshot);
                                             //   drops the owner ref: 1 → 0, frees rt.
 ```
 
@@ -644,7 +685,8 @@ The transport helper must additionally guard reads of `rt->DmaBuffer`
 and treat `NULL` as "this stream is unmapping; no-op the render/capture
 copy this tick." This guard is cheap (a single compare under
 `PositionLock`) and closes the late-DPC race. (Review #11 of 8afa59a;
-ref-count semantics tightened by re-review #3 of a038ad6.)
+ref-count + query-path partition tightened by re-review #3 of a038ad6
+and #1 of 0eb5920.)
 
 ---
 
@@ -655,10 +697,23 @@ ref-count semantics tightened by re-review #3 of a038ad6.)
 In `Source/Filters/cablewavtable.h` (or per-cable filter table):
 
 - declare data ranges that cover the rates / bits / channels listed in
-  `docs/AO_CABLE_V1_ARCHITECTURE.md` § 10.3.
-- intersection handler picks the requested format if it matches a range
-  AND `pickGCD(requestedRate, pipe.InternalRate)` succeeds; otherwise
-  return `STATUS_NO_MATCH`.
+  `docs/AO_CABLE_V1_ARCHITECTURE.md` § 10.3 (KSDATAFORMAT_SUBTYPE_PCM
+  only — IEEE_FLOAT not advertised).
+- intersection handler returns one of three statuses:
+  - `STATUS_SUCCESS` when the requested format matches an advertised
+    range (rate ∈ list, bits ∈ {8,16,24,32}, subtype = PCM,
+    channels ∈ {1,2}) AND the rate GCD-divides cleanly via 300/100/75
+    against `pipe->InternalRate`.
+  - `STATUS_NO_MATCH` when the request is **outside** the advertised
+    range — wrong subtype (IEEE_FLOAT), unadvertised rate, unsupported
+    bit-depth, unsupported channel count, etc.
+  - `STATUS_NOT_SUPPORTED` when the request is in-range PCM but
+    `pickGCD(requestedRate, pipe->InternalRate)` returns no divisor
+    (e.g. `22050 ↔ {8000, 16000, 32000}`).
+
+The two-tier contract is the same across ARCHITECTURE § 10.3 and
+ADR-008. Implementations must not collapse both to one status — see
+ARCHITECTURE for rationale.
 
 ### 6.2 OEM Default Format
 

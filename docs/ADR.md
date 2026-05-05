@@ -501,8 +501,12 @@ direction) and ring→client (read direction) using ADR-004's algorithm.
 ### Consequences
 
 - `FormatMatch` enforcement code is removed from the cable path.
-- KSDATARANGE intersection handler must validate the GCD divisor; client
-  asking for an unsupported rate gets `STATUS_NOT_SUPPORTED` cleanly.
+- KSDATARANGE intersection handler uses a **two-tier failure status**
+  (see ARCHITECTURE § 10.3 and DESIGN § 6.1):
+  - `STATUS_NO_MATCH` for outside-range requests (IEEE_FLOAT,
+    unadvertised rate / bit / channel).
+  - `STATUS_NOT_SUPPORTED` for in-range PCM requests whose rate fails
+    the 300/100/75 GCD divisor check against the pipe's internal rate.
 - multi-channel (>2) is out of scope for V1; revisit in Stage 7.
 
 ---

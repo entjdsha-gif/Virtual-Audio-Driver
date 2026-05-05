@@ -294,34 +294,58 @@ helper run from the timer DPC without contending with PortCls's own
 calls into `m_PositionSpinLock`.
 
 DPC vs unwind race is closed by ref-counting on `AO_STREAM_RT`:
-engine `RefCount++` on snapshot, `RefCount--` after helper returns.
+engine `RefCount++` on snapshot under `EngineLock`, `RefCount--`
+after helper returns. The **query path is excluded from RefCount by
+design** — it uses `m_PositionSpinLock` + `m_pTransportRt` publish
+ordering instead (see DESIGN § 5.4 "Helper invocation paths and how
+each is excluded from teardown"). Mixing the two would force every
+`GetPosition` to take an interlocked op for no real benefit, since
+`m_PositionSpinLock` already serializes query against unwind.
+
 Per ADR-009, **all three** of PAUSE, STOP, and destructor call
 `KeFlushQueuedDpcs` before mutating per-stream state — PAUSE pairs it
 with `AoTransportOnPauseEx` (keep allocation), STOP and destructor
 pair it with `AoTransportOnStopEx` (reset state). The destructor
 additionally drops the owner ref via `AoTransportFreeStreamRt`. The
-`FreeAudioBuffer` unwind ordering is in DESIGN § 5.4.
+full `FreeAudioBuffer` unwind ordering (Step A query exclusion,
+Step B DPC exclusion, Step C DMA teardown, Step D rt free) is in
+DESIGN § 5.4.
 
 ## 9. Lifecycle
+
+Each transition has a fixed contract; PAUSE / STOP / destructor are
+**not** interchangeable (per ADR-009).
 
 ```text
 RUN entry:
   if (m_pTransportRt == NULL)
-      m_pTransportRt = AoTransportAllocStreamRt(this);
+      m_pTransportRt = AoTransportAllocStreamRt(this);  // owner ref = 1
   populate snapshot from format / DMA / pipe
   AoTransportOnRunEx(&snapshot);                  // engine ref += 1, add to active
 
 PAUSE:
-  AoTransportOnPauseEx(rt);                       // mark inactive, keep allocation
+  KeFlushQueuedDpcs();                            // drain in-flight DPCs
+  AoTransportOnPauseEx(rt);                       // mark inactive; KEEP allocation
+                                                  //   (RUN→PAUSE→RUN reuses the ring;
+                                                  //    do NOT reset state here)
 
 STOP:
-  AoTransportOnStopEx(rt);                        // mark inactive, zero cursors
+  KeFlushQueuedDpcs();                            // drain in-flight DPCs
+  AoTransportOnStopEx(rt);                        // mark inactive; reset monotonic
+                                                  //   counters, cursor, fade, SRC
+                                                  //   (RUN→STOP→RUN starts fresh)
 
 Destructor:
-  KeFlushQueuedDpcs();                             // drain in-flight DPCs
-  AoTransportOnStopEx(rt);                         // idempotent
-  AoTransportFreeStreamRt(rt);                    // ref-count-aware free
+  // FreeAudioBuffer ordering precedes the steps below — see DESIGN § 5.4
+  // (Step A query exclusion, Step B DPC exclusion, Step C DMA teardown).
+  KeFlushQueuedDpcs();                            // drain in-flight DPCs
+  AoTransportOnStopEx(rt);                        // idempotent state reset
+  AoTransportFreeStreamRt(rt);                    // owner ref drops 1 → 0, free
 ```
+
+PAUSE must NEVER call `AoTransportOnStopEx` — it would reset state
+the next RUN expects to find intact. STOP and the destructor must
+NEVER call `AoTransportOnPauseEx` — it would skip the reset.
 
 ## 10. External contract (advertised to Windows)
 
@@ -353,14 +377,27 @@ can convert (per ADR-008):
 - rates: 8000, 16000, 22050, 32000, 44100, 48000, 88200, 96000, 176400,
   192000 Hz
 - bits: 8 (PCM uint), 16 (PCM int), 24 (packed PCM int), 32 (PCM int)
-- subtype: `KSDATAFORMAT_SUBTYPE_PCM` only.
-  `KSDATAFORMAT_SUBTYPE_IEEE_FLOAT` is **not** advertised; the
-  intersection handler must reject IEEE_FLOAT requests with
-  `STATUS_NO_MATCH` (per ADR-008 + DESIGN § 2.5).
+- subtype: `KSDATAFORMAT_SUBTYPE_PCM` only (per ADR-008 + DESIGN § 2.5).
 - channels: 1, 2
 
-Unsupported requests get `STATUS_NOT_SUPPORTED` cleanly (no fall-back
-silent re-conversion).
+#### Intersection failure status (two-tier contract)
+
+The intersection handler returns one of two distinct error codes, by
+where the request fails:
+
+| Failure mode | Status | Example |
+|---|---|---|
+| Subtype / range miss — the requested format is **outside** the advertised KSDATARANGE (e.g. `KSDATAFORMAT_SUBTYPE_IEEE_FLOAT`, an unadvertised rate / bit-depth / channel-count combination, or a non-PCM tag) | `STATUS_NO_MATCH` | IEEE_FLOAT 32-bit, 192k 8-channel, ALAW |
+| In-range PCM but cable SRC cannot bridge — the requested rate is in the advertised list but does **not** GCD-divide cleanly against the registry-driven internal rate via 300 / 100 / 75 (e.g. `22050 ↔ 16000`; see § 2 Phase 2 acceptance matrix) | `STATUS_NOT_SUPPORTED` | 22050 ↔ {8000, 16000, 32000} pairs |
+
+`STATUS_NO_MATCH` tells the WASAPI / KS pipeline "this endpoint does
+not advertise that shape — try another endpoint or fall back". 
+`STATUS_NOT_SUPPORTED` tells the caller "this endpoint advertised the
+shape but cannot bridge it under V1's GCD constraint" — a more
+specific signal that surfaces in driver logs and `test_stream_monitor.py`.
+Conflating the two would mask SRC-coverage gaps as generic mismatches.
+
+No fall-back silent re-conversion in either case.
 
 ### Position contract
 
