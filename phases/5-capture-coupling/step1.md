@@ -1,64 +1,77 @@
-# Phase 5 Step 1: Retire legacy capture write path
+# Phase 5 Step 1: Live-call end-to-end validation
 
 ## Read First
 
-- Phase 4 Step 2 (legacy render retirement pattern).
-- `docs/AO_CABLE_V1_DESIGN.md` § 5.2 (SetState cable branch).
+- Phase 4 Step 2 (render-only validation pattern).
+- Phase 5 Step 0 (capture audible flip atomic).
+- `tests/live_call/run_test_call.py`.
+- `docs/PRD.md` § 8 success criteria (especially #6, #7 — live-call
+  parity with VB and STT accuracy).
 
 ## Goal
 
-Make the legacy `CMiniportWaveRTStream::WriteBytes` (capture side) and
-related cable-capture transport call sites no-op for cable streams.
+Run the full live-call path (render + capture both on helper) against
+AO Cable A, confirm parity with VB-Cable on the same harness. This is
+the **defining V1 success gate**.
 
 ## Planned Files
 
-Edit only:
+No source edits. Run-only step. Captured artifacts to
+`tests/phase5-runtime/` (untracked).
 
-- `Source/Main/minwavertstream.cpp` — capture-side `WriteBytes`,
-  `UpdatePosition` capture-side branch (if it has one), and any
-  remaining cable-capture-specific transport call site.
+## Procedure
 
-## Required Edits
+1. Pre-experiment Cable / Phone Link checks (CLAUDE.md 엄수).
+2. Run AO live call:
 
-In `WriteBytes(ULONG ByteDisplacement)`:
-
-```c
-VOID
-CMiniportWaveRTStream::WriteBytes(ULONG ByteDisplacement)
-{
-    if (IsCableStream(this)) {
-        /* Cable capture fill is owned by AoCableAdvanceByQpc capture
-         * branch. WriteBytes is a no-op for cable streams. */
-        return;
-    }
-    /* non-cable legacy path — unchanged */
-    ...
-}
+```powershell
+$env:AUDIO_CABLE_PROFILE = "ao"
+cd tests\live_call
+python run_test_call.py
 ```
 
-Also retire any remaining `MicSink`-related call sites if they still
-exist. Per ADR-002 / forbidden-compromises in CLAUDE.md / AGENTS.md,
-`MicSink` dual-write must be entirely gone after Phase 5.
+3. User judges call quality, STT transcript, and any audible artifact.
+4. Capture `test_stream_monitor.py` log during the call to
+   `tests/phase5-runtime/ao_phase5_stream_monitor.log`.
+5. Run VB live call same harness:
 
-## Rules
+```powershell
+$env:AUDIO_CABLE_PROFILE = "vb"
+python run_test_call.py
+```
 
-- Tell the user before editing.
-- Non-cable behavior stays unchanged.
-- If a `MicSink` field or function is still wired into anything,
-  remove it (or mark it with a TODO + explicit retirement deadline in
-  Phase 6 cleanup).
+6. User judges VB call quality.
+7. Compare AO vs VB on three axes:
+   - Subjective audio quality (clean / garbled / silent).
+   - STT transcript accuracy (count of misheard words).
+   - Driver counters (overflow / underrun / drop / underrun flag).
 
 ## Acceptance Criteria
 
-- [ ] Build clean.
-- [ ] Live cable capture path works correctly with legacy retired.
-- [ ] No `MicSink`-related symbol survives in the cable path
-      (`grep MicSink` in `Source/` returns nothing under cable
-      compilation, or only TODO-tagged stubs scheduled for Phase 6).
-- [ ] No regression in non-cable streams.
+- [ ] AO subjective quality: **clean**, comparable to VB.
+- [ ] AO STT accuracy: same level as VB (delta within natural call
+      variance).
+- [ ] AO `OverflowCounter` and `UnderrunCounter` both 0 in steady-
+      state speech for at least one full call;
+      `UnderrunFlag = 0` in steady state.
+- [ ] No mid-call chopping reported in user judgment.
+- [ ] Cable B parallel sanity (open Cable B simultaneously, no
+      Cable A degradation).
+
+## Failure Path
+
+If AO quality is significantly worse than VB:
+
+- This is a **BLOCKER** for Phase 5 exit.
+- Capture `test_stream_monitor.log` + dbgview log + the user
+  judgment, save to `tests/phase5-runtime/ao_phase5_FAIL_run<N>/`.
+- Do **not** flip step status to completed.
+- Open a fix-up step (`Phase 5 Step 1-fix-1`) describing the failure
+  signature, the hypothesis for the cause, and the proposed fix.
+  Repeat until parity is achieved.
 
 ## Completion
 
 ```powershell
-python scripts/execute.py mark 5-capture-coupling 1 completed --message "Legacy cable-capture path retired; helper is sole owner."
+python scripts/execute.py mark 5-capture-coupling 1 completed --message "Live call AO parity with VB."
 ```

@@ -25,18 +25,26 @@ helper. The helper computes everything (advance, gate, overrun,
 drift correction) and writes shadow state. The legacy
 `UpdatePosition`-driven path still owns audible cable transport.
 
-The shadow divergence counter being zero in steady state proves the
-helper's advance math agrees with the legacy advance math within
-the 8-frame gate tolerance. This unlocks Phase 4 audible flip on the
-render side.
+The shadow divergence counter staying within the steady-state gate
+(**≤ 5 increments per minute**) proves the helper's advance math
+agrees with the legacy advance math within the 8-frame per-call
+tolerance. This is the single numeric precondition that unlocks
+Phase 4 audible flip on the render side.
+
+> Note: a strictly *zero* divergence count is not realistic given
+> normal Windows scheduler jitter. The exit gate is "≤ 5/min for at
+> least one full live call." Phase 4 Step 1 must re-check the same
+> threshold immediately before flipping audible ownership; do not
+> rely on a stale Phase 3 measurement.
 
 ## Forbidden Carry-Over Into Phase 4
 
 - Phase 4 must not introduce a third "publish state for the timer
   to consume" pattern. Audible ownership flips **directly** from
   legacy to helper.
-- Phase 4 must not flip audible ownership without first confirming
-  the divergence counter is zero on a live call.
+- Phase 4 must not flip audible ownership without re-confirming
+  divergence counter ≤ 5/min on a live call **immediately before**
+  the flip commit (not on a stale Phase 3 measurement).
 
 ## Phase 3 → Phase 4 Handoff
 

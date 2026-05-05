@@ -44,8 +44,8 @@ AoRingWriteFromScratch(PFRAME_PIPE pipe, const BYTE* scratch, ULONG frames,
         return STATUS_NOT_SUPPORTED;
     }
 
-    LONG available = AoRingAvailableSpaceFrames_Locked(pipe);
-    if ((LONG)frames > available - 2) {
+    LONG writable = AoRingAvailableSpaceFrames_Locked(pipe);
+    if ((LONG)frames > writable) {
         pipe->OverflowCounter++;
         KeReleaseSpinLock(&pipe->Lock, oldIrql);
         return STATUS_INSUFFICIENT_RESOURCES;
@@ -71,8 +71,12 @@ AoRingWriteFromScratch(PFRAME_PIPE pipe, const BYTE* scratch, ULONG frames,
 dispatch table (`docs/AO_CABLE_V1_DESIGN.md` § 2.5). 4 branches, no
 indirection.
 
-`AoRingAvailableSpaceFrames_Locked` returns
-`WrapBound - currentFill - 2`, computed without re-acquiring the lock.
+`AoRingAvailableSpaceFrames_Locked` is the **single source** of the
+guard subtraction: it returns `WrapBound - currentFill - 2` (writer-vs-
+reader collision guard, 2-frame band) computed without re-acquiring the
+lock. Callers compare `framesNeeded > available` directly — they must
+**not** subtract another 2, otherwise the guard band doubles and the
+ring loses 2 frames of usable capacity. (Review #2 of 8afa59a.)
 
 ## Rules
 

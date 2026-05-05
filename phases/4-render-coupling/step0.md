@@ -1,81 +1,92 @@
-# Phase 4 Step 0: Helper render-side does the real DMA → ring write
+# Phase 4 Step 0: Fade-in envelope helper
 
 ## Read First
 
-- Phase 3 exit (divergence counter zero).
-- `docs/AO_CABLE_V1_DESIGN.md` § 4.3 (helper render branch) and § 5.3
-  (render path).
+- `docs/AO_CABLE_V1_DESIGN.md` § 4.3 (fade envelope reference in
+  helper render branch).
+- `results/vbcable_pipeline_analysis.md` § 7.3 (VB fade envelope
+  reference).
 
 ## Goal
 
-Flip the render branch of `AoCableAdvanceByQpc` from shadow mode to
-real audible owner: linearize DMA window into per-stream scratch,
-call `AoRingWriteFromScratch`, advance `MonoFramesLow / Mirror` and
-`DmaCursorFrames`. The legacy `UpdatePosition` cable-render branch
-stays in place but becomes redundant — it will be retired in Step 2.
+Define and implement the 96-entry fade-in envelope that suppresses
+packet-boundary clicks, matching the VB pattern. This step **only**
+introduces the helper functions; it does not invoke them yet.
+
+The envelope must be in place before Step 1's atomic flip, because
+Step 1 calls `AoApplyFadeEnvelope` from the helper render branch
+during the legacy → helper audible-ownership transition.
 
 ## Planned Files
 
 Edit only:
 
-- `Source/Utilities/transport_engine.cpp` — render branch of helper.
+- `Source/Utilities/transport_engine.cpp` — define
+  `g_aoFadeEnvelope[96]` (or 95-entry table with explicit bounds),
+  implement `AoApplyFadeEnvelope` and `AoResetFadeCounter`.
+- `Source/Utilities/transport_engine.h` — declarations.
 
 ## Required Edits
 
-Replace the shadow-only render branch with the real flow:
-
 ```c
-if (!rt->IsCapture) {
-    ULONG bytes = advance * rt->BlockAlign;
-    LinearizeDmaWindowToScratch(rt, bytes);
-    NTSTATUS s = AoRingWriteFromScratch(rt->Pipe,
-                                        rt->CableScratchBuffer,
-                                        advance,
-                                        rt->SampleRate,
-                                        rt->Channels,
-                                        rt->BitsPerSample);
-    if (NT_SUCCESS(s)) {
-        AoApplyFadeEnvelope((LONG*)rt->CableScratchBuffer,
-                            advance * rt->Channels,
-                            &rt->FadeSampleCounter);
-        rt->DmaCursorFrames = (rt->DmaCursorFrames + advance)
-                              % (rt->DmaBufferSize / rt->BlockAlign);
-        rt->MonoFramesLow    += advance;
-        rt->MonoFramesMirror += advance;
+static const SHORT g_aoFadeEnvelope[96] = { /* per VB ... */ };
+
+VOID
+AoApplyFadeEnvelope(LONG* samples, ULONG sampleCount, LONG* perStreamCounter)
+{
+    LONG counter = *perStreamCounter;
+    for (ULONG i = 0; i < sampleCount; ++i) {
+        if (counter >= 0) {
+            /* fully ramped; no envelope */
+        } else {
+            ULONG idx = (ULONG)(counter + 96);
+            if (idx < ARRAYSIZE(g_aoFadeEnvelope)) {
+                samples[i] = (samples[i] * g_aoFadeEnvelope[idx]) >> 7;
+            }
+            counter++;
+        }
     }
-    /* Hard-reject overflow simply does not advance cursors —
-     * the next tick will re-attempt with the same backing data
-     * after the consumer drains. */
+    *perStreamCounter = counter;
+}
+
+VOID
+AoResetFadeCounter(PAO_STREAM_RT rt)
+{
+    rt->FadeSampleCounter = -96;  /* pre-silence prefix */
 }
 ```
+
+`AoResetFadeCounter` is invoked at packet-boundary transitions —
+specifically, on RUN entry and on any deliberate position
+reinitialization.
 
 ## Rules
 
 - Tell the user before editing.
-- Hard-reject overflow path **does not** retry, swap, or fall back.
-  Counter increments and helper returns. Same-tick caller behavior
-  is unchanged.
-- Capture branch stays in shadow mode until Phase 5.
+- Do not yet wire `AoApplyFadeEnvelope` into the helper render branch.
+  Step 1 does that as part of the atomic flip.
+- The envelope must operate on the **scratch buffer before** the ring
+  write; Step 1 enforces this ordering. (Review #15 of 8afa59a:
+  applying the fade after the ring write affects nothing audible.)
 
 ## Acceptance Criteria
 
 - [ ] Build clean.
-- [ ] Local sine loopback on Cable A render → capture preserves the
-      sine without audible glitches in steady state.
-- [ ] `OverflowCounter` stays 0 in steady state.
-- [ ] `MonoFramesLow` advances at a rate matching the input frame
-      flow (verify via `test_stream_monitor.py`).
-- [ ] No regression in Cable B (independent ring).
+- [ ] Forced-discontinuity unit test (call `AoApplyFadeEnvelope` on a
+      step-discontinuous synthetic input) shows the envelope smoothing
+      the discontinuity over ~96 samples.
+- [ ] Steady-state speech is unaffected (counter at 0, envelope is a
+      no-op).
+- [ ] `AoResetFadeCounter` arms the counter to -96.
 
 ## What This Step Does NOT Do
 
-- Does not yet remove the legacy `UpdatePosition` cable-render
-  branch. It runs in parallel and now is **redundant**, not
-  authoritative.
-- Does not flip capture audible.
+- Does not call `AoApplyFadeEnvelope` from the helper. Step 1 does
+  that.
+- Does not flip render audible ownership. Step 1 does that.
 
 ## Completion
 
 ```powershell
-python scripts/execute.py mark 4-render-coupling 0 completed --message "Render helper writes audibly; legacy parallel still active."
+python scripts/execute.py mark 4-render-coupling 0 completed --message "Fade envelope helper defined; not yet wired into helper."
 ```

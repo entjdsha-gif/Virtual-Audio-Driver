@@ -4,9 +4,16 @@ These files are kept for historical reference only. They are **not** the current
 
 ## Current source of truth
 
-- **Architecture (single source):** `docs/AO_FIXED_PIPE_ARCHITECTURE.md`
-- **Roadmap / current state:** `docs/CURRENT_STATE.md`
-- **Evidence (Ghidra/WinDbg):** `results/vbcable_*.md`, `results/ghidra_decompile/`, `results/ghidra_logs/`, `results/phase6_vb_verification.md`, `results/vb_session.log`
+- **Product identity:** `docs/PRD.md`
+- **Architecture decisions:** `docs/ADR.md`
+- **Architecture overview:** `docs/AO_CABLE_V1_ARCHITECTURE.md`
+- **Detailed design:** `docs/AO_CABLE_V1_DESIGN.md`
+- **Review policy:** `docs/REVIEW_POLICY.md`
+- **VB-Cable RE evidence (canonical):** `results/vbcable_capture_contract_answers.md`
+  (deep decompile verification; offsets/counters/SRC math grounded in
+  `results/ghidra_decompile/vbcable_all_functions.c`).
+  Other `results/vbcable_*.md` files are earlier/coarser analyses; treat
+  `vbcable_capture_contract_answers.md` as authoritative when they conflict.
 
 ## What is archived here and why
 
@@ -32,6 +39,12 @@ These files are kept for historical reference only. They are **not** the current
 
 - `AO_V2_ARCHITECTURE_PLAN.md` — V2 SessionPassthrough plan. Superseded; the V2 audio core was abandoned (`feature/ao-pipeline-v2` is frozen reference).
 - `MILESTONES_M1-M6_ACHIEVED.md` — completed milestones M1/M2 (build/install + 16-channel selectable). Recorded for product history.
+- `AO_TELEPHONY_V1_VB_MANUAL_COMPARISON.md` — early "AO vs VB-Cable manual"
+  comparison written during the AO Telephony V1 effort. **Not VB-Cable
+  reverse engineering** — its own header (line 10) states "does not claim
+  to reverse engineer VB-Cable." Misnamed in the original docs/ tree as
+  `VB_CABLE_PATH_ANALYSIS.md`. Renamed and archived to remove confusion;
+  the canonical VB RE base is `results/vbcable_capture_contract_answers.md`.
 
 ## Re-reading rule
 

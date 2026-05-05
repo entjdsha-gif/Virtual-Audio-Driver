@@ -103,6 +103,16 @@ typedef struct _FRAME_PIPE {
     LONG        UnderrunCounter;       // read-insufficient hits
     UCHAR       UnderrunFlag;          // 1 = in recovery (silence until WrapBound/2)
 
+    // Persistent SRC state — must survive across calls so the linear-interp
+    // accumulator does not reset at every chunk boundary. VB-Cable carries
+    // the same kind of state per ring (RE: vbcable_capture_contract_answers.md
+    // § 0, +0xB8 phase + +0xBC..+0xFB per-channel residual). 16 channel slots
+    // mirror `Channels`.
+    LONG        WriteSrcPhase;         // accumulator phase (write direction)
+    LONG        WriteSrcResidual[16];  // per-channel residual carry
+    LONG        ReadSrcPhase;          // accumulator phase (read direction)
+    LONG        ReadSrcResidual[16];   // per-channel residual carry
+
     // Backing storage — INT32 array of size WrapBound * Channels
     LONG*       Data;
     SIZE_T      DataAllocBytes;
@@ -149,15 +159,7 @@ acquire(pipe->Lock);
 
 reconcile_wrapbound_to_target(pipe);  // grow/shrink WrapBound toward TargetLatencyFrames
 
-available = AoRingAvailableSpaceFrames(pipe);  // WrapBound - currentFill - 2
-
-if (frames > available) {
-    pipe->OverflowCounter += 1;
-    release(pipe->Lock);
-    return STATUS_INSUFFICIENT_RESOURCES;
-}
-
-// GCD divisor selection
+// GCD divisor selection FIRST (so capacity check uses output ring frames).
 divisor = pickGCD(srcRate, pipe->InternalRate, [300, 100, 75]);
 if (divisor < 0) {
     release(pipe->Lock);
@@ -166,11 +168,24 @@ if (divisor < 0) {
 srcRatio = srcRate / divisor;
 dstRatio = pipe->InternalRate / divisor;
 
-// Per-channel linear-interp accumulator
+// Capacity check uses OUTPUT ring frames — for 44.1k → 48k expansion,
+// the actual ring write count is larger than the input frame count.
+ringFramesToWrite = ((uint64_t)frames * dstRatio) / srcRatio;
+available = AoRingAvailableSpaceFrames(pipe);  // WrapBound - currentFill - 2
+                                               // (single source of guard)
+
+if (ringFramesToWrite > available) {
+    pipe->OverflowCounter += 1;
+    release(pipe->Lock);
+    return STATUS_INSUFFICIENT_RESOURCES;
+}
+
+// Per-channel linear-interp accumulator — uses pipe->WriteSrcPhase and
+// pipe->WriteSrcResidual[] which persist across calls (VB parity).
 for (i = 0; i < frames; ++i) {
     for (ch = 0; ch < min(srcChannels, pipe->Channels); ++ch) {
-        sample = read_and_normalize_to_int19(scratch, srcBits, ch);  // 8/16/24/32 dispatch
-        // weighted accumulator linear interp...
+        sample = read_and_normalize_to_int19(scratch, srcBits, ch);  // 8/16/24/32 dispatch per § 2.5
+        // weighted accumulator linear interp using pipe->WriteSrcResidual[ch]...
         write_int32_to_ring(pipe, slot(ch, frame), interpolated);
     }
     pipe->WritePos = (pipe->WritePos + 1) % pipe->WrapBound;
@@ -214,13 +229,28 @@ return STATUS_SUCCESS;
 
 ### 2.5 Bit-depth dispatch
 
+The ring stores values in a **19-bit signed-magnitude** representation
+(range ≈ `[-2^18, +2^18]`) regardless of client bit depth. This gives
+~13 bits of headroom for the linear-interp accumulator and avoids
+overflow across channel/rate combinations.
+
+V1 supports the `KSDATAFORMAT_SUBTYPE_PCM` subtype only (see ADR-008
+and § 8 below). `KSDATAFORMAT_SUBTYPE_IEEE_FLOAT` is **not** advertised
+in `KSDATARANGE` and **must** be rejected at intersection time. The
+dispatch table therefore covers PCM widths only:
+
 | Bits | Read (scratch → INT32 ring) | Write (INT32 ring → scratch) |
 |---|---|---|
-| 8 | `(byte - 0x80) << 11` | `(int >> 11) + 0x80` |
-| 16 | `(int)short << 3` | `int >> 3` |
-| 24 | `((b0 \| (b1<<8) \| (b2<<16)) << 8) >> 13` | `int << 5` then write 3 bytes |
-| 32 (PCM) | direct copy | direct copy |
-| 32 (FP) | `(int)(float * (1<<19))` clamped | `(int)((float)int / (1<<19))` |
+| 8 PCM (unsigned) | `(byte - 0x80) << 11` | `(int >> 11) + 0x80` |
+| 16 PCM (signed) | `(int)int16 << 3` | `int >> 3` |
+| 24 PCM (signed, packed) | `((b0 \| (b1<<8) \| (b2<<16)) << 8) >> 13` | `int << 5` then pack 3 bytes |
+| 32 PCM (signed) | `(int)int32 >> 13` | `int << 13` |
+
+**32-bit PCM is *not* a direct copy** — full-range INT32 input must be
+right-shifted by 13 to fit the 19-bit ring representation, and ring
+samples must be left-shifted by 13 on read to restore full INT32 range.
+Direct copy would let 32-bit PCM clients bypass the headroom invariant
+and overflow the SRC accumulator (#7 from review of 8afa59a).
 
 Branch on `bits` once, outside the per-frame loop, for performance.
 
@@ -473,10 +503,23 @@ NTSTATUS SetState(KSSTATE NewState)
             AoTransportOnRunEx(&snap);
             break;
         case KSSTATE_PAUSE:
-            if (m_pTransportRt) AoTransportOnPauseEx(m_pTransportRt);
+            if (m_pTransportRt) {
+                /* ADR-009: drain any DPC that has already snapshotted
+                 * this rt before zeroing per-stream cursor state.
+                 * Without this, the in-flight helper would write to a
+                 * struct that OnPauseEx is concurrently zeroing. */
+                KeFlushQueuedDpcs();
+                AoTransportOnPauseEx(m_pTransportRt);
+            }
             break;
         case KSSTATE_STOP:
-            if (m_pTransportRt) AoTransportOnStopEx(m_pTransportRt);
+            if (m_pTransportRt) {
+                /* Same DPC-drain requirement as PAUSE; OnStopEx also
+                 * resets SRC phase / residual on the FRAME_PIPE per
+                 * Phase 1 Step 0. */
+                KeFlushQueuedDpcs();
+                AoTransportOnStopEx(m_pTransportRt);
+            }
             break;
         case KSSTATE_ACQUIRE:
             // no-op for cable
@@ -506,6 +549,40 @@ NTSTATUS SetState(KSSTATE NewState)
     // remaining cleanup (DMA buffer, port stream release, etc.)
 }
 ```
+
+### 5.4 `FreeAudioBuffer` ordering (DMA buffer lifetime)
+
+`AO_STREAM_RT::DmaBuffer` is a non-owning pointer into the WaveRT-mapped
+DMA buffer; PortCls owns the allocation via
+`IMiniportWaveRTStream::AllocateAudioBuffer` /
+`IMiniportWaveRTStream::FreeAudioBuffer`. If `FreeAudioBuffer` runs
+while a transport DPC or canonical helper is mid-call holding a transient
+ref to the same `AO_STREAM_RT`, the DPC will dereference an unmapped
+buffer (use-after-free, BSOD).
+
+The unwind contract on every path that reaches `FreeAudioBuffer`
+(destructor, `KSSTATE_STOP` from a session that allocated, error rollback
+from `AllocateAudioBuffer` failure):
+
+```c
+// Required ordering — no exceptions:
+1. AoTransportUnregister(m_pTransportRt);  // remove from engine active list
+                                           // (engine timer DPC stops snapshotting this rt)
+2. KeFlushQueuedDpcs();                    // drain any DPC that already snapshotted
+                                           // and is mid-helper-call
+3. Wait until rt->RefCount == 0            // any transient helper ref completes
+                                           // (engine-side ref-count discipline,
+                                           //  ADR-009 § Consequences)
+4. m_pTransportRt->DmaBuffer     = NULL;   // publish "buffer is gone" before unmap
+   m_pTransportRt->DmaBufferSize = 0;      //   so any late observer sees NULL, not stale
+5. FreeAudioBuffer();                      // PortCls unmaps; the buffer is gone.
+6. (destructor only) AoTransportFreeStreamRt(rt);
+```
+
+The transport helper must additionally guard reads of `rt->DmaBuffer`
+and treat `NULL` as "this stream is unmapping; no-op the render/capture
+copy this tick." This guard is cheap (a single compare under
+`PositionLock`) and closes the late-DPC race. (Review #11 of 8afa59a.)
 
 ---
 

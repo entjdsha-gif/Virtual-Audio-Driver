@@ -128,33 +128,48 @@ position freshness. Every active call source funnels into it. Pseudocode
 
 ```c
 AoCableAdvanceByQpc(rt, nowQpcRaw, reason, flags) {
-    lock(rt->PositionLock);
+    // KeAcquireSpinLockRaiseToDpc returns the old IRQL — capture it.
+    oldIrql = KeAcquireSpinLockRaiseToDpc(&rt->PositionLock);
 
     apply_drift_correction(rt, nowQpcRaw);                    // 63/64 phase
     nowQpc100ns  = AoQpcTo100ns(nowQpcRaw);
-    elapsed      = ((nowQpc100ns - rt->AnchorQpc100ns)
+
+    // Long-window rebase BEFORE elapsed/advance calc — the rebase tick
+    // consumes itself; next tick measures fresh elapsed against new anchor.
+    elapsedProbe = ((nowQpc100ns - rt->AnchorQpc100ns)
                      * rt->SampleRate) / 10000000ULL;
-    advance      = elapsed - rt->PublishedFramesSinceAnchor;
-
-    if (advance < 8) { unlock; return; }                      // 8-frame gate
-
-    if (elapsed >= ((uint64_t)rt->SampleRate << 7)) {         // ~128 s long-window rebase
-        rt->PublishedFramesSinceAnchor = 0;
+    if (elapsedProbe >= ((uint64_t)rt->SampleRate << 7)) {    // ~128 s
         rt->AnchorQpc100ns             = nowQpc100ns;
+        rt->PublishedFramesSinceAnchor = 0;
+        rt->LastAdvanceDelta           = 0;
+        KeReleaseSpinLock(&rt->PositionLock, oldIrql);
+        return;
+    }
+
+    elapsed = elapsedProbe;
+    advance = (LONG)(elapsed - rt->PublishedFramesSinceAnchor);
+
+    if (advance < 8) {                                         // 8-frame gate
+        KeReleaseSpinLock(&rt->PositionLock, oldIrql);
+        return;
     }
 
     if ((uint32_t)advance > (rt->SampleRate / 2)) {           // overrun guard
         AoHandleAdvanceOverrun(rt, reason, advance);
-        unlock; return;
+        KeReleaseSpinLock(&rt->PositionLock, oldIrql);
+        return;
     }
 
     if (!rt->IsCapture) {                                      // RENDER
         bytes = advance * rt->BlockAlign;
         linearize_dma_window_to_scratch(rt, bytes);
+        // Fade envelope applied to scratch BEFORE ring write — otherwise
+        // the un-faded samples are already in the ring and the fade
+        // affects nothing audible (#15 from review of 8afa59a).
+        AoApplyFadeEnvelope(rt->ScratchBuffer, advance, &rt->FadeSampleCounter);
         AoRingWriteFromScratch(rt->Pipe, rt->ScratchBuffer,
                                advance, rt->SampleRate,
                                rt->Channels, rt->BitsPerSample);
-        AoApplyFadeEnvelope(rt->ScratchBuffer, advance, &rt->FadeSampleCounter);
         advance_render_cursors(rt, advance, bytes);
     } else {                                                   // CAPTURE
         bytes = advance * rt->BlockAlign;
@@ -178,7 +193,7 @@ AoCableAdvanceByQpc(rt, nowQpcRaw, reason, flags) {
     rt->LastAdvanceDelta            = advance;
     rt->PublishedFramesSinceAnchor  = (uint32_t)elapsed;
 
-    unlock(rt->PositionLock);
+    KeReleaseSpinLock(&rt->PositionLock, oldIrql);
 }
 ```
 

@@ -2,25 +2,20 @@
   "phase": "4-render-coupling",
   "project": "AO Cable V1",
   "status": "planned",
-  "summary": "Flip cable render audible ownership to AoCableAdvanceByQpc; legacy UpdatePosition cable-render branch becomes a thin shim or no-op.",
+  "summary": "Atomically flip cable render audible ownership to AoCableAdvanceByQpc; legacy UpdatePosition / WriteBytes cable-render branches retired in the same commit (no transient parallel owner).",
   "steps": [
     {
       "step": 0,
-      "name": "render-helper-real-write",
+      "name": "fade-envelope-helper",
       "status": "pending"
     },
     {
       "step": 1,
-      "name": "fade-envelope-on-render",
+      "name": "render-audible-flip-atomic",
       "status": "pending"
     },
     {
       "step": 2,
-      "name": "retire-legacy-render-path",
-      "status": "pending"
-    },
-    {
-      "step": 3,
       "name": "live-call-render-validation",
       "status": "pending"
     }

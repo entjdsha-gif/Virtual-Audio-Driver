@@ -6,7 +6,7 @@
   "steps": [
     {
       "step": 0,
-      "name": "rate-aware-frame-gate",
+      "name": "rate-aware-frame-gate-deferred",
       "status": "pending"
     },
     {

@@ -22,9 +22,18 @@ Edit only:
 ## Required Edits
 
 Mirror image of Step 1, but operating on the read direction. Per-channel
-accumulator + residual carry. Sample read from ring at internal rate is
-already INT32 normalized; linear-interpolate to the destination rate
-ticks; format-denormalize at write-to-scratch.
+accumulator + residual carry **persists on `FRAME_PIPE`**:
+`pipe->ReadSrcPhase` and `pipe->ReadSrcResidual[]` (separate from the
+write-direction state added in Step 1 via Phase 1 Step 0). Sample read
+from ring at internal rate is already INT32 19-bit normalized;
+linear-interpolate to the destination rate ticks; format-denormalize
+at write-to-scratch per § 2.5.
+
+Capacity check is mirrored from Step 1: compute `ringFramesNeeded =
+(frames * srcRatio) / dstRatio` first; if `AoRingAvailableFrames(pipe)
+< ringFramesNeeded`, trigger underrun (`UnderrunFlag = 1`,
+`UnderrunCounter++`, zero-fill scratch) — the count is in **input ring
+frames needed**, not output dst frames.
 
 Specifically, where Step 1 normalizes input to ring INT32, Step 2
 denormalizes ring INT32 to output format **only at output ticks**, not

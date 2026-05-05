@@ -140,12 +140,17 @@ is:
 
 | Input format          | Conversion to ring INT32                        |
 |-----------------------|-------------------------------------------------|
-| 8-bit unsigned        | `(byte - 0x80) << 11`                           |
-| 16-bit signed         | `(int)short << 3`                               |
+| 8-bit unsigned PCM    | `(byte - 0x80) << 11`                           |
+| 16-bit signed PCM     | `(int)int16 << 3`                               |
 | 24-bit packed signed  | `(3-byte assembled << 8) >> 13`                 |
-| 32-bit (PCM int / FP) | direct copy / reinterpret                       |
+| 32-bit signed PCM     | `(int)int32 >> 13`                              |
 
-Read path inverts (`>> 11`, `>> 3`, `<< 5` then 3-byte pack, direct copy).
+Read path inverts (`>> 11`, `>> 3`, `<< 5` then 3-byte pack, `<< 13`).
+V1 supports `KSDATAFORMAT_SUBTYPE_PCM` only (see ADR-008);
+`KSDATAFORMAT_SUBTYPE_IEEE_FLOAT` is rejected at intersection. 32-bit
+PCM is **not** a direct copy — the full INT32 range must be normalized
+to 19-bit before entering the ring so the SRC accumulator's 13-bit
+headroom invariant holds.
 
 Ring layout fields: `TargetLatencyFrames`, `WrapBound` (current depth),
 `FrameCapacityMax`, `Channels`, `WritePos` (frames), `ReadPos` (frames),
@@ -466,7 +471,15 @@ V1 KSDATARANGE accepts:
   176400, 192000 Hz (the rates that GCD-divide cleanly by 300, 100, or 75
   against the registry-driven internal rate).
 - **Bit depths**: 8 (PCM uint), 16 (PCM int), 24 (packed PCM int), 32
-  (PCM int and IEEE float).
+  (PCM int).
+- **Subtype**: `KSDATAFORMAT_SUBTYPE_PCM` only.
+  `KSDATAFORMAT_SUBTYPE_IEEE_FLOAT` is **not** advertised; the
+  intersection handler must reject IEEE_FLOAT requests with
+  `STATUS_NO_MATCH`. Rationale: distinguishing 32-bit PCM from 32-bit
+  float at the cable transport API requires plumbing `SubFormat` /
+  `ValidBitsPerSample` through every SRC entry point (`AoRingWrite/Read
+  FromScratch`); for V1 ship parity with VB-Cable we constrain to PCM
+  and defer float to a post-V1 ADR.
 - **Channels**: 1 (mono), 2 (stereo).
 
 OEM Default Format (advertised in INF for shared-mode default): **48 kHz

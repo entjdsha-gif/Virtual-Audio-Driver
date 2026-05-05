@@ -9,9 +9,15 @@
 
 ## Goal
 
-Expose Phase 1 ring counters (`OverflowCounter`, `UnderrunCounter`,
-`UnderrunFlag`, current ring fill in frames) through
-`IOCTL_AO_GET_STREAM_STATUS` so user-mode can observe them.
+Expose Phase 1 ring counters and the underrun-recovery flag state
+through `IOCTL_AO_GET_STREAM_STATUS` so user-mode can observe them:
+`OverflowCounter`, `UnderrunCounter`, `UnderrunFlag` (drained
+boolean), current ring fill in frames, and current `WrapBound`.
+
+The flag is exposed because counters alone cannot prove the
+50%-`WrapBound` recovery path is operating correctly — a stream that
+sits in `UnderrunFlag = 1` for an extended period is broken even if
+`UnderrunCount` is small. (Review #4 of 8afa59a.)
 
 Since the diagnostics rule (REVIEW_POLICY § 7) requires that
 `ioctl.h`, `adapter.cpp`, and `test_stream_monitor.py` are updated
@@ -22,13 +28,15 @@ together, this is one atomic step.
 Edit only:
 
 - `Source/Main/ioctl.h` — extend `AO_V2_DIAG` with per-cable
-  ring counters: `<Cable>_OverflowCount`, `<Cable>_UnderrunCount`,
-  `<Cable>_RingFillFrames`, `<Cable>_WrapBoundFrames`. Bump
-  `StructSize` and the `C_ASSERT` shape check.
+  ring counters and state: `<Cable>_OverflowCount`,
+  `<Cable>_UnderrunCount`, `<Cable>_UnderrunFlag` (UCHAR; 0 = normal,
+  1 = drained-recovery), `<Cable>_RingFillFrames`,
+  `<Cable>_WrapBoundFrames`. Bump `StructSize` and the `C_ASSERT`
+  shape check.
 - `Source/Main/adapter.cpp` — extend `IOCTL_AO_GET_STREAM_STATUS`
   handler to fill the new fields from the cable `FRAME_PIPE`s.
 - `test_stream_monitor.py` — read the new fields and print per-cable
-  ring health.
+  ring health, including the underrun flag state.
 
 ## Rules
 
@@ -41,13 +49,28 @@ Edit only:
 ## Acceptance Criteria
 
 - [ ] Build clean.
-- [ ] `test_stream_monitor.py` shows 0/0 for both cables in steady
-      state, with `RingFillFrames` oscillating in a sane band around
-      `TargetLatencyFrames`.
+- [ ] `test_stream_monitor.py` shows 0/0 for `OverflowCount` /
+      `UnderrunCount` on both cables in steady state.
+- [ ] `WrapBoundFrames == TargetLatencyFrames` (default 7168 @ 48k
+      after `reconcile_wrapbound_to_target` settles). This is the
+      ring **capacity**, not the steady-state fill.
+- [ ] `RingFillFrames` is in a small live-latency band — typically
+      well below `TargetLatencyFrames` (a few hundred frames at
+      48 kHz, depending on writer/reader cadence). Fill ≈ capacity
+      means the ring is full and overflow is imminent; fill ≈ 0 with
+      `UnderrunFlag = 0` means writer is keeping up with reader. Both
+      are healthy. Fill drifting upward toward capacity over time is
+      a leak.
+- [ ] `UnderrunFlag` is `0` in steady state. It is allowed to flicker
+      to `1` at startup or under transient stalls, but must clear
+      back to `0` within one fill cycle (≤ `WrapBound / 2` frames of
+      writer activity).
 - [ ] Forced overflow scenario from Step 1 increments
       `<Cable>_OverflowCount` visible in `test_stream_monitor.py`.
 - [ ] Forced underrun scenario from Step 4 increments
-      `<Cable>_UnderrunCount` visible in `test_stream_monitor.py`.
+      `<Cable>_UnderrunCount` AND sets `<Cable>_UnderrunFlag` to `1`,
+      visible in `test_stream_monitor.py`. Flag clears to `0` after
+      ring refills past `WrapBound / 2`.
 
 ## What This Step Does NOT Do
 

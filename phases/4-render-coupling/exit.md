@@ -2,11 +2,12 @@
 
 ## Exit Gate
 
-- [ ] Steps 0..3 marked completed.
+- [ ] Steps 0..2 marked completed.
 - [ ] Build clean.
 - [ ] Live AO call render quality matches VB on the same path.
 - [ ] Cable A and Cable B render both stable.
-- [ ] Legacy `UpdatePosition` cable-render branch is no-op for cable.
+- [ ] Legacy `UpdatePosition` and `WriteBytes` cable-render branches
+      are no-op for cable streams (retired atomically in Step 1).
 - [ ] No regression in non-cable streams.
 
 ## Outcome

@@ -75,6 +75,12 @@ Do not touch in this step:
        LONG        UnderrunCounter;
        UCHAR       UnderrunFlag;
 
+       /* Persistent SRC state — survives across calls (VB parity). */
+       LONG        WriteSrcPhase;
+       LONG        WriteSrcResidual[16];
+       LONG        ReadSrcPhase;
+       LONG        ReadSrcResidual[16];
+
        LONG*       Data;
        SIZE_T      DataAllocBytes;
    } FRAME_PIPE, *PFRAME_PIPE;
@@ -93,11 +99,14 @@ Do not touch in this step:
      `TargetLatencyFrames = WrapBound = initialFrames`,
      `FrameCapacityMax = max(initialFrames, registry-driven max)`,
      zeros `WritePos/ReadPos/OverflowCounter/UnderrunCounter/
-     UnderrunFlag`, initializes the spinlock.
+     UnderrunFlag/WriteSrcPhase/WriteSrcResidual/ReadSrcPhase/
+     ReadSrcResidual`, initializes the spinlock.
    - `FramePipeFree(pipe)` releases `Data` and zeros the struct.
-   - `FramePipeResetCable(pipe)` zeros `WritePos/ReadPos/UnderrunFlag`
-     (does **not** zero counters — those persist across pause cycles for
-     diagnostics).
+   - `FramePipeResetCable(pipe)` zeros `WritePos/ReadPos/UnderrunFlag/
+     WriteSrcPhase/WriteSrcResidual/ReadSrcPhase/ReadSrcResidual` (SRC
+     state belongs to the *current* stream session — Stop/Start must
+     start fresh phase). Does **not** zero counters — those persist
+     across pause cycles for diagnostics.
 
 4. Confirm existing callers in `Source/Utilities/loopback.cpp` (any
    helper that touches the old packed-24 fields) compile with the new

@@ -32,29 +32,44 @@ if (!NT_SUCCESS(st)) {
     return st;  /* STATUS_NOT_SUPPORTED */
 }
 
-/* Per-channel accumulator state; lives on stack since SRC is one-shot
- * per call. The persistent SRC state lives on the pipe struct only if
- * the same-call-spans-multiple-frames pattern needs it (it does for
- * proper continuous SRC; allocate as needed). */
-LONG accumulator[16] = {0};   /* internal channel slots */
-LONG residual[16]    = {0};
+/* Compute output ring frames first; capacity check uses the OUTPUT
+ * count, not the input count (44.1k → 48k expansion writes more
+ * frames than it consumes — see #6 from review). */
+ULONG ringFramesToWrite = (ULONG)(((ULONGLONG)frames * ratio.DstRatio)
+                                  / ratio.SrcRatio);
+LONG  available = AoRingAvailableSpaceFrames_Locked(pipe);
+if ((LONG)ringFramesToWrite > available) {
+    pipe->OverflowCounter++;
+    KeReleaseSpinLock(&pipe->Lock, oldIrql);
+    return STATUS_INSUFFICIENT_RESOURCES;
+}
 
-/* per-frame interp loop — see vbcable_disasm_analysis.md FUN_1400026a0
- * and vbcable_pipeline_analysis.md § 6.3 for the VB pattern. */
+/* Per-channel accumulator state lives on FRAME_PIPE
+ * (pipe->WriteSrcPhase + pipe->WriteSrcResidual[]) and persists
+ * across calls so the linear-interp phase does not reset at every
+ * chunk boundary. VB parity: vbcable_capture_contract_answers.md § 0
+ * (+0xB8 phase, +0xBC.. residual) and FUN_1400017ac:588/1013. */
+
+/* per-frame interp loop — see vbcable_pipeline_analysis.md § 6.3 and
+ * the FUN_1400026a0 / FUN_1400017ac decompile in
+ * results/ghidra_decompile/vbcable_all_functions.c for the VB pattern. */
 for (ULONG f = 0; f < frames; ++f) {
-    /* read input, normalize to 19-bit, weighted-blend into output slot,
-     * advance per-channel residual carry, write to ring on each
-     * dst-tick, advance WritePos. */
+    /* read input, normalize to 19-bit per § 2.5 of DESIGN,
+     * weighted-blend into output slot using pipe->WriteSrcResidual[ch]
+     * as carry, advance per-channel residual, advance pipe->WriteSrcPhase,
+     * write to ring on each dst-tick, advance WritePos. */
     ...
 }
 ```
 
 The exact accumulator math is implementation-level; specifically, the
-residual carry pattern from `vbcable_disasm_analysis.md` § 3.3:
+residual carry pattern from VB:
 
 ```c
-output[ch] = (accumulator[ch] * dst_ratio + residual[ch] * src_ratio)
-             / total_ratio;
+output[ch] = (input_sample * ratio.DstRatio +
+              pipe->WriteSrcResidual[ch] * ratio.SrcRatio)
+             / (ratio.SrcRatio + ratio.DstRatio);
+pipe->WriteSrcResidual[ch] = output[ch];   /* carry into next frame */
 ```
 
 ## Rules

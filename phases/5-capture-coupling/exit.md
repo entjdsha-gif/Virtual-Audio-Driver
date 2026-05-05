@@ -2,8 +2,8 @@
 
 ## Exit Gate
 
-- [ ] Steps 0..2 marked completed.
-- [ ] Live-call parity with VB-Cable confirmed (Step 2 acceptance).
+- [ ] Steps 0..1 marked completed.
+- [ ] Live-call parity with VB-Cable confirmed (Step 1 acceptance).
 - [ ] All forbidden-compromises (CLAUDE.md / AGENTS.md) are absent
       from cable code path:
       - no packed 24-bit ring;

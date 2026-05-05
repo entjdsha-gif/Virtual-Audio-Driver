@@ -66,6 +66,25 @@ Reject any change that:
 - Copies fresh code from `feature/ao-pipeline-v2` (frozen reference) without
   cherry-pick discipline.
 - Changes architecture only to make a build error disappear.
+- Treats `TargetLatencyFrames` (default 7168 @ 48 kHz) as a steady-state
+  *fill* target. `TargetLatencyFrames` is the ring **capacity** (the value
+  `WrapBound` reaches). Steady-state ring **fill** (writer-vs-reader
+  in-flight) is a small live-latency band (typically a few ms). Any
+  diagnostic / acceptance criterion that asserts fill ≈ `TargetLatencyFrames`
+  is rejecting healthy state and accepting buffer-full / overflow risk.
+- Hides hysteresis state (`UnderrunFlag` / drained boolean) from the
+  diagnostics IOCTL. Counters alone cannot prove the 50%-`WrapBound`
+  underrun-recovery path is operating correctly; the flag state must be
+  observable through `AO_V2_DIAG`.
+- Splits an audible-ownership transition across two commits. A render or
+  capture flip from legacy → helper must atomically retire the legacy
+  owner in the same commit; no commit may leave two transport owners
+  simultaneously active for the same audible direction. (See ADR-006:
+  one canonical helper.)
+- Resizes `WrapBound` past `FrameCapacityMax`, or in a way that places
+  `WritePos` / `ReadPos` outside the new bound. Latency reconciliation
+  must clamp to `[currentFill + guard, FrameCapacityMax]` and must run
+  while holding `pipe->Lock`.
 
 ## 3. API Sequence Validation
 

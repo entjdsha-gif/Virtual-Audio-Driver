@@ -35,13 +35,40 @@ AoCableAdvanceByQpc(PAO_STREAM_RT rt,
                     AO_ADVANCE_REASON reason,
                     ULONG         flags)
 {
-    KIRQL oldIrql;
-    KeAcquireSpinLockRaiseToDpc(&rt->PositionLock);
+    /* KeAcquireSpinLockRaiseToDpc() RETURNS the old IRQL — capture it.
+     * The earlier draft passed an uninitialized KIRQL to KeReleaseSpinLock,
+     * which would corrupt scheduler state on restore (real BSOD trigger,
+     * #9 from review of 8afa59a). */
+    KIRQL oldIrql = KeAcquireSpinLockRaiseToDpc(&rt->PositionLock);
 
     /* drift correction (ADR-007) */
     apply_drift_correction(rt, nowQpcRaw);
 
     ULONGLONG nowQpc100ns = AoQpcTo100ns(nowQpcRaw);
+
+    /* Long-window rebase BEFORE computing elapsed/advance — so the
+     * post-rebase elapsed is small (relative to the new anchor) and
+     * the publish step writes a consistent value. The earlier draft
+     * rebased mid-function and then republished the OLD elapsed into
+     * PublishedFramesSinceAnchor, which made the next call see an
+     * underflowed advance (#8 from review). */
+    {
+        ULONGLONG elapsedProbe = ((nowQpc100ns - rt->AnchorQpc100ns)
+                                  * rt->SampleRate) / 10000000ULL;
+        if (elapsedProbe >= ((ULONGLONG)rt->SampleRate << 7)) {
+            /* ~128 s of stream time at any rate has accumulated against
+             * the current anchor — re-anchor to "now" and zero the
+             * publication counter. This tick consumes the rebase; do
+             * not advance audible state. Next tick computes a fresh,
+             * small elapsed against the new anchor. */
+            rt->AnchorQpc100ns             = nowQpc100ns;
+            rt->PublishedFramesSinceAnchor = 0;
+            rt->LastAdvanceDelta           = 0;
+            KeReleaseSpinLock(&rt->PositionLock, oldIrql);
+            return;
+        }
+    }
+
     ULONGLONG elapsed = ((nowQpc100ns - rt->AnchorQpc100ns)
                          * rt->SampleRate) / 10000000ULL;
     LONG advance = (LONG)(elapsed - rt->PublishedFramesSinceAnchor);
@@ -57,12 +84,6 @@ AoCableAdvanceByQpc(PAO_STREAM_RT rt,
         }
         KeReleaseSpinLock(&rt->PositionLock, oldIrql);
         return;
-    }
-
-    /* long-window rebase (~128 s of stream time at any rate) */
-    if (elapsed >= ((ULONGLONG)rt->SampleRate << 7)) {
-        rt->PublishedFramesSinceAnchor = 0;
-        rt->AnchorQpc100ns = nowQpc100ns;
     }
 
     /* overrun guard */

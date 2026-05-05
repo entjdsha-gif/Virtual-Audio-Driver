@@ -1,95 +1,70 @@
-# Phase 4 Step 2: Retire legacy cable-render path
+# Phase 4 Step 2: Live-call render validation
 
 ## Read First
 
-- Phase 4 Step 0 (helper is audible owner now; legacy is redundant).
-- `docs/AO_CABLE_V1_DESIGN.md` § 5.2 (SetState cable branch),
-  § 5.3 (destructor).
+- Phase 4 Steps 0-1.
+- `tests/live_call/run_test_call.py` (existing live-call harness).
+- CLAUDE.md "Pre-Experiment Phone Link Connection Check" and
+  "Pre-Experiment Cable Check" sections — both are 엄수.
 
 ## Goal
 
-Make the legacy `CMiniportWaveRTStream::UpdatePosition` cable-render
-branch a thin shim or no-op for cable streams. Non-cable streams keep
-their existing behavior unchanged.
+Run the live-call test harness against AO Cable A render with the
+helper as audible owner. Confirm the render path (PC audio → call
+uplink) is at least as clean as VB-Cable.
 
 ## Planned Files
 
-Edit only:
+No source edits. Run-only step. Captured artifacts go under
+`tests/phase4-runtime/` (untracked).
 
-- `Source/Main/minwavertstream.cpp` — `UpdatePosition` cable branch,
-  `WriteBytes` cable branch, related cable transport call sites that
-  currently double as transport owners.
+## Procedure
 
-## Required Edits
+1. Pre-experiment Cable Check: confirm system default playback is
+   "AO Cable A", default recording is "AO Cable B" (or whichever
+   pairing the test harness expects).
+2. Pre-experiment Phone Link Check: confirm phone-side toggle ON,
+   Phone Link app on dialer state.
+3. Run AO baseline:
 
-In `UpdatePosition(LARGE_INTEGER ilQPC)`:
-
-```c
-VOID
-CMiniportWaveRTStream::UpdatePosition(LARGE_INTEGER ilQPC)
-{
-    if (IsCableStream(this) && m_pTransportRt) {
-        /* Cable transport is owned by AoCableAdvanceByQpc.
-         * UpdatePosition becomes a no-op for cable streams; it is
-         * kept in place because PortCls / WaveRT may still call it.
-         * The shared timer DPC and the GetPositions query path both
-         * already advance the helper.
-         *
-         * If we want UpdatePosition itself to be a wake source too,
-         * we may invoke the helper here with reason QUERY:
-         */
-        AoCableAdvanceByQpc(m_pTransportRt, ilQPC.QuadPart,
-                            AO_ADVANCE_QUERY, 0);
-        return;
-    }
-    /* non-cable legacy path — unchanged */
-    ...
-}
+```powershell
+$env:AUDIO_CABLE_PROFILE = "ao"
+cd tests\live_call
+python run_test_call.py
 ```
 
-In `WriteBytes(ULONG ByteDisplacement)`:
+4. User judges call quality (clean / garbled / silent), saves
+   judgment to `tests/phase4-runtime/ao_phase4_run1_judgment.txt`.
+5. Run VB comparison:
 
-```c
-VOID
-CMiniportWaveRTStream::WriteBytes(ULONG ByteDisplacement)
-{
-    if (IsCableStream(this)) {
-        /* Cable render fill is owned by AoCableAdvanceByQpc render
-         * branch. WriteBytes is a no-op for cable streams. */
-        return;
-    }
-    /* non-cable legacy path — unchanged */
-    ...
-}
+```powershell
+$env:AUDIO_CABLE_PROFILE = "vb"
+python run_test_call.py
 ```
 
-(Mirror for `ReadBytes` if it has cable branches that should be
-retired here. Capture-side `WriteBytes` retirement is Phase 5.)
-
-## Rules
-
-- Tell the user before editing each function.
-- Non-cable behavior is **strictly unchanged**.
-- Phase 5 capture coupling depends on retiring legacy capture write,
-  so Step 2 here only retires the **render** legacy paths, not
-  capture.
-- If a Phase 5 / pump-flag artifact still depends on
-  `UpdatePosition`'s cable side-effects, capture the dependency in
-  the commit message and address it in Phase 6 cleanup.
+6. User judges VB call quality.
+7. Compare AO vs VB. If AO < VB significantly, treat as
+   `BLOCKER` and investigate before marking step completed.
 
 ## Acceptance Criteria
 
-- [ ] Build clean.
-- [ ] Live test: cable render path still works correctly with the
-      legacy branch retired (helper is now sole audible owner).
-- [ ] Legacy advance counters at the stream level
-      (`m_ulPumpProcessedFrames` etc.) stop incrementing on cable
-      streams (only helper's `MonoFramesLow` does).
-- [ ] No regression in non-cable streams.
-- [ ] Cable render `OverflowCounter` stays 0 in steady state.
+- [ ] AO live call: user judgment **clean**, comparable to VB on the
+      same path.
+- [ ] STT transcript accuracy on AO: not garbled or hallucinating.
+- [ ] `test_stream_monitor.py` during AO call shows
+      `OverflowCounter` and `UnderrunCounter` both at 0 in steady
+      state, and `UnderrunFlag = 0`.
+- [ ] Capture path quality not worse than pre-Phase-4 baseline (capture
+      is still on legacy until Phase 5; this gate is "no render-side
+      regression caused capture-side quality drop").
+
+## What This Step Does NOT Do
+
+- Does not flip capture audible.
+- Does not test multi-format / multi-channel (Phase 7).
 
 ## Completion
 
 ```powershell
-python scripts/execute.py mark 4-render-coupling 2 completed --message "Legacy cable-render path retired; helper is sole owner."
+python scripts/execute.py mark 4-render-coupling 2 completed --message "Render live-call clean, parity with VB on render side."
 ```
