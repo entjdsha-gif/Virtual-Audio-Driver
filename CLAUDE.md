@@ -296,9 +296,12 @@ not improvise. `--no-ff` mandatory; squash and fast-forward forbidden.
 - Direct commits to `feature/ao-fixed-pipe-rewrite` for phase
   implementation work.
 - Squash or fast-forward merge of phase branches.
-- Force-push to `main` or `feature/ao-fixed-pipe-rewrite`.
+- Force-push to `main` ever.
+- Force-push to `feature/ao-fixed-pipe-rewrite` ever.
 - Skipping git hooks (`--no-verify`) or signing (`--no-gpg-sign`)
-  unless user explicitly authorizes a specific commit.
+  unless the user explicitly authorizes for a specific commit.
+- Rewriting history on shared branches (`main`,
+  `feature/ao-fixed-pipe-rewrite`, frozen reference branches).
 - Committing build artifacts, `.env`, secrets, local WDK signing
   bypass files.
 

@@ -988,10 +988,21 @@ the two canonical sources cited above.
 
 ### Forbidden as a result
 
+Branch / commit:
+
+- Direct commits to `main` during Phase 1-6. `main` only changes via
+  the V1 ship merge at Phase 7 exit.
 - Direct commits to `feature/ao-fixed-pipe-rewrite` for phase
   implementation work. Phase work goes on `phase/<N>-name`.
-- Direct commits to `main` of any kind. `main` only changes via the
-  V1 ship merge.
+- Force-push to `main` ever.
+- Force-push to `feature/ao-fixed-pipe-rewrite` ever.
+- Rewriting history on shared branches (`main`,
+  `feature/ao-fixed-pipe-rewrite`, frozen reference branches).
+- Skipping git hooks (`--no-verify`) or signing (`--no-gpg-sign`)
+  unless the user explicitly authorizes for a specific commit.
+
+Merge:
+
 - Squash merging a phase branch (loses per-step bisect granularity).
 - Fast-forward merging a phase branch (loses the `Verified:` block
   attached to the merge commit).
