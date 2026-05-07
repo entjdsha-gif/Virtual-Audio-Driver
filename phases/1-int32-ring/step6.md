@@ -51,9 +51,21 @@ Edit only:
 - [ ] Build clean.
 - [ ] `test_stream_monitor.py` shows 0/0 for `OverflowCount` /
       `UnderrunCount` on both cables in steady state.
-- [ ] `WrapBoundFrames == TargetLatencyFrames` (default 7168 @ 48k
-      after `reconcile_wrapbound_to_target` settles). This is the
+- [ ] `WrapBoundFrames == TargetLatencyFrames`. This acceptance is
+      the **equality**, not a specific frame count. The actual value
+      is whatever the live `targetFill` policy (set in
+      `Source/Main/adapter.cpp` at `FramePipeInit` time) chooses;
+      both fields must agree at the live driver. The number is the
       ring **capacity**, not the steady-state fill.
+
+      Phase 1 live evidence (Step 6.2 against the installed driver
+      from `phase/1-int32-ring`): `WrapBound=96000` per cable
+      (~2 s at 48 kHz, set by `adapter.cpp` `targetFill = 96000`).
+      Earlier drafts of this step referenced `7168` as a default;
+      that value does not match the current `adapter.cpp` policy
+      and was retired here. Future phases that change the policy
+      should update this evidence note rather than the equality
+      acceptance.
 - [ ] `RingFillFrames` is in a small live-latency band — typically
       well below `TargetLatencyFrames` (a few hundred frames at
       48 kHz, depending on writer/reader cadence). Fill ≈ capacity
