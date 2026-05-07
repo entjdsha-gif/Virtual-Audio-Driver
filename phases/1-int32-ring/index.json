@@ -35,7 +35,9 @@
     {
       "step": 4,
       "name": "hard-reject-overflow",
-      "status": "pending"
+      "status": "completed",
+      "completed_at": "2026-05-08T03:26:36+0900",
+      "summary": "Audit complete; only AoRingWriteFromScratch writes the cable ring."
     },
     {
       "step": 5,
