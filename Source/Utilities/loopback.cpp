@@ -1421,6 +1421,20 @@ AoRingAvailableSpaceFrames_Locked(PFRAME_PIPE pipe)
 }
 
 //=============================================================================
+// AoRingAvailableFrames_Locked — current fill (readable frames). Caller
+// must already hold pipe->Lock; no guard band is applied (distinct from
+// AoRingAvailableSpaceFrames_Locked). Distinct from public
+// AoRingAvailableFrames, which acquires the lock internally.
+//=============================================================================
+static __forceinline LONG
+AoRingAvailableFrames_Locked(PFRAME_PIPE pipe)
+{
+    LONG fill = pipe->WritePos - pipe->ReadPos;
+    if (fill < 0) fill += pipe->WrapBound;
+    return fill;
+}
+
+//=============================================================================
 // NormalizeToInt19 — bit-depth dispatch per DESIGN § 2.5.
 //
 // Reads one channel of one frame from `scratch` and returns the value
@@ -1591,7 +1605,153 @@ NTSTATUS AoRingWriteFromScratch(
 }
 
 //=============================================================================
-// AoRingReadToScratch — Step 3 implements; Step 1 stub.
+// DenormalizeFromInt19 — bit-depth dispatch per DESIGN § 2.5 (read direction).
+//
+// Writes one channel of one frame to `scratch`, denormalizing the 19-bit
+// signed-magnitude `sample` value into the destination format.
+//
+//  8 PCM (unsigned, 0x80-centered): (int >> 11) + 0x80, clamp 0..255
+// 16 PCM (signed LE):              int >> 3, clamp INT16
+// 24 PCM (signed packed LE):       (LONGLONG)int << 5, clamp INT24, 3-byte pack
+// 32 PCM (signed LE):              (LONGLONG)int << 13, clamp INT32, 4-byte pack
+//
+// Why LONGLONG for 24/32-bit shifts:
+//   The ring stores 19-bit signed-magnitude (±2^18), so `sample << 13`
+//   on the worst-case +2^18 input would equal +2^31 — outside the
+//   representable INT32 range. Computing in INT32 directly is undefined
+//   behavior under the C standard for signed left shift overflow. The
+//   LONGLONG intermediate sidesteps the UB; the explicit clamp then
+//   bounds the value back into the destination range before pack.
+//
+// Why clamp for 8/16-bit too:
+//   Same headroom argument: +2^18 >> 3 = +2^15 = 32768, one above
+//   INT16_MAX. (>> on signed types is implementation-defined arithmetic
+//   shift in MSVC, so the right-shift itself is safe — but the post-shift
+//   value can still exceed the dst format's range and must be clamped.)
+//
+// Caller must filter `dstBits` to {8, 16, 24, 32} before reaching here;
+// the default branch is a no-op (defensive).
+//=============================================================================
+static __forceinline VOID
+DenormalizeFromInt19(
+    BYTE*       scratch,
+    ULONG       dstBits,
+    ULONG       frame,
+    ULONG       channel,
+    ULONG       dstChannels,
+    LONG        sample)
+{
+    SIZE_T bytesPerSample = (SIZE_T)(dstBits / 8);
+    SIZE_T offset = ((SIZE_T)frame * (SIZE_T)dstChannels + (SIZE_T)channel)
+                  * bytesPerSample;
+    BYTE* p = scratch + offset;
+
+    switch (dstBits)
+    {
+    case 8:
+    {
+        // (sample >> 11) + 0x80, clamp 0..255 (unsigned 8-bit PCM range).
+        // MSVC arithmetic right shift on signed LONG is well-defined.
+        LONG v = (sample >> 11) + 0x80;
+        if (v > 255) v = 255;
+        if (v < 0)   v = 0;
+        *p = (BYTE)v;
+        break;
+    }
+
+    case 16:
+    {
+        // sample >> 3, clamp INT16. Signed-LE 16-bit pack.
+        LONG v = sample >> 3;
+        if (v >  32767) v =  32767;
+        if (v < -32768) v = -32768;
+        p[0] = (BYTE)( v        & 0xFF);
+        p[1] = (BYTE)((v >>  8) & 0xFF);
+        break;
+    }
+
+    case 24:
+    {
+        // ((LONGLONG)sample) << 5, clamp INT24, 3-byte signed-LE pack.
+        // LONGLONG intermediate avoids signed-shift UB at the +2^18 boundary.
+        LONGLONG v64 = ((LONGLONG)sample) << 5;
+        if (v64 >  8388607LL)  v64 =  8388607LL;   // (1 << 23) - 1
+        if (v64 < -8388608LL)  v64 = -8388608LL;   // -(1 << 23)
+        LONG v = (LONG)v64;
+        p[0] = (BYTE)( v        & 0xFF);
+        p[1] = (BYTE)((v >>  8) & 0xFF);
+        p[2] = (BYTE)((v >> 16) & 0xFF);
+        break;
+    }
+
+    case 32:
+    {
+        // ((LONGLONG)sample) << 13, clamp INT32, 4-byte signed-LE pack.
+        // Per DESIGN § 2.5: 32-bit PCM is NOT a direct copy — << 13
+        // restores the 19-bit normalization shift applied on write.
+        LONGLONG v64 = ((LONGLONG)sample) << 13;
+        if (v64 >  2147483647LL)   v64 =  2147483647LL;   // INT32_MAX
+        if (v64 < -2147483647LL-1) v64 = -2147483647LL-1; // INT32_MIN
+        LONG v = (LONG)v64;
+        p[0] = (BYTE)( v        & 0xFF);
+        p[1] = (BYTE)((v >>  8) & 0xFF);
+        p[2] = (BYTE)((v >> 16) & 0xFF);
+        p[3] = (BYTE)((v >> 24) & 0xFF);
+        break;
+    }
+
+    default:
+        // Defensive: caller filters dstBits to {8,16,24,32} upstream.
+        break;
+    }
+}
+
+//=============================================================================
+// ZeroFillScratch — write `frames * dstChannels * (dstBits/8)` silence
+// bytes to `scratch`. 8-bit PCM silence is 0x80 (mid-rail unsigned);
+// 16/24/32-bit PCM silence is 0x00. Caller guarantees dstBits ∈ {8,16,24,32}.
+//=============================================================================
+static __forceinline VOID
+ZeroFillScratch(
+    BYTE*       scratch,
+    ULONG       frames,
+    ULONG       dstBits,
+    ULONG       dstChannels)
+{
+    SIZE_T totalBytes = (SIZE_T)frames
+                      * (SIZE_T)dstChannels
+                      * (SIZE_T)(dstBits / 8);
+    if (dstBits == 8)
+        RtlFillMemory(scratch, totalBytes, 0x80);
+    else
+        RtlZeroMemory(scratch, totalBytes);
+}
+
+//=============================================================================
+// AoRingReadToScratch — same-rate ring read (Phase 1 Step 3).
+//
+// Path:
+//   1. Validate parameters (defensive guards).
+//   2. ADR-008: dstBits must be PCM 8/16/24/32; otherwise STATUS_NOT_SUPPORTED.
+//   3. Acquire pipe->Lock at DISPATCH_LEVEL.
+//   4. Step 3 contract: dstRate must equal pipe->InternalRate. SRC path
+//      is Phase 2; rate-mismatch returns STATUS_NOT_SUPPORTED here.
+//   5. ADR-005 hysteretic underrun:
+//        - If UnderrunFlag set and available < WrapBound/2: silence-fill
+//          and return STATUS_SUCCESS (stay in recovery).
+//        - If UnderrunFlag set and available >= WrapBound/2: clear flag,
+//          fall through to real read.
+//        - If frames > available (hard underrun): UnderrunCounter++,
+//          UnderrunFlag = 1, silence-fill, return STATUS_SUCCESS.
+//   6. Per-frame, per-channel denormalize-and-write with 4-way bit-depth
+//      dispatch (DenormalizeFromInt19). When dstChannels > pipe->Channels,
+//      the surplus client channels receive silence (8-bit 0x80 / else 0x00).
+//   7. Advance ReadPos with WrapBound modulus.
+//
+// NOT covered here:
+//   - SRC (rate conversion) — Phase 2.
+//   - Caller migration — all external callers still go through legacy
+//     shims until Step 4-6.
 //=============================================================================
 NTSTATUS AoRingReadToScratch(
     PFRAME_PIPE  pipe,
@@ -1601,13 +1761,93 @@ NTSTATUS AoRingReadToScratch(
     ULONG        dstChannels,
     ULONG        dstBits)
 {
-    UNREFERENCED_PARAMETER(pipe);
-    UNREFERENCED_PARAMETER(scratch);
-    UNREFERENCED_PARAMETER(frames);
-    UNREFERENCED_PARAMETER(dstRate);
-    UNREFERENCED_PARAMETER(dstChannels);
-    UNREFERENCED_PARAMETER(dstBits);
-    return STATUS_NOT_IMPLEMENTED;
+    // --- Defensive guards (no state change on failure) ---
+    if (!pipe || !scratch)
+        return STATUS_INVALID_PARAMETER;
+    if (frames == 0 || dstChannels == 0)
+        return STATUS_INVALID_PARAMETER;
+    if (!pipe->Data || pipe->Channels <= 0 || pipe->WrapBound <= 2)
+        return STATUS_INVALID_PARAMETER;
+
+    // ADR-008: V1 supports KSDATAFORMAT_SUBTYPE_PCM only.
+    // Bit widths {8, 16, 24, 32} match DESIGN § 2.5 dispatch table.
+    if (dstBits != 8 && dstBits != 16 && dstBits != 24 && dstBits != 32)
+        return STATUS_NOT_SUPPORTED;
+
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&pipe->Lock, &oldIrql);
+
+    // Step 3 = same-rate only. SRC path is Phase 2.
+    if (dstRate != pipe->InternalRate)
+    {
+        KeReleaseSpinLock(&pipe->Lock, oldIrql);
+        return STATUS_NOT_SUPPORTED;
+    }
+
+    LONG available = AoRingAvailableFrames_Locked(pipe);
+
+    // ADR-005 hysteretic underrun recovery.
+    if (pipe->UnderrunFlag)
+    {
+        if (available < pipe->WrapBound / 2)
+        {
+            // Stay in recovery — deliver silence, do NOT advance ReadPos.
+            ZeroFillScratch(scratch, frames, dstBits, dstChannels);
+            KeReleaseSpinLock(&pipe->Lock, oldIrql);
+            return STATUS_SUCCESS;
+        }
+        // Refill crossed the 50% threshold — exit recovery.
+        pipe->UnderrunFlag = 0;
+    }
+
+    // Hard underrun → enter recovery, deliver silence.
+    if ((LONG)frames > available)
+    {
+        pipe->UnderrunCounter++;
+        pipe->UnderrunFlag = 1;
+        ZeroFillScratch(scratch, frames, dstBits, dstChannels);
+        KeReleaseSpinLock(&pipe->Lock, oldIrql);
+        return STATUS_SUCCESS;
+    }
+
+    // Per-frame, per-channel denormalize-and-write.
+    LONG ringChannels = pipe->Channels;
+    SIZE_T bytesPerSample = (SIZE_T)(dstBits / 8);
+
+    for (ULONG f = 0; f < frames; ++f)
+    {
+        LONG slotBase = pipe->ReadPos * ringChannels;
+
+        for (ULONG ch = 0; ch < dstChannels; ++ch)
+        {
+            if ((LONG)ch < ringChannels)
+            {
+                LONG sample = pipe->Data[slotBase + (LONG)ch];
+                DenormalizeFromInt19(scratch, dstBits, f, ch,
+                                     dstChannels, sample);
+            }
+            else
+            {
+                // dstChannels > pipe->Channels: surplus client channels
+                // receive silence (8-bit 0x80 / else 0x00). DESIGN § 2.3
+                // forbids hidden upmix; this is silence, not synthesis.
+                SIZE_T off = ((SIZE_T)f * (SIZE_T)dstChannels + (SIZE_T)ch)
+                           * bytesPerSample;
+                BYTE* p = scratch + off;
+                if (dstBits == 8)
+                    *p = 0x80;
+                else
+                    RtlZeroMemory(p, bytesPerSample);
+            }
+        }
+
+        pipe->ReadPos++;
+        if (pipe->ReadPos >= pipe->WrapBound)
+            pipe->ReadPos = 0;
+    }
+
+    KeReleaseSpinLock(&pipe->Lock, oldIrql);
+    return STATUS_SUCCESS;
 }
 
 //=============================================================================
