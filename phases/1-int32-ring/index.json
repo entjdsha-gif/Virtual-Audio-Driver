@@ -14,7 +14,9 @@
     {
       "step": 1,
       "name": "frame-pipe-struct-api-rewrite",
-      "status": "pending"
+      "status": "completed",
+      "completed_at": "2026-05-08T02:37:23+0900",
+      "summary": "FRAME_PIPE struct shape replaced with canonical INT32 ring API and compile-preserving shim."
     },
     {
       "step": 2,
