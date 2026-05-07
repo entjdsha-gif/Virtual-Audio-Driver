@@ -38,7 +38,10 @@ C_ASSERT(FIELD_OFFSET(LOOPBACK_BUFFER, InternalBlockAlign) == 0x4D8);
 // mismatch caused by editing only one of the two headers fails to build.
 // Phase 5 (2026-04-14): bumped from 116 to 132 after render-side drive
 // counter tail extension.
-C_ASSERT(sizeof(AO_V2_DIAG) == 132);
+// Phase 1 Step 6 (2026-05-08): bumped from 132 to 172 after appending
+// per-cable FRAME_PIPE ring diagnostics (Overflow / Underrun /
+// UnderrunFlag / RingFill / WrapBound).
+C_ASSERT(sizeof(AO_V2_DIAG) == 172);
 
 typedef void (*fnPcDriverUnload) (PDRIVER_OBJECT);
 fnPcDriverUnload gPCDriverUnloadRoutine = NULL;
@@ -1586,6 +1589,55 @@ static VOID AoReadRegistryConfig(
 }
 
 //=============================================================================
+// AoSnapshotFramePipeDiag — atomic snapshot of FRAME_PIPE ring diagnostics
+// under pipe->Lock. Phase 1 Step 6: deliberately scopes one new FRAME_PIPE
+// field access in adapter.cpp to provide IOCTL_AO_GET_STREAM_STATUS with a
+// lock-correct, mutually consistent five-tuple (Overflow / Underrun /
+// UnderrunFlag / RingFill / WrapBound). Step 4 audit (§ 5) noted that
+// adapter.cpp did not access FRAME_PIPE fields directly; this is the one
+// permitted exception, contained inside this helper.
+//
+// Nonpaged code segment so the spinlock-bracketed section never resides in
+// a pageable page when executing at DISPATCH_LEVEL. Caller may itself be
+// pageable (PASSIVE_LEVEL) — control returns to caller after the spinlock
+// is released, so caller stays at PASSIVE throughout.
+//=============================================================================
+#pragma code_seg()
+static VOID
+AoSnapshotFramePipeDiag(
+    _In_  PFRAME_PIPE  pipe,
+    _Out_ ULONG*       overflowCount,
+    _Out_ ULONG*       underrunCount,
+    _Out_ UCHAR*       underrunFlag,
+    _Out_ ULONG*       ringFillFrames,
+    _Out_ ULONG*       wrapBoundFrames)
+{
+    *overflowCount   = 0;
+    *underrunCount   = 0;
+    *underrunFlag    = 0;
+    *ringFillFrames  = 0;
+    *wrapBoundFrames = 0;
+
+    if (!pipe || !pipe->Data || pipe->WrapBound <= 0)
+        return;
+
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&pipe->Lock, &oldIrql);
+
+    LONG fill = pipe->WritePos - pipe->ReadPos;
+    if (fill < 0)
+        fill += pipe->WrapBound;
+
+    *overflowCount   = (ULONG)pipe->OverflowCounter;
+    *underrunCount   = (ULONG)pipe->UnderrunCounter;
+    *underrunFlag    = pipe->UnderrunFlag;
+    *ringFillFrames  = (ULONG)fill;
+    *wrapBoundFrames = (ULONG)pipe->WrapBound;
+
+    KeReleaseSpinLock(&pipe->Lock, oldIrql);
+}
+
+//=============================================================================
 // IOCTL dispatch for AO Virtual Cable control panel communication
 //=============================================================================
 #pragma code_seg("PAGE")
@@ -1798,6 +1850,38 @@ AoDeviceControlHandler(
             pDiag->A_R_LegacyDriveCount          = 0;
             pDiag->B_R_PumpDriveCount            = 0;
             pDiag->B_R_LegacyDriveCount          = 0;
+
+            // Phase 1 Step 6: per-cable canonical FRAME_PIPE ring
+            // diagnostics. AoSnapshotFramePipeDiag takes pipe->Lock
+            // for a single-shot consistent five-tuple per cable.
+            // <Cable>_Reserved* pad bytes already zeroed by the
+            // RtlZeroMemory above. UCHAR locals live inside their own
+            // #if so a single-cable build does not warn on the unused
+            // variable for the absent cable.
+#if defined(CABLE_A) || !defined(CABLE_B)
+            {
+                UCHAR ufA = 0;
+                AoSnapshotFramePipeDiag(&g_CableAPipe,
+                                        &pDiag->A_OverflowCount,
+                                        &pDiag->A_UnderrunCount,
+                                        &ufA,
+                                        &pDiag->A_RingFillFrames,
+                                        &pDiag->A_WrapBoundFrames);
+                pDiag->A_UnderrunFlag = ufA;
+            }
+#endif
+#if defined(CABLE_B) || !defined(CABLE_A)
+            {
+                UCHAR ufB = 0;
+                AoSnapshotFramePipeDiag(&g_CableBPipe,
+                                        &pDiag->B_OverflowCount,
+                                        &pDiag->B_UnderrunCount,
+                                        &ufB,
+                                        &pDiag->B_RingFillFrames,
+                                        &pDiag->B_WrapBoundFrames);
+                pDiag->B_UnderrunFlag = ufB;
+            }
+#endif
 
             bytesReturned = v2Offset + sizeof(AO_V2_DIAG);
         }

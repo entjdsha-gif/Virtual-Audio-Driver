@@ -44,10 +44,15 @@ OPEN_EXISTING = 3
 V1_STATUS_SIZE = 64
 # Phase 1 V2 diag: StructSize + 4 * 7 ULONGs = 116 bytes.
 # Phase 5 tail extension: +4 ULONGs (A_R/B_R pump/legacy drive counts) = 132.
+# Phase 6 tail extension: +2 cables * 5 ULONG-equivalents (Overflow,
+# Underrun, RingFill, WrapBound, UnderrunFlag UCHAR + 3-byte pad) = 172.
 V2_DIAG_SIZE_P1  = 4 + 4 * 7 * 4                 # 116
-V2_DIAG_SIZE     = V2_DIAG_SIZE_P1 + 4 * 4       # 132
+V2_DIAG_SIZE_P5  = V2_DIAG_SIZE_P1 + 4 * 4       # 132
+V2_DIAG_SIZE_P6  = V2_DIAG_SIZE_P5 + 2 * 5 * 4   # 172
+V2_DIAG_SIZE     = V2_DIAG_SIZE_P6
 V2_BUF_SIZE      = V1_STATUS_SIZE + V2_DIAG_SIZE
 V2_FIELDS_PER_BLOCK = 7
+RING_DIAG_BLOCK_BYTES = 5 * 4                    # per-cable Phase 6 ring diag
 
 
 def open_device(name):
@@ -107,14 +112,15 @@ def get_stream_status(h):
     #   PumpInvocationCount, PumpShadowDivergenceCount,
     #   PumpFeatureFlags
     result['v2'] = False
-    # Accept either Phase 1 (116) or Phase 5 (132) tail, whichever the
-    # driver reports. Phase 5 clients see the full tail and 4 extra
-    # render-side drive counters; older drivers return the Phase 1 shape.
+    # Accept Phase 1 (116), Phase 5 (132), or Phase 6 (172) tail, whichever
+    # the driver reports. Phase 6 clients see the full tail and 10 extra
+    # ULONG-equivalents (per-cable ring diag); Phase 5 stops at the drive
+    # counters; Phase 1 stops at the per-direction pump counters.
     if ret.value >= V1_STATUS_SIZE + V2_DIAG_SIZE_P1:
         v2_offset = V1_STATUS_SIZE
         struct_size = struct.unpack_from('<I', buf.raw, v2_offset)[0]
 
-        if struct_size == V2_DIAG_SIZE_P1 or struct_size == V2_DIAG_SIZE:
+        if struct_size in (V2_DIAG_SIZE_P1, V2_DIAG_SIZE_P5, V2_DIAG_SIZE_P6):
             def read_block(offset):
                 fields = struct.unpack_from('<IIIIIII', buf.raw, offset)
                 return {
@@ -138,18 +144,47 @@ def get_stream_status(h):
             result['CableB_Capture'] = read_block(cursor); cursor += block_bytes
 
             # Phase 5 tail: 4 ULONGs of render-side drive counters.
-            # Present iff the driver returned the 132-byte shape.
-            if struct_size == V2_DIAG_SIZE:
+            # Present iff the driver returned the 132-byte shape or larger.
+            if struct_size in (V2_DIAG_SIZE_P5, V2_DIAG_SIZE_P6):
                 a_r_pump, a_r_legacy, b_r_pump, b_r_legacy = struct.unpack_from(
                     '<IIII', buf.raw, cursor)
                 result['CableA_Render']['RenderPumpDriveCount']   = a_r_pump
                 result['CableA_Render']['RenderLegacyDriveCount'] = a_r_legacy
                 result['CableB_Render']['RenderPumpDriveCount']   = b_r_pump
                 result['CableB_Render']['RenderLegacyDriveCount'] = b_r_legacy
+                cursor += 4 * 4
             else:
                 for key in ('CableA_Render', 'CableB_Render'):
                     result[key]['RenderPumpDriveCount']   = None
                     result[key]['RenderLegacyDriveCount'] = None
+
+            # Phase 6 tail: per-cable canonical FRAME_PIPE ring diag.
+            # 5 ULONG-equivalents per cable: OverflowCount, UnderrunCount,
+            # RingFillFrames, WrapBoundFrames, UnderrunFlag (UCHAR) + 3-byte
+            # Reserved pad. Layout = '<IIIIB3x' per cable. Present iff the
+            # driver returned the 172-byte shape.
+            if struct_size == V2_DIAG_SIZE_P6:
+                ovA, urA, fillA, wrapA, ufA = struct.unpack_from(
+                    '<IIIIB3x', buf.raw, cursor)
+                cursor += RING_DIAG_BLOCK_BYTES
+                ovB, urB, fillB, wrapB, ufB = struct.unpack_from(
+                    '<IIIIB3x', buf.raw, cursor)
+                cursor += RING_DIAG_BLOCK_BYTES
+
+                result['CableA_Ring'] = {
+                    'OverflowCount':   ovA,
+                    'UnderrunCount':   urA,
+                    'RingFillFrames':  fillA,
+                    'WrapBoundFrames': wrapA,
+                    'UnderrunFlag':    ufA,
+                }
+                result['CableB_Ring'] = {
+                    'OverflowCount':   ovB,
+                    'UnderrunCount':   urB,
+                    'RingFillFrames':  fillB,
+                    'WrapBoundFrames': wrapB,
+                    'UnderrunFlag':    ufB,
+                }
 
     return result
 
@@ -215,6 +250,19 @@ def print_status(cable_label, handle):
 
         print(fmt_block("Render ", render, is_render=True))
         print(fmt_block("Capture", capture))
+
+        # Phase 6 per-cable ring diag (Phase 1 Step 6). Present iff the
+        # driver returned the 172-byte V2 shape.
+        ring = status.get(f"{cable_label}_Ring")
+        if ring is not None:
+            ov   = ring['OverflowCount']
+            ur   = ring['UnderrunCount']
+            fill = ring['RingFillFrames']
+            wrap = ring['WrapBoundFrames']
+            flag = ring['UnderrunFlag']
+            flag_tag = "RECOVER" if flag else "ok"
+            print(f"    Ring   : Overflow={ov} Underrun={ur} "
+                  f"Flag={flag}({flag_tag}) Fill={fill} WrapBound={wrap}")
     else:
         print(f"    (V2 diag not available — expected {V2_DIAG_SIZE} bytes at offset {V1_STATUS_SIZE})")
 

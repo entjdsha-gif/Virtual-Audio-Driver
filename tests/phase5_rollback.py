@@ -42,8 +42,11 @@ IOCTL_AO_GET_STREAM_STATUS     = CTL_CODE(0x802, 1)
 IOCTL_AO_SET_PUMP_FEATURE_FLAGS = CTL_CODE(0x806, 2)  # FILE_WRITE_ACCESS
 
 V1_STATUS_SIZE   = 64
-V2_DIAG_SIZE_P5  = 4 + 4 * 7 * 4 + 16   # Phase 5 = 132
-V2_BUF_SIZE      = V1_STATUS_SIZE + V2_DIAG_SIZE_P5
+V2_DIAG_SIZE_P5  = 4 + 4 * 7 * 4 + 16        # Phase 5 = 132
+# Phase 1 Step 6 (2026-05-08): driver may now return 172-byte tail; accept
+# it too. A_Render block + drive-counter tail offsets are unchanged.
+V2_DIAG_SIZE_P6  = V2_DIAG_SIZE_P5 + 2 * 5 * 4   # 172
+V2_BUF_SIZE      = V1_STATUS_SIZE + V2_DIAG_SIZE_P6
 
 AO_PUMP_FLAG_ENABLE                  = 0x00000001
 AO_PUMP_FLAG_SHADOW_ONLY             = 0x00000002
@@ -62,7 +65,7 @@ def read_a_render_full(h):
     if not ok or ret.value < V1_STATUS_SIZE + V2_DIAG_SIZE_P5:
         return None
     struct_size = struct.unpack_from("<I", buf.raw, V1_STATUS_SIZE)[0]
-    if struct_size != V2_DIAG_SIZE_P5:
+    if struct_size not in (V2_DIAG_SIZE_P5, V2_DIAG_SIZE_P6):
         return None
     # A_Render block starts right after StructSize.
     off = V1_STATUS_SIZE + 4
