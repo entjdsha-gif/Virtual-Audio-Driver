@@ -2187,3 +2187,49 @@ VOID FramePipeReadToDma(
     if (usedBytes < byteCount)
         RtlZeroMemory(dmaData + usedBytes, byteCount - usedBytes);
 }
+
+//=============================================================================
+//
+//  AoPumpApplyRenderFlagMask — fail-closed link target stub
+//
+//  History:
+//    2c733f1 (2026-04-14, Phase 5 CLOSED) — original definition added
+//      to minwavertstream.cpp, with per-cable active-stream globals
+//      (g_CableA/BActiveRenderStream, g_CableA/BActiveRenderLock),
+//      static helpers AoPumpRegister/UnregisterActiveRenderStream, and
+//      the member body CMiniportWaveRTStream::ApplyPumpFlagMaskUnderLock.
+//    5a013b1 (2026-04-15, Phase 6 Step 1 skeleton) — wholesale removed
+//      the definition AND its dependent globals/helpers/member body
+//      while migrating cable transport ownership to the shared transport
+//      engine. The declaration in loopback.h and the four call sites in
+//      adapter.cpp's IOCTL_AO_SET_PUMP_FEATURE_FLAGS handler stayed,
+//      leaving the link unresolved.
+//
+//  Resolution (Phase 1, ADR-014 phase/1-int32-ring branch):
+//    The IOCTL surface is preserved for ABI stability — adapter.cpp is
+//    out of scope for the current step (per step0.md STOP condition).
+//    Restoring the original definition by itself is not possible because
+//    the dependent globals / static helpers / member body were all
+//    deleted by 5a013b1 and the post-Phase-6 transport ownership model
+//    no longer matches the per-cable-active-render-stream pattern that
+//    the original definition assumed.
+//
+//    Fail-closed stub: returns STATUS_NOT_SUPPORTED so the IOCTL caller
+//    sees a clear "not supported in this build" result. No state is
+//    mutated. Phase 6 cleanup is expected to retire both the IOCTL
+//    handler in adapter.cpp and this stub together.
+//
+//=============================================================================
+extern "C"
+NTSTATUS
+AoPumpApplyRenderFlagMask(
+    _In_ ULONG cableIndex,
+    _In_ ULONG setMask,
+    _In_ ULONG clearMask)
+{
+    UNREFERENCED_PARAMETER(cableIndex);
+    UNREFERENCED_PARAMETER(setMask);
+    UNREFERENCED_PARAMETER(clearMask);
+
+    return STATUS_NOT_SUPPORTED;
+}
