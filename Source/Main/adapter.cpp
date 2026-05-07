@@ -38,7 +38,10 @@ C_ASSERT(FIELD_OFFSET(LOOPBACK_BUFFER, InternalBlockAlign) == 0x4D8);
 // mismatch caused by editing only one of the two headers fails to build.
 // Phase 5 (2026-04-14): bumped from 116 to 132 after render-side drive
 // counter tail extension.
-C_ASSERT(sizeof(AO_V2_DIAG) == 132);
+// Phase 1 Step 6 (2026-05-08): bumped from 132 to 172 after appending
+// per-cable FRAME_PIPE ring diagnostics (Overflow / Underrun /
+// UnderrunFlag / RingFill / WrapBound).
+C_ASSERT(sizeof(AO_V2_DIAG) == 172);
 
 typedef void (*fnPcDriverUnload) (PDRIVER_OBJECT);
 fnPcDriverUnload gPCDriverUnloadRoutine = NULL;
@@ -1586,6 +1589,55 @@ static VOID AoReadRegistryConfig(
 }
 
 //=============================================================================
+// AoSnapshotFramePipeDiag — atomic snapshot of FRAME_PIPE ring diagnostics
+// under pipe->Lock. Phase 1 Step 6: deliberately scopes one new FRAME_PIPE
+// field access in adapter.cpp to provide IOCTL_AO_GET_STREAM_STATUS with a
+// lock-correct, mutually consistent five-tuple (Overflow / Underrun /
+// UnderrunFlag / RingFill / WrapBound). Step 4 audit (§ 5) noted that
+// adapter.cpp did not access FRAME_PIPE fields directly; this is the one
+// permitted exception, contained inside this helper.
+//
+// Nonpaged code segment so the spinlock-bracketed section never resides in
+// a pageable page when executing at DISPATCH_LEVEL. Caller may itself be
+// pageable (PASSIVE_LEVEL) — control returns to caller after the spinlock
+// is released, so caller stays at PASSIVE throughout.
+//=============================================================================
+#pragma code_seg()
+static VOID
+AoSnapshotFramePipeDiag(
+    _In_  PFRAME_PIPE  pipe,
+    _Out_ ULONG*       overflowCount,
+    _Out_ ULONG*       underrunCount,
+    _Out_ UCHAR*       underrunFlag,
+    _Out_ ULONG*       ringFillFrames,
+    _Out_ ULONG*       wrapBoundFrames)
+{
+    *overflowCount   = 0;
+    *underrunCount   = 0;
+    *underrunFlag    = 0;
+    *ringFillFrames  = 0;
+    *wrapBoundFrames = 0;
+
+    if (!pipe || !pipe->Data || pipe->WrapBound <= 0)
+        return;
+
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&pipe->Lock, &oldIrql);
+
+    LONG fill = pipe->WritePos - pipe->ReadPos;
+    if (fill < 0)
+        fill += pipe->WrapBound;
+
+    *overflowCount   = (ULONG)pipe->OverflowCounter;
+    *underrunCount   = (ULONG)pipe->UnderrunCounter;
+    *underrunFlag    = pipe->UnderrunFlag;
+    *ringFillFrames  = (ULONG)fill;
+    *wrapBoundFrames = (ULONG)pipe->WrapBound;
+
+    KeReleaseSpinLock(&pipe->Lock, oldIrql);
+}
+
+//=============================================================================
 // IOCTL dispatch for AO Virtual Cable control panel communication
 //=============================================================================
 #pragma code_seg("PAGE")
@@ -1745,60 +1797,90 @@ AoDeviceControlHandler(
             RtlZeroMemory(pDiag, sizeof(AO_V2_DIAG));
             pDiag->StructSize = sizeof(AO_V2_DIAG);
 
-#if defined(CABLE_A) || !defined(CABLE_B)
-            // Cable A Render snapshot
-            pDiag->A_R_GatedSkipCount            = g_CableAPipe.RenderGatedSkipCount;
-            pDiag->A_R_OverJumpCount             = g_CableAPipe.RenderOverJumpCount;
-            pDiag->A_R_FramesProcessedLow        = (ULONG)(g_CableAPipe.RenderFramesProcessedTotal & 0xFFFFFFFF);
-            pDiag->A_R_FramesProcessedHigh       = (ULONG)(g_CableAPipe.RenderFramesProcessedTotal >> 32);
-            pDiag->A_R_PumpInvocationCount       = g_CableAPipe.RenderPumpInvocationCount;
-            pDiag->A_R_PumpShadowDivergenceCount = g_CableAPipe.RenderPumpShadowDivergenceCount;
-            pDiag->A_R_PumpFeatureFlags          = g_CableAPipe.RenderPumpFeatureFlags;
+            // Phase 1 Step 1 (ADR-014 phase/1-int32-ring):
+            // The legacy FRAME_PIPE shape carried per-direction pump
+            // / drive / shadow counters that no longer exist on the
+            // canonical V1 shape (DESIGN § 2.1). The AO_V2_DIAG
+            // schema fields stay as ABI for existing user-mode
+            // callers, but their source members are gone; per
+            // step1.md plan they are zero-filled here. Phase 1 Step
+            // 6 plumbs the new diagnostics surface (Overflow /
+            // Underrun / UnderrunFlag / RingFill / WrapBound).
+            // Phase 6 cleanup retires these AO_V2_DIAG fields
+            // entirely.
+            // RtlZeroMemory above already zeroed the entire
+            // AO_V2_DIAG; these explicit assignments document each
+            // removed-source field for the reviewer.
+            pDiag->A_R_GatedSkipCount            = 0;
+            pDiag->A_R_OverJumpCount             = 0;
+            pDiag->A_R_FramesProcessedLow        = 0;
+            pDiag->A_R_FramesProcessedHigh       = 0;
+            pDiag->A_R_PumpInvocationCount       = 0;
+            pDiag->A_R_PumpShadowDivergenceCount = 0;
+            pDiag->A_R_PumpFeatureFlags          = 0;
 
-            // Cable A Capture snapshot
-            pDiag->A_C_GatedSkipCount            = g_CableAPipe.CaptureGatedSkipCount;
-            pDiag->A_C_OverJumpCount             = g_CableAPipe.CaptureOverJumpCount;
-            pDiag->A_C_FramesProcessedLow        = (ULONG)(g_CableAPipe.CaptureFramesProcessedTotal & 0xFFFFFFFF);
-            pDiag->A_C_FramesProcessedHigh       = (ULONG)(g_CableAPipe.CaptureFramesProcessedTotal >> 32);
-            pDiag->A_C_PumpInvocationCount       = g_CableAPipe.CapturePumpInvocationCount;
-            pDiag->A_C_PumpShadowDivergenceCount = g_CableAPipe.CapturePumpShadowDivergenceCount;
-            pDiag->A_C_PumpFeatureFlags          = g_CableAPipe.CapturePumpFeatureFlags;
-#endif
+            pDiag->A_C_GatedSkipCount            = 0;
+            pDiag->A_C_OverJumpCount             = 0;
+            pDiag->A_C_FramesProcessedLow        = 0;
+            pDiag->A_C_FramesProcessedHigh       = 0;
+            pDiag->A_C_PumpInvocationCount       = 0;
+            pDiag->A_C_PumpShadowDivergenceCount = 0;
+            pDiag->A_C_PumpFeatureFlags          = 0;
 
-#if defined(CABLE_B) || !defined(CABLE_A)
-            // Cable B Render snapshot
-            pDiag->B_R_GatedSkipCount            = g_CableBPipe.RenderGatedSkipCount;
-            pDiag->B_R_OverJumpCount             = g_CableBPipe.RenderOverJumpCount;
-            pDiag->B_R_FramesProcessedLow        = (ULONG)(g_CableBPipe.RenderFramesProcessedTotal & 0xFFFFFFFF);
-            pDiag->B_R_FramesProcessedHigh       = (ULONG)(g_CableBPipe.RenderFramesProcessedTotal >> 32);
-            pDiag->B_R_PumpInvocationCount       = g_CableBPipe.RenderPumpInvocationCount;
-            pDiag->B_R_PumpShadowDivergenceCount = g_CableBPipe.RenderPumpShadowDivergenceCount;
-            pDiag->B_R_PumpFeatureFlags          = g_CableBPipe.RenderPumpFeatureFlags;
+            pDiag->B_R_GatedSkipCount            = 0;
+            pDiag->B_R_OverJumpCount             = 0;
+            pDiag->B_R_FramesProcessedLow        = 0;
+            pDiag->B_R_FramesProcessedHigh       = 0;
+            pDiag->B_R_PumpInvocationCount       = 0;
+            pDiag->B_R_PumpShadowDivergenceCount = 0;
+            pDiag->B_R_PumpFeatureFlags          = 0;
 
-            // Cable B Capture snapshot
-            pDiag->B_C_GatedSkipCount            = g_CableBPipe.CaptureGatedSkipCount;
-            pDiag->B_C_OverJumpCount             = g_CableBPipe.CaptureOverJumpCount;
-            pDiag->B_C_FramesProcessedLow        = (ULONG)(g_CableBPipe.CaptureFramesProcessedTotal & 0xFFFFFFFF);
-            pDiag->B_C_FramesProcessedHigh       = (ULONG)(g_CableBPipe.CaptureFramesProcessedTotal >> 32);
-            pDiag->B_C_PumpInvocationCount       = g_CableBPipe.CapturePumpInvocationCount;
-            pDiag->B_C_PumpShadowDivergenceCount = g_CableBPipe.CapturePumpShadowDivergenceCount;
-            pDiag->B_C_PumpFeatureFlags          = g_CableBPipe.CapturePumpFeatureFlags;
-#endif
+            pDiag->B_C_GatedSkipCount            = 0;
+            pDiag->B_C_OverJumpCount             = 0;
+            pDiag->B_C_FramesProcessedLow        = 0;
+            pDiag->B_C_FramesProcessedHigh       = 0;
+            pDiag->B_C_PumpInvocationCount       = 0;
+            pDiag->B_C_PumpShadowDivergenceCount = 0;
+            pDiag->B_C_PumpFeatureFlags          = 0;
 
-            // Phase 5 (2026-04-14): render-side drive counters at V2 tail.
-            // Zero-filled for cables not built into this driver variant
-            // (CABLE_A-only builds leave B counters at zero, etc.).
+            // Phase 5 render-side drive counters — same status:
+            // source members removed from FRAME_PIPE in Step 1,
+            // zero-filled here.
             pDiag->A_R_PumpDriveCount            = 0;
             pDiag->A_R_LegacyDriveCount          = 0;
             pDiag->B_R_PumpDriveCount            = 0;
             pDiag->B_R_LegacyDriveCount          = 0;
+
+            // Phase 1 Step 6: per-cable canonical FRAME_PIPE ring
+            // diagnostics. AoSnapshotFramePipeDiag takes pipe->Lock
+            // for a single-shot consistent five-tuple per cable.
+            // <Cable>_Reserved* pad bytes already zeroed by the
+            // RtlZeroMemory above. UCHAR locals live inside their own
+            // #if so a single-cable build does not warn on the unused
+            // variable for the absent cable.
 #if defined(CABLE_A) || !defined(CABLE_B)
-            pDiag->A_R_PumpDriveCount            = g_CableAPipe.RenderPumpDriveCount;
-            pDiag->A_R_LegacyDriveCount          = g_CableAPipe.RenderLegacyDriveCount;
+            {
+                UCHAR ufA = 0;
+                AoSnapshotFramePipeDiag(&g_CableAPipe,
+                                        &pDiag->A_OverflowCount,
+                                        &pDiag->A_UnderrunCount,
+                                        &ufA,
+                                        &pDiag->A_RingFillFrames,
+                                        &pDiag->A_WrapBoundFrames);
+                pDiag->A_UnderrunFlag = ufA;
+            }
 #endif
 #if defined(CABLE_B) || !defined(CABLE_A)
-            pDiag->B_R_PumpDriveCount            = g_CableBPipe.RenderPumpDriveCount;
-            pDiag->B_R_LegacyDriveCount          = g_CableBPipe.RenderLegacyDriveCount;
+            {
+                UCHAR ufB = 0;
+                AoSnapshotFramePipeDiag(&g_CableBPipe,
+                                        &pDiag->B_OverflowCount,
+                                        &pDiag->B_UnderrunCount,
+                                        &ufB,
+                                        &pDiag->B_RingFillFrames,
+                                        &pDiag->B_WrapBoundFrames);
+                pDiag->B_UnderrunFlag = ufB;
+            }
 #endif
 
             bytesReturned = v2Offset + sizeof(AO_V2_DIAG);

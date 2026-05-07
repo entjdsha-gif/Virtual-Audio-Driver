@@ -39,8 +39,13 @@ V1_STATUS_SIZE = 64
 # Phase 5 (2026-04-14): driver writes 132-byte V2 tail. This script keeps
 # using only the Phase 1 block offsets, which are stable, but allocates
 # the larger buffer so the StructSize check still matches.
+# Phase 1 Step 6 (2026-05-08): driver may now write 172-byte tail; accept
+# it too so this script keeps working post-step6 without re-parsing the
+# new ring-diag block (out of scope for shadow-divergence smoke).
 V2_DIAG_SIZE_P1 = 4 + 4 * 7 * 4
-V2_DIAG_SIZE    = V2_DIAG_SIZE_P1 + 16
+V2_DIAG_SIZE_P5 = V2_DIAG_SIZE_P1 + 16            # 132
+V2_DIAG_SIZE_P6 = V2_DIAG_SIZE_P5 + 2 * 5 * 4     # 172
+V2_DIAG_SIZE    = V2_DIAG_SIZE_P6
 V2_BUF_SIZE     = V1_STATUS_SIZE + V2_DIAG_SIZE
 
 SHADOW_WINDOW = 128
@@ -65,7 +70,7 @@ def read_all_blocks(h):
     if not ok or ret.value < V1_STATUS_SIZE + V2_DIAG_SIZE_P1:
         return None
     struct_size = struct.unpack_from("<I", buf.raw, V1_STATUS_SIZE)[0]
-    if struct_size != V2_DIAG_SIZE_P1 and struct_size != V2_DIAG_SIZE:
+    if struct_size not in (V2_DIAG_SIZE_P1, V2_DIAG_SIZE_P5, V2_DIAG_SIZE_P6):
         return None
 
     def read_block(offset):

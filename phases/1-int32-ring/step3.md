@@ -1,65 +1,116 @@
-# Phase 1 Step 3: Hard-reject overflow + counter audit
+# Phase 1 Step 3: Ring read - INT32 conversion (no SRC yet)
 
 ## Read First
 
-- `docs/ADR.md` ADR-005 (hard-reject overflow + hysteretic underrun)
-- `docs/REVIEW_POLICY.md` § 2 (forbidden drift) — silent overflow is
-  forbidden.
-- Phase 1 Step 1 already implements hard-reject in the write path.
-  This step is the **audit** that verifies no other path silently
-  overwrites the ring.
+- `docs/ADR.md` ADR-003, ADR-005
+- `docs/AO_CABLE_V1_DESIGN.md` § 2.4 (read SRC algorithm), § 2.5
+  (bit-depth dispatch table — read direction).
+- Phase 1 Step 2 (write side).
 
 ## Goal
 
-Audit `Source/Utilities/loopback.cpp` and confirm that no remaining code
-path silently overwrites cable ring data on overflow. All paths that
-could touch `pipe->Data` / `pipe->WritePos` must:
+Implement the **same-rate** ring read path: INT32 ring → client format,
+with 4-way bit-depth dispatch (denormalize from 19-bit). SRC out of scope
+(Phase 2). Underrun handling is in this step (Step 2 deferred it).
 
-1. Go through `AoRingWriteFromScratch` (which hard-rejects), OR
-2. Be deleted (legacy paths that contradict ADR-005).
+## Planned Files
 
-## Planned Edits
+Edit only:
 
-This step is mostly read-and-classify, with targeted deletions:
+- `Source/Utilities/loopback.cpp` — implement `AoRingReadToScratch`
+  same-rate path with underrun + hysteretic recovery (per ADR-005).
+  Stub the rate-mismatch path with `STATUS_NOT_SUPPORTED`.
 
-- Inspect every `loopback.cpp` function that writes to the cable ring.
-- For each function, decide:
-  - **Keep** if it's `AoRingWriteFromScratch` or its helpers.
-  - **Delete** if it's a legacy write path (e.g., `LoopbackWriteRaw`
-    or similar pre-rewrite functions that bypassed overflow checks).
-  - **Refactor** if it's a path that is still called from somewhere
-    valid but uses the wrong overflow semantics (rare; should be
-    captured during pre-step inspection).
+## Required Edits
+
+```c
+NTSTATUS
+AoRingReadToScratch(PFRAME_PIPE pipe, BYTE* scratch, ULONG frames,
+                    ULONG dstRate, ULONG dstChannels, ULONG dstBits)
+{
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&pipe->Lock, &oldIrql);
+
+    if (dstRate != pipe->InternalRate /* same-rate only in Step 3 */) {
+        KeReleaseSpinLock(&pipe->Lock, oldIrql);
+        return STATUS_NOT_SUPPORTED;
+    }
+
+    LONG available = AoRingAvailableFrames_Locked(pipe);
+
+    /* hysteretic underrun recovery */
+    if (pipe->UnderrunFlag) {
+        if (available < pipe->WrapBound / 2) {
+            ZeroFillScratch(scratch, frames, dstBits, dstChannels);
+            KeReleaseSpinLock(&pipe->Lock, oldIrql);
+            return STATUS_SUCCESS;
+        }
+        pipe->UnderrunFlag = 0;  /* exit recovery */
+    }
+
+    if ((LONG)frames > available) {
+        pipe->UnderrunCounter++;
+        pipe->UnderrunFlag = 1;
+        ZeroFillScratch(scratch, frames, dstBits, dstChannels);
+        KeReleaseSpinLock(&pipe->Lock, oldIrql);
+        return STATUS_SUCCESS;
+    }
+
+    for (ULONG f = 0; f < frames; ++f) {
+        for (ULONG ch = 0; ch < dstChannels; ++ch) {
+            LONG slot = (pipe->ReadPos * pipe->Channels) + ch;
+            LONG sample = (ch < pipe->Channels) ? pipe->Data[slot] : 0;
+            DenormalizeFromInt19(scratch, dstBits, f, ch, dstChannels, sample);
+        }
+        pipe->ReadPos++;
+        if (pipe->ReadPos >= pipe->WrapBound) pipe->ReadPos = 0;
+    }
+
+    KeReleaseSpinLock(&pipe->Lock, oldIrql);
+    return STATUS_SUCCESS;
+}
+```
 
 ## Rules
 
-- Tell the user before deleting any function.
-- If a function is called from a non-cable path that still relies on
-  silent overwrite, **stop and report** — do not delete or refactor
-  without approval. (Non-cable streams are out of scope for V1; their
-  legacy behavior may be preserved.)
-- Cite the call sites explicitly in the report.
+- Tell the user before editing.
+- Same-rate only.
+- Caller-side behavior still unchanged.
 
 ## Acceptance Criteria
 
-- [ ] Audit report committed to `phases/1-int32-ring/step3-audit.md`
-      listing every cable-ring write path and its disposition (keep /
-      delete / refactor).
-- [ ] No remaining cable-ring write path increments `WritePos` without
-      incrementing `OverflowCounter` on overflow.
 - [ ] Build clean.
-- [ ] Step 1's overflow scenario test still passes.
-- [ ] No non-cable (mic-array / speaker / save-data / tone-generator)
-      regression — sample test on those paths still works (manual
-      inspection if no automated coverage exists).
+- [ ] Round-trip test (Step 2 write / Step 3 read at same rate)
+      against the per-bit-depth dispatch in DESIGN § 2.5:
+      - **8-bit and 16-bit input: bit-exact** (full range fits inside
+        the 19-bit ring representation, so the `<<n` / `>>n` pair is
+        a no-op round trip).
+      - **24-bit input: top 19 bits preserved, bottom 5 bits zeroed.**
+        `(int << 8) >> 13` on write loses bits 0-4; `int << 5` on read
+        cannot restore them. This is the intentional lossy
+        normalization (ADR-003 / DESIGN § 2.5); test asserts the top
+        19 bits match.
+      - **32-bit PCM input: top 19 bits preserved, bottom 13 bits
+        zeroed.** `int >> 13` on write loses bits 0-12; `int << 13`
+        on read cannot restore them. Same intentional lossy
+        normalization; test asserts the top 19 bits match. **Do not**
+        assert bit-exact 32-bit round trip — that contradicts the
+        19-bit ring invariant.
+- [ ] Forced underrun (read more frames than available) returns
+      `STATUS_SUCCESS`, scratch is silence-filled, `UnderrunCounter`
+      incremented, `UnderrunFlag = 1`.
+- [ ] Recovery: continued reads while `available < WrapBound / 2` keep
+      delivering silence. When fill recovers ≥ `WrapBound / 2`,
+      `UnderrunFlag = 0` and real data resumes.
 
 ## What This Step Does NOT Do
 
-- No new functionality.
+- No SRC.
 - No caller swap.
+- No changes to `AO_STREAM_RT` or the canonical helper.
 
 ## Completion
 
 ```powershell
-python scripts/execute.py mark 1-int32-ring 3 completed --message "Audit complete; only AoRingWriteFromScratch writes the cable ring."
+python scripts/execute.py mark 1-int32-ring 3 completed --message "Same-rate INT32 ring read + hysteretic underrun."
 ```

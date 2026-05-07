@@ -1,58 +1,65 @@
-# Phase 1 Step 4: Underrun hysteresis end-to-end test
+# Phase 1 Step 4: Hard-reject overflow + counter audit
 
 ## Read First
 
-- `docs/ADR.md` ADR-005 (hysteretic underrun recovery, 50% threshold).
-- Phase 1 Steps 1, 2 (read/write same-rate paths).
+- `docs/ADR.md` ADR-005 (hard-reject overflow + hysteretic underrun)
+- `docs/REVIEW_POLICY.md` § 2 (forbidden drift) — silent overflow is
+  forbidden.
+- Phase 1 Step 2 already implements hard-reject in the write path.
+  This step is the **audit** that verifies no other path silently
+  overwrites the ring.
 
 ## Goal
 
-End-to-end smoke test of the underrun hysteresis path under realistic
-producer/consumer rates. Drive a fresh `FRAME_PIPE` from a controlled
-producer/consumer and confirm:
+Audit `Source/Utilities/loopback.cpp` and confirm that no remaining code
+path silently overwrites cable ring data on overflow. All paths that
+could touch `pipe->Data` / `pipe->WritePos` must:
 
-1. Steady-state with producer rate ≥ consumer rate: no underrun.
-2. Producer underruns once: consumer goes silent until ring fill
-   recovers to ≥ `WrapBound / 2`.
-3. After recovery, consumer delivers real data again.
-4. `UnderrunCounter` increments by exactly 1 per underrun event.
+1. Go through `AoRingWriteFromScratch` (which hard-rejects), OR
+2. Be deleted (legacy paths that contradict ADR-005).
 
-## Planned Files
+## Planned Edits
 
-Edit only:
+This step is mostly read-and-classify, with targeted deletions:
 
-- Add `tests/phase1-runtime/underrun_hysteresis_test.py` (untracked
-  per `docs/GIT_POLICY.md` § 8) — Python harness using `ctypes` to
-  drive a thin user-mode helper that exposes `AoRingWriteFromScratch` /
-  `AoRingReadToScratch` for testing. The helper itself remains
-  internal to the test; do not promote unless explicitly approved.
-
-If a user-mode test harness for the ring does not exist yet, this step
-documents that as a blocker and proposes the minimum helper surface
-needed.
+- Inspect every `loopback.cpp` function that writes to the cable ring.
+- For each function, decide:
+  - **Keep** if it's `AoRingWriteFromScratch` or its helpers.
+  - **Delete** if it's a legacy write path (e.g., `LoopbackWriteRaw`
+    or similar pre-rewrite functions that bypassed overflow checks).
+  - **Refactor** if it's a path that is still called from somewhere
+    valid but uses the wrong overflow semantics (rare; should be
+    captured during pre-step inspection).
 
 ## Rules
 
-- Do not modify `Source/Utilities/loopback.cpp` in this step (it is
-  already correct from Step 2). If the test exposes a bug, capture it
-  as a Step 2 retroactive finding and fix in a Step 2 fix-up commit.
-- Do not promote test artifacts to tracked locations.
+- Tell the user before deleting any function.
+- If a function is called from a non-cable path that still relies on
+  silent overwrite, **stop and report** — do not delete or refactor
+  without approval. (Non-cable streams are out of scope for V1; their
+  legacy behavior may be preserved.)
+- Cite the call sites explicitly in the report.
 
 ## Acceptance Criteria
 
-- [ ] Test runs deterministically and prints PASS / FAIL.
-- [ ] PASS condition: above 4 invariants all hold.
-- [ ] FAIL leaves a captured trace in `tests/phase1-runtime/` for
-      diagnosis.
+- [ ] Audit report committed to `phases/1-int32-ring/step4-audit.md`
+      listing every cable-ring write path and its disposition (keep /
+      delete / refactor).
+- [ ] No remaining cable-ring write path increments `WritePos` without
+      incrementing `OverflowCounter` on overflow.
+- [ ] Build clean.
+- [ ] Step 2's overflow scenario test still passes.
+- [ ] No non-cable (mic-array / speaker / save-data / tone-generator)
+      regression — sample test on those paths still works (manual
+      inspection if no automated coverage exists).
 
 ## What This Step Does NOT Do
 
-- Does not test SRC.
-- Does not test the canonical helper.
-- Does not flip cable transport ownership.
+- No new functionality.
+- No caller swap.
 
 ## Completion
 
 ```powershell
-python scripts/execute.py mark 1-int32-ring 4 completed --message "Underrun hysteresis end-to-end smoke PASS."
+python scripts/execute.py mark 1-int32-ring 4 completed --message "Audit complete; only AoRingWriteFromScratch writes the cable ring."
 ```

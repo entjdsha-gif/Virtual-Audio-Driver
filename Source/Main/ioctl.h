@@ -148,12 +148,48 @@ typedef struct _AO_V2_DIAG {
     ULONG   A_R_LegacyDriveCount;
     ULONG   B_R_PumpDriveCount;
     ULONG   B_R_LegacyDriveCount;
+
+    // Phase 1 Step 6 (ADR-014 phase/1-int32-ring): per-cable canonical
+    // FRAME_PIPE diagnostics. Sourced under pipe->Lock from a single
+    // snapshot helper so OverflowCount / UnderrunCount / UnderrunFlag /
+    // RingFillFrames / WrapBoundFrames are mutually consistent.
+    //
+    //   OverflowCount    -- hard-reject hits per ADR-005.
+    //   UnderrunCount    -- read-insufficient hits per ADR-005.
+    //   RingFillFrames   -- current fill (WritePos - ReadPos, wrap-corrected).
+    //                      Healthy band: a small live-latency value, well
+    //                      below WrapBoundFrames. Drift toward capacity
+    //                      over time is a leak.
+    //   WrapBoundFrames  -- ring capacity (== TargetLatencyFrames after
+    //                      reconcile_wrapbound_to_target settles).
+    //   UnderrunFlag     -- UCHAR; 0 = normal, 1 = drained-recovery.
+    //                      Must clear back to 0 within one fill cycle
+    //                      (<= WrapBound/2 frames of writer activity).
+    //
+    // UnderrunFlag is UCHAR per step6.md and step5 evidence rationale
+    // (counters alone cannot prove the 50%-WrapBound recovery path is
+    // operating). The 3-byte Reserved pad keeps the next ULONG aligned.
+    ULONG   A_OverflowCount;
+    ULONG   A_UnderrunCount;
+    ULONG   A_RingFillFrames;
+    ULONG   A_WrapBoundFrames;
+    UCHAR   A_UnderrunFlag;
+    UCHAR   A_Reserved0[3];
+
+    ULONG   B_OverflowCount;
+    ULONG   B_UnderrunCount;
+    ULONG   B_RingFillFrames;
+    ULONG   B_WrapBoundFrames;
+    UCHAR   B_UnderrunFlag;
+    UCHAR   B_Reserved1[3];
 } AO_V2_DIAG;
 
 // Compile-time shape guard. Bump this C_ASSERT whenever AO_V2_DIAG grows.
-// Phase 5 layout: StructSize (1) + 4 blocks * 7 ULONGs (28) +
-// 4 render-side drive counters (4) = 33 ULONGs = 132 bytes.
-C_ASSERT(sizeof(AO_V2_DIAG) == (1 + 4 * 7 + 4) * sizeof(ULONG));
+// Phase 6 layout: StructSize (1) + 4 blocks * 7 ULONGs (28) +
+// 4 render-side drive counters (4) + 2 cables * 5 ring-diag ULONG-equivs (10)
+// = 43 ULONGs = 172 bytes. Each cable's UCHAR UnderrunFlag + 3-byte
+// Reserved pad together occupy one ULONG slot.
+C_ASSERT(sizeof(AO_V2_DIAG) == (1 + 4 * 7 + 4 + 2 * 5) * sizeof(ULONG));
 
 // Registry value names for persistent settings (stored under service Parameters key)
 // e.g. HKLM\SYSTEM\CurrentControlSet\Services\AOCableA\Parameters

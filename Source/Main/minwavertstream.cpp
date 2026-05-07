@@ -1376,17 +1376,7 @@ NTSTATUS CMiniportWaveRTStream::SetState
                 {
                     pFP = &g_CableBPipe;
                 }
-                if (pFP)
-                {
-                    if (isSpeaker)
-                    {
-                        pFP->RenderPumpFeatureFlags = 0;
-                    }
-                    else
-                    {
-                        pFP->CapturePumpFeatureFlags = 0;
-                    }
-                }
+                FramePipeResetPumpFeatureFlags(pFP, /* isRenderSide */ isSpeaker);
             }
 
             KeReleaseSpinLock(&m_PositionSpinLock, oldIrql);
@@ -1487,11 +1477,15 @@ NTSTATUS CMiniportWaveRTStream::SetState
                         {
                             pFP = &g_CableBPipe;
                         }
-                        if (pFP && pFP->Initialized)
+                        if (pFP)
                         {
-                            BOOLEAN otherSideActive = isSpeaker
-                                ? pFP->MicActive
-                                : pFP->SpeakerActive;
+                            // FramePipeIsDirectionActive folds the
+                            // pipe NULL + Initialized + per-direction
+                            // Active checks behind the loopback.cpp
+                            // ownership boundary (Phase 1 Step 0).
+                            BOOLEAN otherSideActive =
+                                FramePipeIsDirectionActive(
+                                    pFP, /* isSpeaker */ !isSpeaker);
                             if (!otherSideActive)
                             {
                                 FramePipeReset(pFP);
@@ -1674,17 +1668,7 @@ NTSTATUS CMiniportWaveRTStream::SetState
                 {
                     pFP = &g_CableBPipe;
                 }
-                if (pFP)
-                {
-                    if (isSpeaker)
-                    {
-                        pFP->RenderPumpFeatureFlags = m_ulPumpFeatureFlags;
-                    }
-                    else
-                    {
-                        pFP->CapturePumpFeatureFlags = m_ulPumpFeatureFlags;
-                    }
-                }
+                FramePipeSetPumpFeatureFlags(pFP, /* isRenderSide */ isSpeaker, m_ulPumpFeatureFlags);
             }
 
             break;
@@ -1908,27 +1892,15 @@ Mirror:
         {
             pFP = &g_CableBPipe;
         }
-        if (pFP)
-        {
-            if (isSpeaker)
-            {
-                pFP->RenderGatedSkipCount             = m_ulPumpGatedSkipCount;
-                pFP->RenderOverJumpCount              = m_ulPumpOverJumpCount;
-                pFP->RenderFramesProcessedTotal       = m_ullPumpFramesProcessed;
-                pFP->RenderPumpInvocationCount        = m_ulPumpInvocationCount;
-                pFP->RenderPumpShadowDivergenceCount  = m_ulPumpShadowDivergenceCount;
-                pFP->RenderPumpFeatureFlags           = m_ulPumpFeatureFlags;
-            }
-            else
-            {
-                pFP->CaptureGatedSkipCount            = m_ulPumpGatedSkipCount;
-                pFP->CaptureOverJumpCount             = m_ulPumpOverJumpCount;
-                pFP->CaptureFramesProcessedTotal      = m_ullPumpFramesProcessed;
-                pFP->CapturePumpInvocationCount       = m_ulPumpInvocationCount;
-                pFP->CapturePumpShadowDivergenceCount = m_ulPumpShadowDivergenceCount;
-                pFP->CapturePumpFeatureFlags          = m_ulPumpFeatureFlags;
-            }
-        }
+        FramePipePublishPumpCounters(
+            pFP,
+            /* isRenderSide */            isSpeaker,
+            /* gatedSkipCount */          m_ulPumpGatedSkipCount,
+            /* overJumpCount */           m_ulPumpOverJumpCount,
+            /* framesProcessedTotal */    m_ullPumpFramesProcessed,
+            /* invocationCount */         m_ulPumpInvocationCount,
+            /* shadowDivergenceCount */   m_ulPumpShadowDivergenceCount,
+            /* featureFlags */            m_ulPumpFeatureFlags);
     }
 }
 

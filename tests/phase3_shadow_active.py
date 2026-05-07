@@ -44,8 +44,13 @@ V1_STATUS_SIZE = 64
 # new shape including the render-side drive counters at the tail. The
 # Phase 1 blocks stay at the same offsets, so this script's slicing of
 # the A_Render block is unchanged.
-V2_DIAG_SIZE_P1 = 4 + 4 * 7 * 4          # 116
-V2_DIAG_SIZE    = V2_DIAG_SIZE_P1 + 16   # 132
+# Phase 1 Step 6 (2026-05-08): driver may now return 172-byte tail; accept
+# it too. The A_Render block offset is still right after StructSize, so
+# this script's parser is unchanged beyond the size check.
+V2_DIAG_SIZE_P1 = 4 + 4 * 7 * 4              # 116
+V2_DIAG_SIZE_P5 = V2_DIAG_SIZE_P1 + 16        # 132
+V2_DIAG_SIZE_P6 = V2_DIAG_SIZE_P5 + 2 * 5 * 4 # 172
+V2_DIAG_SIZE    = V2_DIAG_SIZE_P6
 V2_BUF_SIZE     = V1_STATUS_SIZE + V2_DIAG_SIZE
 
 
@@ -68,8 +73,8 @@ def read_render_counters(h):
     if not ok or ret.value < V1_STATUS_SIZE + V2_DIAG_SIZE_P1:
         return None
     struct_size = struct.unpack_from("<I", buf.raw, V1_STATUS_SIZE)[0]
-    # Accept either the Phase 1 (116) or the Phase 5 (132) shape.
-    if struct_size != V2_DIAG_SIZE_P1 and struct_size != V2_DIAG_SIZE:
+    # Accept Phase 1 (116), Phase 5 (132), or Phase 6 (172) shape.
+    if struct_size not in (V2_DIAG_SIZE_P1, V2_DIAG_SIZE_P5, V2_DIAG_SIZE_P6):
         return None
     # CableA_Render is the first block, right after StructSize.
     offset = V1_STATUS_SIZE + 4
