@@ -28,7 +28,9 @@
     {
       "step": 3,
       "name": "ring-read-int32-conversion",
-      "status": "pending"
+      "status": "completed",
+      "completed_at": "2026-05-08T03:15:03+0900",
+      "summary": "Same-rate INT32 ring read + hysteretic underrun."
     },
     {
       "step": 4,
