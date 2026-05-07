@@ -49,7 +49,9 @@
     {
       "step": 6,
       "name": "diagnostics-counters",
-      "status": "pending"
+      "status": "completed",
+      "completed_at": "2026-05-08T04:23:21+0900",
+      "summary": "AO_V2_DIAG ring diagnostics exposed; live baseline verified; forced counter scenarios deferred to Phase 4/5."
     }
   ]
 }
