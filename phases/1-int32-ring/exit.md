@@ -4,9 +4,10 @@
 
 All of the following are true:
 
-- [ ] Step 0 (struct shape), Step 1 (write same-rate), Step 2 (read
-      same-rate), Step 3 (overflow audit), Step 4 (underrun
-      hysteresis), Step 5 (diagnostics) all marked completed.
+- [ ] Step 0 (cross-TU access removal), Step 1 (struct/API shape),
+      Step 2 (write same-rate), Step 3 (read same-rate), Step 4
+      (overflow audit), Step 5 (underrun hysteresis), Step 6
+      (diagnostics) all marked completed.
 - [ ] Each step's commit has a passing review per
       `docs/REVIEW_POLICY.md`.
 - [ ] `build-verify.ps1 -Config Release` succeeds clean (no new

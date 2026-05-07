@@ -1,84 +1,58 @@
-# Phase 1 Step 5: Diagnostics counter exposure
+# Phase 1 Step 5: Underrun hysteresis end-to-end test
 
 ## Read First
 
-- `docs/AO_CABLE_V1_DESIGN.md` § 7 (diagnostics IOCTL detail).
-- `docs/REVIEW_POLICY.md` § 7 (diagnostics coupling rule).
-- `Source/Main/ioctl.h` (`AO_V2_DIAG` schema).
-- `test_stream_monitor.py`.
+- `docs/ADR.md` ADR-005 (hysteretic underrun recovery, 50% threshold).
+- Phase 1 Steps 2, 3 (write/read same-rate paths).
 
 ## Goal
 
-Expose Phase 1 ring counters and the underrun-recovery flag state
-through `IOCTL_AO_GET_STREAM_STATUS` so user-mode can observe them:
-`OverflowCounter`, `UnderrunCounter`, `UnderrunFlag` (drained
-boolean), current ring fill in frames, and current `WrapBound`.
+End-to-end smoke test of the underrun hysteresis path under realistic
+producer/consumer rates. Drive a fresh `FRAME_PIPE` from a controlled
+producer/consumer and confirm:
 
-The flag is exposed because counters alone cannot prove the
-50%-`WrapBound` recovery path is operating correctly — a stream that
-sits in `UnderrunFlag = 1` for an extended period is broken even if
-`UnderrunCount` is small. (Review #4 of 8afa59a.)
-
-Since the diagnostics rule (REVIEW_POLICY § 7) requires that
-`ioctl.h`, `adapter.cpp`, and `test_stream_monitor.py` are updated
-together, this is one atomic step.
+1. Steady-state with producer rate ≥ consumer rate: no underrun.
+2. Producer underruns once: consumer goes silent until ring fill
+   recovers to ≥ `WrapBound / 2`.
+3. After recovery, consumer delivers real data again.
+4. `UnderrunCounter` increments by exactly 1 per underrun event.
 
 ## Planned Files
 
 Edit only:
 
-- `Source/Main/ioctl.h` — extend `AO_V2_DIAG` with per-cable
-  ring counters and state: `<Cable>_OverflowCount`,
-  `<Cable>_UnderrunCount`, `<Cable>_UnderrunFlag` (UCHAR; 0 = normal,
-  1 = drained-recovery), `<Cable>_RingFillFrames`,
-  `<Cable>_WrapBoundFrames`. Bump `StructSize` and the `C_ASSERT`
-  shape check.
-- `Source/Main/adapter.cpp` — extend `IOCTL_AO_GET_STREAM_STATUS`
-  handler to fill the new fields from the cable `FRAME_PIPE`s.
-- `test_stream_monitor.py` — read the new fields and print per-cable
-  ring health, including the underrun flag state.
+- Add `tests/phase1-runtime/underrun_hysteresis_test.py` (untracked
+  per `docs/GIT_POLICY.md` § 8) — Python harness using `ctypes` to
+  drive a thin user-mode helper that exposes `AoRingWriteFromScratch` /
+  `AoRingReadToScratch` for testing. The helper itself remains
+  internal to the test; do not promote unless explicitly approved.
+
+If a user-mode test harness for the ring does not exist yet, this step
+documents that as a blocker and proposes the minimum helper surface
+needed.
 
 ## Rules
 
-- Tell the user before editing. Three files are edited atomically.
-- Do not change existing field offsets in `AO_V2_DIAG` (only append).
-- The existing `C_ASSERT` for `AO_V2_DIAG` shape **must** be updated
-  to reflect the new size — this is the test that catches schema
-  drift.
+- Do not modify `Source/Utilities/loopback.cpp` in this step (it is
+  already correct from Step 3). If the test exposes a bug, capture it
+  as a Step 3 retroactive finding and fix in a Step 3 fix-up commit.
+- Do not promote test artifacts to tracked locations.
 
 ## Acceptance Criteria
 
-- [ ] Build clean.
-- [ ] `test_stream_monitor.py` shows 0/0 for `OverflowCount` /
-      `UnderrunCount` on both cables in steady state.
-- [ ] `WrapBoundFrames == TargetLatencyFrames` (default 7168 @ 48k
-      after `reconcile_wrapbound_to_target` settles). This is the
-      ring **capacity**, not the steady-state fill.
-- [ ] `RingFillFrames` is in a small live-latency band — typically
-      well below `TargetLatencyFrames` (a few hundred frames at
-      48 kHz, depending on writer/reader cadence). Fill ≈ capacity
-      means the ring is full and overflow is imminent; fill ≈ 0 with
-      `UnderrunFlag = 0` means writer is keeping up with reader. Both
-      are healthy. Fill drifting upward toward capacity over time is
-      a leak.
-- [ ] `UnderrunFlag` is `0` in steady state. It is allowed to flicker
-      to `1` at startup or under transient stalls, but must clear
-      back to `0` within one fill cycle (≤ `WrapBound / 2` frames of
-      writer activity).
-- [ ] Forced overflow scenario from Step 1 increments
-      `<Cable>_OverflowCount` visible in `test_stream_monitor.py`.
-- [ ] Forced underrun scenario from Step 4 increments
-      `<Cable>_UnderrunCount` AND sets `<Cable>_UnderrunFlag` to `1`,
-      visible in `test_stream_monitor.py`. Flag clears to `0` after
-      ring refills past `WrapBound / 2`.
+- [ ] Test runs deterministically and prints PASS / FAIL.
+- [ ] PASS condition: above 4 invariants all hold.
+- [ ] FAIL leaves a captured trace in `tests/phase1-runtime/` for
+      diagnosis.
 
 ## What This Step Does NOT Do
 
-- Does not change the canonical helper (Phase 3).
-- Does not flip render/capture coupling (Phases 4/5).
+- Does not test SRC.
+- Does not test the canonical helper.
+- Does not flip cable transport ownership.
 
 ## Completion
 
 ```powershell
-python scripts/execute.py mark 1-int32-ring 5 completed --message "AO_V2_DIAG extended with cable ring counters; test_stream_monitor.py reads them."
+python scripts/execute.py mark 1-int32-ring 5 completed --message "Underrun hysteresis end-to-end smoke PASS."
 ```
