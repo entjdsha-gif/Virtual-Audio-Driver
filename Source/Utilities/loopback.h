@@ -371,6 +371,67 @@ VOID FramePipePrefillSilence(PFRAME_PIPE pPipe);
 ULONG FramePipeGetFillFrames(PFRAME_PIPE pPipe);
 
 //=============================================================================
+// Frame Pipe — Cross-TU helpers (Phase 1 Step 0)
+//
+// Narrow accessors that own all FRAME_PIPE field reads/writes needed by
+// translation units other than loopback.cpp. They exist so that
+// minwavertstream.cpp (and any future external caller) does not depend
+// on the legacy FRAME_PIPE field layout, which lets Phase 1 Step 1
+// replace the struct shape without a cross-TU contradiction.
+//
+// All helpers are NULL-safe: passing pPipe == NULL is a no-op (or
+// returns FALSE for the active-query helper). The `Initialized`
+// state is consulted by `FramePipeIsDirectionActive` only — it
+// is the helper that gates the pause-time reset on whether the
+// pipe has been brought up at all. The write/publish helpers do
+// not check `Initialized`, exactly matching the prior inline
+// direct-access behavior in minwavertstream.cpp (which also
+// wrote unconditionally once a non-NULL pPipe had been resolved
+// from the cable globals).
+//
+// Phase 1 Step 0 contract: these helpers preserve the legacy
+// FRAME_PIPE behavior exactly. They do not change semantics; they
+// only relocate the field access into loopback.cpp.
+//=============================================================================
+
+// Returns TRUE iff `pipe` is initialized AND the named direction is
+// currently registered/active. Direction selector: TRUE = speaker side,
+// FALSE = mic side. Any IRQL.
+BOOLEAN FramePipeIsDirectionActive(
+    PFRAME_PIPE  pipe,
+    BOOLEAN      isSpeaker
+);
+
+// Sets the per-direction pump feature-flags field. Direction selector:
+// TRUE = render side, FALSE = capture side. Any IRQL.
+VOID FramePipeSetPumpFeatureFlags(
+    PFRAME_PIPE  pipe,
+    BOOLEAN      isRenderSide,
+    ULONG        flags
+);
+
+// Resets the per-direction pump feature-flags field to 0. Direction
+// selector: TRUE = render side, FALSE = capture side. Any IRQL.
+VOID FramePipeResetPumpFeatureFlags(
+    PFRAME_PIPE  pipe,
+    BOOLEAN      isRenderSide
+);
+
+// Publishes the per-direction pump counter snapshot from the caller's
+// per-stream state. Direction selector: TRUE = render side,
+// FALSE = capture side. Any IRQL.
+VOID FramePipePublishPumpCounters(
+    PFRAME_PIPE  pipe,
+    BOOLEAN      isRenderSide,
+    ULONG        gatedSkipCount,
+    ULONG        overJumpCount,
+    ULONGLONG    framesProcessedTotal,
+    ULONG        invocationCount,
+    ULONG        shadowDivergenceCount,
+    ULONG        featureFlags
+);
+
+//=============================================================================
 // Frame Pipe — Phase 2: Format Registration + DMA Batch API
 //=============================================================================
 

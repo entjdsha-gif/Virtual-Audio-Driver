@@ -2190,6 +2190,97 @@ VOID FramePipeReadToDma(
 
 //=============================================================================
 //
+//  Frame Pipe — Cross-TU helpers (Phase 1 Step 0)
+//
+//  Narrow accessors that own legacy FRAME_PIPE field access for callers
+//  outside loopback.cpp. Behavior-preserving: each helper does exactly
+//  what the inlined direct member access used to do in
+//  minwavertstream.cpp.
+//
+//  Guard layering (matches the legacy inline behavior, not a uniform
+//  "NULL + Initialized" check):
+//    - Active query (FramePipeIsDirectionActive) checks both NULL and
+//      Initialized — it is the gate for the pause-reset path.
+//    - Write/reset/publish helpers (FramePipeSetPumpFeatureFlags,
+//      FramePipeResetPumpFeatureFlags, FramePipePublishPumpCounters)
+//      check NULL only. The legacy code wrote these fields
+//      unconditionally once a non-NULL pPipe had been resolved from
+//      the cable globals; the helpers preserve that contract exactly.
+//
+//  When Phase 1 Step 1 replaces the FRAME_PIPE struct shape, these
+//  helper bodies are the only place that needs a coordinated update;
+//  the external callers compile unchanged.
+//
+//=============================================================================
+
+BOOLEAN FramePipeIsDirectionActive(PFRAME_PIPE pipe, BOOLEAN isSpeaker)
+{
+    if (!pipe || !pipe->Initialized)
+        return FALSE;
+
+    return isSpeaker ? pipe->SpeakerActive : pipe->MicActive;
+}
+
+VOID FramePipeSetPumpFeatureFlags(
+    PFRAME_PIPE  pipe,
+    BOOLEAN      isRenderSide,
+    ULONG        flags)
+{
+    if (!pipe)
+        return;
+
+    if (isRenderSide)
+        pipe->RenderPumpFeatureFlags = flags;
+    else
+        pipe->CapturePumpFeatureFlags = flags;
+}
+
+VOID FramePipeResetPumpFeatureFlags(PFRAME_PIPE pipe, BOOLEAN isRenderSide)
+{
+    if (!pipe)
+        return;
+
+    if (isRenderSide)
+        pipe->RenderPumpFeatureFlags = 0;
+    else
+        pipe->CapturePumpFeatureFlags = 0;
+}
+
+VOID FramePipePublishPumpCounters(
+    PFRAME_PIPE  pipe,
+    BOOLEAN      isRenderSide,
+    ULONG        gatedSkipCount,
+    ULONG        overJumpCount,
+    ULONGLONG    framesProcessedTotal,
+    ULONG        invocationCount,
+    ULONG        shadowDivergenceCount,
+    ULONG        featureFlags)
+{
+    if (!pipe)
+        return;
+
+    if (isRenderSide)
+    {
+        pipe->RenderGatedSkipCount             = gatedSkipCount;
+        pipe->RenderOverJumpCount              = overJumpCount;
+        pipe->RenderFramesProcessedTotal       = framesProcessedTotal;
+        pipe->RenderPumpInvocationCount        = invocationCount;
+        pipe->RenderPumpShadowDivergenceCount  = shadowDivergenceCount;
+        pipe->RenderPumpFeatureFlags           = featureFlags;
+    }
+    else
+    {
+        pipe->CaptureGatedSkipCount            = gatedSkipCount;
+        pipe->CaptureOverJumpCount             = overJumpCount;
+        pipe->CaptureFramesProcessedTotal      = framesProcessedTotal;
+        pipe->CapturePumpInvocationCount       = invocationCount;
+        pipe->CapturePumpShadowDivergenceCount = shadowDivergenceCount;
+        pipe->CapturePumpFeatureFlags          = featureFlags;
+    }
+}
+
+//=============================================================================
+//
 //  AoPumpApplyRenderFlagMask — fail-closed link target stub
 //
 //  History:
