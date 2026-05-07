@@ -227,114 +227,116 @@ extern LOOPBACK_BUFFER g_CableBLoopback;
 #define FP_STARTUP_HEADROOM_MS      300
 
 //=============================================================================
-// FRAME_PIPE structure
+// FRAME_PIPE structure (canonical V1 shape — DESIGN § 2.1)
+//
+// Phase 1 Step 1 (ADR-014 phase/1-int32-ring): replaced the prior ad-hoc
+// FRAME_PIPE shape with the design-locked INT32 frame-indexed shape.
+//
+// Compile-preserving shim layer:
+//   - 12 legacy FramePipe* functions kept in loopback.h/.cpp so untouched
+//     translation units (minwavertstream.cpp, transport_engine.cpp) link
+//     without modification (forward wrappers + behavior-absent stubs).
+//   - 4 Phase 1 Step 0 cross-TU helpers (FramePipeIsDirectionActive,
+//     FramePipeSetPumpFeatureFlags, FramePipeResetPumpFeatureFlags,
+//     FramePipePublishPumpCounters) kept as behavior-absent stubs against
+//     the new shape — minwavertstream.cpp continues to call them but the
+//     bodies do not consult the legacy fields that no longer exist.
+//
+// LOOPBACK_BUFFER above is a separate legacy ring; not touched here.
+//
+// All fields are protected by Lock when touched at DISPATCH_LEVEL.
+// Counters use plain LONG — increments happen under Lock.
 //=============================================================================
 typedef struct _FRAME_PIPE {
-    // ─── INT32 Frame Ring (transport core) ───
-    INT32*              RingBuffer;         // CapacityFrames * PipeChannels INT32 samples
-    ULONG               PipeChannels;       // channels per frame
-    volatile ULONG      WriteFrame;         // producer frame index [0, CapacityFrames)
-    volatile ULONG      ReadFrame;          // consumer frame index [0, CapacityFrames)
-    volatile ULONG      FillFrames;         // explicit fill count (resolves full/empty ambiguity)
-    KSPIN_LOCK          PipeLock;
+    // Lifetime
+    KSPIN_LOCK  Lock;                  // protects all fields below
 
-    // ─── Pipe Format (configured, not dynamic) ───
-    ULONG               PipeSampleRate;     // Hz = configured InternalRate
-    ULONG               PipeBitsPerSample;  // always 32 (INT32)
-    ULONG               PipeBlockAlign;     // PipeChannels * sizeof(INT32)
+    // Internal pipe format — fixed at FramePipeInitCable time, never
+    // changes for the life of the pipe.
+    ULONG       InternalRate;          // ring sample rate, Hz
+    USHORT      InternalBitsPerSample; // ring sample width — always 32 (INT32)
+    LONG        InternalBlockAlign;    // = (InternalBitsPerSample/8) * Channels
 
-    // ─── Stream Format Registration ───
-    ULONG               SpeakerSampleRate;
-    ULONG               SpeakerBitsPerSample;
-    ULONG               SpeakerChannels;
-    ULONG               SpeakerBlockAlign;
-    BOOLEAN             SpeakerIsFloat;     // TRUE for IEEE_FLOAT
-    BOOLEAN             SpeakerActive;
+    // Latency / capacity (frames)
+    LONG        TargetLatencyFrames;   // registry-driven target depth
+    LONG        WrapBound;             // current ring depth, frames
+    LONG        FrameCapacityMax;      // hard upper bound, frames
+    LONG        Channels;              // typically 16 (planar slots)
 
-    ULONG               MicSampleRate;
-    ULONG               MicBitsPerSample;
-    ULONG               MicChannels;
-    ULONG               MicBlockAlign;
-    BOOLEAN             MicIsFloat;         // TRUE for IEEE_FLOAT
-    BOOLEAN             MicActive;
+    // Cursors (frames; wrap at WrapBound)
+    LONG        WritePos;              // render-side fill cursor
+    LONG        ReadPos;               // capture-side drain cursor
 
-    // ─── Path Selection ───
-    BOOLEAN             SpeakerSameRate;    // Speaker rate == PipeSampleRate -> no SRC
-    BOOLEAN             MicSameRate;        // Mic rate == PipeSampleRate -> no SRC
+    // Statistics
+    LONG        OverflowCounter;       // hard-reject hits
+    LONG        UnderrunCounter;       // read-insufficient hits
+    UCHAR       UnderrunFlag;          // 1 = in recovery (silence until WrapBound/2)
 
-    // ─── Fixed Latency (3 separate values) ───
-    ULONG               TargetFillFrames;   // steady-state fill = actual latency
-    ULONG               CapacityFrames;     // ring size = TargetFillFrames * 2
-    ULONG               StartThresholdFrames; // Mic read starts when fill >= this
-    BOOLEAN             StartPhaseComplete; // TRUE after fill >= StartThreshold reached
+    // Persistent SRC state — must survive across calls so the linear-interp
+    // accumulator does not reset at every chunk boundary. VB-Cable carries
+    // the same kind of state per ring (results/vbcable_capture_contract_answers.md
+    // § 0, +0xB8 phase + +0xBC..+0xFB per-channel residual). 16 channel
+    // slots mirror Channels.
+    LONG        WriteSrcPhase;         // accumulator phase (write direction)
+    LONG        WriteSrcResidual[16];  // per-channel residual carry
+    LONG        ReadSrcPhase;          // accumulator phase (read direction)
+    LONG        ReadSrcResidual[16];   // per-channel residual carry
 
-    // ─── Overflow / Underrun / Diagnostics ───
-    volatile ULONG      DropCount;          // frames rejected on write (pipe full)
-    volatile ULONG      UnderrunCount;      // frames silence-filled on read (post-startup)
-    volatile ULONG      ActiveRenderCount;  // active render streams
-
-    // ─── Phase 1: per-direction pump counter pairs (rev 2.4 split) ───
-    // Speaker and Mic streams share one FRAME_PIPE. A single counter would
-    // race between the two DPCs. Per-direction slots remove the race because
-    // only one stream direction ever writes a given slot (Speaker's pump
-    // writes Render*, Mic's pump writes Capture*).
-    //
-    // Phase 1 contract: every field below is zero-initialized in
-    // FramePipeInit and never written by any execution path. Phase 3 is the
-    // first phase that increments these. FramePipeReset is the only place
-    // that touches per-session fields (GatedSkip/OverJump); monotonic
-    // run-totals (Frames/Invocation/ShadowDivergence) and FeatureFlags
-    // survive reset so Phase 3's shadow-window ratio stays measurable
-    // across RUN -> PAUSE -> RUN cycles.
-    volatile ULONG      RenderGatedSkipCount;            // per-session
-    volatile ULONG      RenderOverJumpCount;             // per-session
-    volatile ULONGLONG  RenderFramesProcessedTotal;      // monotonic
-    volatile ULONG      RenderPumpInvocationCount;       // monotonic
-    volatile ULONG      RenderPumpShadowDivergenceCount; // monotonic
-
-    volatile ULONG      CaptureGatedSkipCount;            // per-session
-    volatile ULONG      CaptureOverJumpCount;             // per-session
-    volatile ULONGLONG  CaptureFramesProcessedTotal;      // monotonic
-    volatile ULONG      CapturePumpInvocationCount;       // monotonic
-    volatile ULONG      CapturePumpShadowDivergenceCount; // monotonic
-
-    // Per-direction feature-flag snapshots. Stored non-volatile because they
-    // are set by a stream on SetState transition (rare) and read by the
-    // IOCTL snapshot (also rare). Phase 1 leaves both at zero.
-    ULONG               RenderPumpFeatureFlags;
-    ULONG               CapturePumpFeatureFlags;
-
-    // Phase 5 (2026-04-14): per-side drive counters for one-owner proof.
-    // Each counter is incremented at most once per UpdatePosition/pump
-    // helper invocation that actually reaches the FramePipeWriteFromDma
-    // call site for this direction. RenderPumpDriveCount is written by
-    // PumpToCurrentPositionFromQuery's render transport block.
-    // RenderLegacyDriveCount is written by ReadBytes() when it enters the
-    // cable-pipe branch. Both are monotonic evidence counters, like the
-    // Phase 1 pump counters; FramePipeReset() does not touch them.
-    // Exclusivity is the Phase 5 one-owner property: at any moment,
-    // exactly one of the two is growing for a given cable render stream.
-    volatile ULONG      RenderPumpDriveCount;   // Phase 5 pump transport fires
-    volatile ULONG      RenderLegacyDriveCount; // Phase 5 ReadBytes cable render fires
-
-    // ─── Scratch Buffers (allocated at PASSIVE, used at DISPATCH) ───
-    // Speaker and Mic DPCs run on separate cores — each needs its own scratch.
-    BYTE*               ScratchDma;         // DMA linearization buffer (future use)
-    INT32*              ScratchSpk;         // Speaker DPC: normalize → pipe write
-    INT32*              ScratchMic;         // Mic DPC: pipe read → denormalize
-    ULONG               ScratchSizeBytes;   // size of each scratch buffer
-
-    // ─── Configuration ───
-    BOOLEAN             Initialized;
-
-    // ─── Debug (rate-limited DbgPrint) ───
-    LONGLONG            DbgLastPrintQpc;    // last print timestamp (QPC ticks)
-    ULONG               DbgWriteFrames;     // frames written since last print
-    ULONG               DbgReadFrames;      // frames read since last print
+    // Backing storage — INT32 array of size WrapBound * Channels
+    LONG*       Data;
+    SIZE_T      DataAllocBytes;
 } FRAME_PIPE, *PFRAME_PIPE;
 
 //=============================================================================
-// Frame Pipe — Core API (Phase 1)
+// Frame Pipe — Canonical V1 API (DESIGN § 2.2)
+//
+// Phase 1 Step 1: declarations introduced + lifetime helpers implemented;
+// AoRingWriteFromScratch / AoRingReadToScratch are STATUS_NOT_IMPLEMENTED
+// stubs until Step 2 / Step 3.
+//=============================================================================
+
+NTSTATUS FramePipeInitCable(
+    PFRAME_PIPE  pipe,
+    ULONG        internalRate,
+    LONG         channels,
+    LONG         initialFrames
+);
+
+VOID     FramePipeFree(PFRAME_PIPE pipe);
+
+// STOP path: zero positions, underrun flag, and SRC phase/residual state.
+VOID     FramePipeResetCable(PFRAME_PIPE pipe);
+
+// (WritePos - ReadPos) wrap-corrected; any IRQL.
+ULONG    AoRingAvailableFrames(PFRAME_PIPE pipe);
+
+// Write/read with format conversion + persistent SRC state.
+// Step 1: stubs returning STATUS_NOT_IMPLEMENTED.
+NTSTATUS AoRingWriteFromScratch(
+    PFRAME_PIPE  pipe,
+    const BYTE*  scratch,
+    ULONG        frames,
+    ULONG        srcRate,
+    ULONG        srcChannels,
+    ULONG        srcBits
+);
+
+NTSTATUS AoRingReadToScratch(
+    PFRAME_PIPE  pipe,
+    BYTE*        scratch,
+    ULONG        frames,
+    ULONG        dstRate,
+    ULONG        dstChannels,
+    ULONG        dstBits
+);
+
+//=============================================================================
+// Frame Pipe — Core API (legacy compile-preserving shim — Phase 1 Step 1)
+//
+// The 12 legacy FramePipe* functions stay so that minwavertstream.cpp /
+// transport_engine.cpp link without modification. Their bodies are
+// forward wrappers (where new canonical API has matching semantics) or
+// behavior-absent stubs. Phase 6 cleanup deletes the shim.
 //=============================================================================
 
 // Init/Cleanup (PASSIVE_LEVEL)
@@ -371,55 +373,56 @@ VOID FramePipePrefillSilence(PFRAME_PIPE pPipe);
 ULONG FramePipeGetFillFrames(PFRAME_PIPE pPipe);
 
 //=============================================================================
-// Frame Pipe — Cross-TU helpers (Phase 1 Step 0)
+// Frame Pipe — Cross-TU helpers (Phase 1 Step 0 boundary, Step 1 stubs)
 //
-// Narrow accessors that own all FRAME_PIPE field reads/writes needed by
-// translation units other than loopback.cpp. They exist so that
-// minwavertstream.cpp (and any future external caller) does not depend
-// on the legacy FRAME_PIPE field layout, which lets Phase 1 Step 1
-// replace the struct shape without a cross-TU contradiction.
+// These helpers were introduced in Phase 1 Step 0 (commit ddbb977) so that
+// minwavertstream.cpp does not depend on the legacy FRAME_PIPE field
+// layout. The Step 0 bodies read/wrote legacy fields (Initialized,
+// Speaker/MicActive, Render/CapturePumpFeatureFlags, all six
+// Render/Capture*Count fields).
 //
-// All helpers are NULL-safe: passing pPipe == NULL is a no-op (or
-// returns FALSE for the active-query helper). The `Initialized`
-// state is consulted by `FramePipeIsDirectionActive` only — it
-// is the helper that gates the pause-time reset on whether the
-// pipe has been brought up at all. The write/publish helpers do
-// not check `Initialized`, exactly matching the prior inline
-// direct-access behavior in minwavertstream.cpp (which also
-// wrote unconditionally once a non-NULL pPipe had been resolved
-// from the cable globals).
+// Phase 1 Step 1 (canonical FRAME_PIPE shape) removed those legacy fields.
+// As of Step 1 these helpers are **kept as behavior-absent stubs**:
+//   - FramePipeIsDirectionActive returns FALSE unconditionally.
+//   - FramePipeSetPumpFeatureFlags / FramePipeResetPumpFeatureFlags /
+//     FramePipePublishPumpCounters are no-ops.
 //
-// Phase 1 Step 0 contract: these helpers preserve the legacy
-// FRAME_PIPE behavior exactly. They do not change semantics; they
-// only relocate the field access into loopback.cpp.
+// minwavertstream.cpp continues to call these helpers in the legacy
+// pump / pause-reset / counter-publish paths, but the calls produce no
+// observable cable-transport behavior. Phase 5 ownership flip preceded
+// this step, so the legacy pump path is no longer driving audio. Phase 6
+// cleanup deletes both these helpers and the minwavertstream.cpp call
+// sites together with the AO_V2_DIAG legacy fields.
 //=============================================================================
 
-// Returns TRUE iff `pipe` is initialized AND the named direction is
-// currently registered/active. Direction selector: TRUE = speaker side,
-// FALSE = mic side. Any IRQL.
+// Behavior-absent stub (Phase 1 Step 1): always returns FALSE.
+// Direction selector: TRUE = speaker side, FALSE = mic side.
+// Any IRQL.
 BOOLEAN FramePipeIsDirectionActive(
     PFRAME_PIPE  pipe,
     BOOLEAN      isSpeaker
 );
 
-// Sets the per-direction pump feature-flags field. Direction selector:
-// TRUE = render side, FALSE = capture side. Any IRQL.
+// Behavior-absent stub (Phase 1 Step 1): no-op.
+// Direction selector: TRUE = render side, FALSE = capture side.
+// Any IRQL.
 VOID FramePipeSetPumpFeatureFlags(
     PFRAME_PIPE  pipe,
     BOOLEAN      isRenderSide,
     ULONG        flags
 );
 
-// Resets the per-direction pump feature-flags field to 0. Direction
-// selector: TRUE = render side, FALSE = capture side. Any IRQL.
+// Behavior-absent stub (Phase 1 Step 1): no-op.
+// Direction selector: TRUE = render side, FALSE = capture side.
+// Any IRQL.
 VOID FramePipeResetPumpFeatureFlags(
     PFRAME_PIPE  pipe,
     BOOLEAN      isRenderSide
 );
 
-// Publishes the per-direction pump counter snapshot from the caller's
-// per-stream state. Direction selector: TRUE = render side,
-// FALSE = capture side. Any IRQL.
+// Behavior-absent stub (Phase 1 Step 1): no-op.
+// Direction selector: TRUE = render side, FALSE = capture side.
+// Any IRQL.
 VOID FramePipePublishPumpCounters(
     PFRAME_PIPE  pipe,
     BOOLEAN      isRenderSide,
@@ -492,15 +495,30 @@ extern FRAME_PIPE g_CableAPipe;
 extern FRAME_PIPE g_CableBPipe;
 
 //=============================================================================
-// Phase 5 (2026-04-14): IOCTL_AO_SET_PUMP_FEATURE_FLAGS C-style entry point.
-// adapter.cpp (which does not include minwavert.h / minwavertstream.h) calls
-// this to apply a mask-constrained render-ownership flag update to the
-// currently-active cable speaker stream. cableIndex: 0 = Cable A, 1 = Cable B.
-// Masks are silently restricted to AO_PUMP_FLAG_DISABLE_LEGACY_RENDER inside
-// the helper implementation in minwavertstream.cpp. Returns STATUS_SUCCESS
-// even when there is no active stream (treated as a no-op). Effect is
-// visible at the next PumpToCurrentPositionFromQuery() invocation and the
-// next UpdatePosition() render branch (1-2 position queries).
+// IOCTL_AO_SET_PUMP_FEATURE_FLAGS C-style entry point — fail-closed stub.
+//
+// History:
+//   2c733f1 (Phase 5 CLOSED, 2026-04-14) — original definition lived in
+//     minwavertstream.cpp and applied a mask-constrained render-ownership
+//     flag update to the active cable speaker stream. Returned
+//     STATUS_SUCCESS (treated no-active-stream as a no-op).
+//   5a013b1 (Phase 6 Step 1 skeleton, 2026-04-15) — wholesale removed
+//     the definition and its dependent globals/static helpers/member body
+//     while migrating cable transport ownership to the shared transport
+//     engine. The declaration here and the four call sites in
+//     adapter.cpp's IOCTL_AO_SET_PUMP_FEATURE_FLAGS handler stayed,
+//     leaving the link unresolved.
+//   f7801bd (Phase 1 build fix) — fail-closed stub added in
+//     Source/Utilities/loopback.cpp so the link target exists.
+//
+// Current contract (Phase 1):
+//   - Implementation lives in Source/Utilities/loopback.cpp, NOT
+//     minwavertstream.cpp.
+//   - Returns STATUS_NOT_SUPPORTED for any (cableIndex, setMask,
+//     clearMask) input. No driver state is mutated.
+//   - The IOCTL caller sees a clear "not supported in this build"
+//     result. Phase 6 cleanup is expected to retire both the IOCTL
+//     handler in adapter.cpp and this stub together.
 //=============================================================================
 #ifdef __cplusplus
 extern "C" {

@@ -1236,989 +1236,406 @@ NTSTATUS LoopbackSetInternalRate(PLOOPBACK_BUFFER pLoopback, ULONG newRate)
 //=============================================================================
 //=============================================================================
 //
-//  FRAME_PIPE Implementation — Fixed Frame Pipe (VB-style transport)
-//  Phase 1: Core ring + write/read + diagnostics
+//  FRAME_PIPE Implementation — Canonical V1 Cable Ring (DESIGN § 2.1 / § 2.2)
+//
+//  Phase 1 Step 1 (ADR-014 phase/1-int32-ring):
+//   - struct shape replaced; 6 canonical APIs introduced (4 real + 2 stubs).
+//   - 12 legacy FramePipe* functions kept as a compile-preserving shim
+//     so untouched translation units (minwavertstream.cpp,
+//     transport_engine.cpp) continue to link.
+//   - 4 Phase 1 Step 0 cross-TU helpers kept as behavior-absent stubs
+//     against the new shape (their legacy fields are gone).
+//   - LOOPBACK_BUFFER above is a separate legacy ring; not touched here.
+//
+//  This commit does NOT claim runtime cable-transport correctness. Step 2
+//  (write same-rate) and Step 3 (read same-rate) restore behavior on the
+//  canonical API; Step 4-6 migrate callers off the shim; Phase 6 deletes
+//  the shim layer.
 //
 //=============================================================================
 //=============================================================================
 
-// Pool tag for Frame Pipe allocations
-#define FP_POOL_TAG  'ePpF'     // "FpPe"
+// Pool tag for Frame Pipe allocations ("FpPe" reversed for little-endian)
+#define FP_POOL_TAG  'ePpF'
 
-// Global instances
+// Default cap on FrameCapacityMax when registry value is unavailable.
+// 192000 frames = ~4 s @ 48 kHz; same upper bound the legacy path used.
+#define FP_DEFAULT_CAPACITY_MAX_FRAMES   192000
+
+// Global instances (declared extern in loopback.h)
 FRAME_PIPE g_CableAPipe = { 0 };
 FRAME_PIPE g_CableBPipe = { 0 };
 
 //=============================================================================
-// FramePipeInit — Allocate ring and scratch buffers (PASSIVE_LEVEL)
+// AoRingAvailableFrames — wrap-corrected (WritePos - ReadPos)
+//
+// Defined here ahead of the lifetime helpers so the wrappers below can
+// forward to it without a separate forward-declare. Any IRQL.
+//=============================================================================
+ULONG AoRingAvailableFrames(PFRAME_PIPE pipe)
+{
+    if (!pipe || !pipe->Data || pipe->WrapBound <= 0)
+        return 0;
+
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&pipe->Lock, &oldIrql);
+
+    LONG wrap = pipe->WrapBound;
+    LONG diff = pipe->WritePos - pipe->ReadPos;
+    if (diff < 0)
+        diff += wrap;
+
+    KeReleaseSpinLock(&pipe->Lock, oldIrql);
+    return (ULONG)diff;
+}
+
+//=============================================================================
+// FramePipeInitCable — allocate ring, set fields, init lock (PASSIVE_LEVEL)
+//
+// DESIGN § 2.1: Data allocation = initialFrames * channels * sizeof(LONG)
+// from non-paged pool. TargetLatencyFrames = WrapBound = initialFrames.
+// FrameCapacityMax = max(initialFrames, registry-driven max).
 //=============================================================================
 #pragma code_seg("PAGE")
-NTSTATUS FramePipeInit(
-    PFRAME_PIPE     pPipe,
-    ULONG           pipeSampleRate,
-    ULONG           pipeChannels,
-    ULONG           targetFillFrames)
+NTSTATUS FramePipeInitCable(
+    PFRAME_PIPE  pipe,
+    ULONG        internalRate,
+    LONG         channels,
+    LONG         initialFrames)
 {
     PAGED_CODE();
 
-    if (!pPipe || pipeChannels == 0 || pipeChannels > FP_MAX_CHANNELS ||
-        pipeSampleRate == 0)
+    if (!pipe || internalRate == 0 ||
+        channels <= 0 || channels > 16 ||
+        initialFrames <= 0)
     {
         return STATUS_INVALID_PARAMETER;
     }
 
-    // Guard against re-init: clean up existing allocations first
-    if (pPipe->Initialized)
-        FramePipeCleanup(pPipe);
+    // Re-init guard: free any prior allocation first
+    if (pipe->Data)
+        FramePipeFree(pipe);
 
-    // Clamp target fill
-    if (targetFillFrames < FP_MIN_TARGET_FILL)
-        targetFillFrames = FP_MIN_TARGET_FILL;
-    if (targetFillFrames > FP_MAX_TARGET_FILL)
-        targetFillFrames = FP_MAX_TARGET_FILL;
+    SIZE_T allocBytes = (SIZE_T)initialFrames * (SIZE_T)channels * sizeof(LONG);
+    if (allocBytes == 0)
+        return STATUS_INVALID_PARAMETER;
 
-    ULONG capacityFrames = targetFillFrames * FP_CAPACITY_MULTIPLIER;
-    ULONG ringBytes = capacityFrames * pipeChannels * sizeof(INT32);
-    ULONG scratchBytes = targetFillFrames * pipeChannels * sizeof(INT32);
-
-    // Allocate ring buffer (NonPagedPoolNx — used at DISPATCH_LEVEL)
-    INT32* ringBuf = (INT32*)ExAllocatePool2(POOL_FLAG_NON_PAGED, ringBytes, FP_POOL_TAG);
-    if (!ringBuf)
+    LONG* data = (LONG*)ExAllocatePool2(POOL_FLAG_NON_PAGED, allocBytes, FP_POOL_TAG);
+    if (!data)
         return STATUS_INSUFFICIENT_RESOURCES;
 
-    // Allocate scratch DMA buffer
-    BYTE* scratchDma = (BYTE*)ExAllocatePool2(POOL_FLAG_NON_PAGED, scratchBytes, FP_POOL_TAG);
-    if (!scratchDma)
-    {
-        ExFreePoolWithTag(ringBuf, FP_POOL_TAG);
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
+    // ExAllocatePool2 already zeroes; explicit Zero is defense in depth.
+    RtlZeroMemory(pipe, sizeof(FRAME_PIPE));
 
-    // Allocate speaker scratch buffer
-    INT32* scratchSpk = (INT32*)ExAllocatePool2(POOL_FLAG_NON_PAGED, scratchBytes, FP_POOL_TAG);
-    if (!scratchSpk)
-    {
-        ExFreePoolWithTag(scratchDma, FP_POOL_TAG);
-        ExFreePoolWithTag(ringBuf, FP_POOL_TAG);
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
+    KeInitializeSpinLock(&pipe->Lock);
 
-    // Allocate mic scratch buffer
-    INT32* scratchMic = (INT32*)ExAllocatePool2(POOL_FLAG_NON_PAGED, scratchBytes, FP_POOL_TAG);
-    if (!scratchMic)
-    {
-        ExFreePoolWithTag(scratchSpk, FP_POOL_TAG);
-        ExFreePoolWithTag(scratchDma, FP_POOL_TAG);
-        ExFreePoolWithTag(ringBuf, FP_POOL_TAG);
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
+    pipe->InternalRate          = internalRate;
+    pipe->InternalBitsPerSample = 32;
+    pipe->InternalBlockAlign    = (LONG)(channels * sizeof(LONG));
 
-    // Zero all buffers
-    RtlZeroMemory(ringBuf, ringBytes);
-    RtlZeroMemory(scratchDma, scratchBytes);
-    RtlZeroMemory(scratchSpk, scratchBytes);
-    RtlZeroMemory(scratchMic, scratchBytes);
+    pipe->TargetLatencyFrames   = initialFrames;
+    pipe->WrapBound             = initialFrames;
+    pipe->FrameCapacityMax      =
+        (initialFrames > FP_DEFAULT_CAPACITY_MAX_FRAMES)
+            ? initialFrames
+            : FP_DEFAULT_CAPACITY_MAX_FRAMES;
+    pipe->Channels              = channels;
 
-    // Zero the pipe struct, then fill fields
-    RtlZeroMemory(pPipe, sizeof(FRAME_PIPE));
+    // WritePos / ReadPos / counters / UnderrunFlag / SRC state already zero
+    // from RtlZeroMemory above.
 
-    pPipe->RingBuffer           = ringBuf;
-    pPipe->PipeChannels         = pipeChannels;
-    pPipe->WriteFrame           = 0;
-    pPipe->ReadFrame            = 0;
-    pPipe->FillFrames           = 0;
-    KeInitializeSpinLock(&pPipe->PipeLock);
-
-    pPipe->PipeSampleRate       = pipeSampleRate;
-    pPipe->PipeBitsPerSample    = 32;
-    pPipe->PipeBlockAlign       = pipeChannels * sizeof(INT32);
-
-    pPipe->TargetFillFrames     = targetFillFrames;
-    pPipe->CapacityFrames       = capacityFrames;
-    // No startup threshold — Mic reads immediately.
-    // This maximizes buffer available during Speaker STOP gaps.
-    // Steady-state fill will be near capacity (VB-Cable behavior).
-    pPipe->StartThresholdFrames = 0;
-    pPipe->StartPhaseComplete   = TRUE;
-
-    pPipe->DropCount            = 0;
-    pPipe->UnderrunCount        = 0;
-    pPipe->ActiveRenderCount    = 0;
-
-    // Phase 1: per-direction pump counters — all zero at init.
-    // Phase 1 has no writer for any of these fields; Phase 3 is the first.
-    pPipe->RenderGatedSkipCount             = 0;
-    pPipe->RenderOverJumpCount              = 0;
-    pPipe->RenderFramesProcessedTotal       = 0;
-    pPipe->RenderPumpInvocationCount        = 0;
-    pPipe->RenderPumpShadowDivergenceCount  = 0;
-    pPipe->RenderPumpFeatureFlags           = 0;
-
-    pPipe->CaptureGatedSkipCount            = 0;
-    pPipe->CaptureOverJumpCount             = 0;
-    pPipe->CaptureFramesProcessedTotal      = 0;
-    pPipe->CapturePumpInvocationCount       = 0;
-    pPipe->CapturePumpShadowDivergenceCount = 0;
-    pPipe->CapturePumpFeatureFlags          = 0;
-
-    // Phase 5: per-side drive counters. Monotonic; not touched by
-    // FramePipeReset(). See loopback.h for the one-owner contract.
-    pPipe->RenderPumpDriveCount             = 0;
-    pPipe->RenderLegacyDriveCount           = 0;
-
-    pPipe->ScratchDma           = scratchDma;
-    pPipe->ScratchSpk           = scratchSpk;
-    pPipe->ScratchMic           = scratchMic;
-    pPipe->ScratchSizeBytes     = scratchBytes;
-
-    pPipe->Initialized          = TRUE;
+    pipe->Data                  = data;
+    pipe->DataAllocBytes        = allocBytes;
 
     return STATUS_SUCCESS;
 }
 #pragma code_seg()
 
 //=============================================================================
-// FramePipeCleanup — Free all buffers (PASSIVE_LEVEL)
+// FramePipeFree — release Data, zero struct (PASSIVE_LEVEL)
 //=============================================================================
+#pragma code_seg("PAGE")
+VOID FramePipeFree(PFRAME_PIPE pipe)
+{
+    PAGED_CODE();
+
+    if (!pipe)
+        return;
+
+    if (pipe->Data)
+    {
+        ExFreePoolWithTag(pipe->Data, FP_POOL_TAG);
+        pipe->Data = NULL;
+    }
+
+    RtlZeroMemory(pipe, sizeof(FRAME_PIPE));
+}
+#pragma code_seg()
+
+//=============================================================================
+// FramePipeResetCable — STOP path: zero positions + UnderrunFlag + SRC state
+//
+// Counters (OverflowCounter / UnderrunCounter) are preserved across reset
+// for diagnostics (Phase 1 Step 6 acceptance).
+//=============================================================================
+#pragma code_seg("PAGE")
+VOID FramePipeResetCable(PFRAME_PIPE pipe)
+{
+    PAGED_CODE();
+
+    if (!pipe || !pipe->Data)
+        return;
+
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&pipe->Lock, &oldIrql);
+
+    pipe->WritePos      = 0;
+    pipe->ReadPos       = 0;
+    pipe->UnderrunFlag  = 0;
+
+    pipe->WriteSrcPhase = 0;
+    pipe->ReadSrcPhase  = 0;
+    RtlZeroMemory(pipe->WriteSrcResidual, sizeof(pipe->WriteSrcResidual));
+    RtlZeroMemory(pipe->ReadSrcResidual,  sizeof(pipe->ReadSrcResidual));
+
+    KeReleaseSpinLock(&pipe->Lock, oldIrql);
+}
+#pragma code_seg()
+
+//=============================================================================
+// AoRingWriteFromScratch — Step 2 implements; Step 1 stub.
+//=============================================================================
+NTSTATUS AoRingWriteFromScratch(
+    PFRAME_PIPE  pipe,
+    const BYTE*  scratch,
+    ULONG        frames,
+    ULONG        srcRate,
+    ULONG        srcChannels,
+    ULONG        srcBits)
+{
+    UNREFERENCED_PARAMETER(pipe);
+    UNREFERENCED_PARAMETER(scratch);
+    UNREFERENCED_PARAMETER(frames);
+    UNREFERENCED_PARAMETER(srcRate);
+    UNREFERENCED_PARAMETER(srcChannels);
+    UNREFERENCED_PARAMETER(srcBits);
+    return STATUS_NOT_IMPLEMENTED;
+}
+
+//=============================================================================
+// AoRingReadToScratch — Step 3 implements; Step 1 stub.
+//=============================================================================
+NTSTATUS AoRingReadToScratch(
+    PFRAME_PIPE  pipe,
+    BYTE*        scratch,
+    ULONG        frames,
+    ULONG        dstRate,
+    ULONG        dstChannels,
+    ULONG        dstBits)
+{
+    UNREFERENCED_PARAMETER(pipe);
+    UNREFERENCED_PARAMETER(scratch);
+    UNREFERENCED_PARAMETER(frames);
+    UNREFERENCED_PARAMETER(dstRate);
+    UNREFERENCED_PARAMETER(dstChannels);
+    UNREFERENCED_PARAMETER(dstBits);
+    return STATUS_NOT_IMPLEMENTED;
+}
+
+//=============================================================================
+//=============================================================================
+//
+//  Legacy compile-preserving shim layer — Phase 1 Step 1.
+//
+//  Each entry point below was a real legacy FramePipe* function whose body
+//  touched fields that no longer exist on the canonical FRAME_PIPE shape.
+//  We keep the *symbols* so untouched translation units link without
+//  modification, and route the bodies to either the new canonical API
+//  (forward wrappers, where semantics carry over) or to a no-op /
+//  zero-return stub (where they do not). Step 2+ migrates each external
+//  caller off these shims; Phase 6 cleanup deletes this entire section.
+//
+//=============================================================================
+//=============================================================================
+
+//---- Forward wrappers --------------------------------------------------------
+
+#pragma code_seg("PAGE")
+NTSTATUS FramePipeInit(
+    PFRAME_PIPE  pPipe,
+    ULONG        pipeSampleRate,
+    ULONG        pipeChannels,
+    ULONG        targetFillFrames)
+{
+    PAGED_CODE();
+
+    return FramePipeInitCable(pPipe,
+                              pipeSampleRate,
+                              (LONG)pipeChannels,
+                              (LONG)targetFillFrames);
+}
+#pragma code_seg()
+
 #pragma code_seg("PAGE")
 VOID FramePipeCleanup(PFRAME_PIPE pPipe)
 {
     PAGED_CODE();
-
-    if (!pPipe)
-        return;
-
-    if (pPipe->ScratchSpk)
-    {
-        ExFreePoolWithTag(pPipe->ScratchSpk, FP_POOL_TAG);
-        pPipe->ScratchSpk = NULL;
-    }
-    if (pPipe->ScratchMic)
-    {
-        ExFreePoolWithTag(pPipe->ScratchMic, FP_POOL_TAG);
-        pPipe->ScratchMic = NULL;
-    }
-    if (pPipe->ScratchDma)
-    {
-        ExFreePoolWithTag(pPipe->ScratchDma, FP_POOL_TAG);
-        pPipe->ScratchDma = NULL;
-    }
-    if (pPipe->RingBuffer)
-    {
-        ExFreePoolWithTag(pPipe->RingBuffer, FP_POOL_TAG);
-        pPipe->RingBuffer = NULL;
-    }
-
-    pPipe->Initialized = FALSE;
+    FramePipeFree(pPipe);
 }
 #pragma code_seg()
 
-//=============================================================================
-// FramePipeWriteFrames — Speaker DPC writes INT32 frames into pipe
-//
-// Returns: frameCount on success, 0 on reject.
-// Overflow: entire write is rejected (all-or-nothing), DropCount incremented.
-// Min gate (FP_MIN_GATE_FRAMES) is NOT enforced here — that's DPC policy.
-// Called at DISPATCH_LEVEL.
-//=============================================================================
-ULONG FramePipeWriteFrames(
-    PFRAME_PIPE     pPipe,
-    const INT32*    srcFrames,
-    ULONG           frameCount)
-{
-    if (!pPipe || !pPipe->Initialized || !srcFrames || frameCount == 0)
-        return 0;
-
-    KIRQL oldIrql;
-    KeAcquireSpinLock(&pPipe->PipeLock, &oldIrql);
-
-    ULONG capacity = pPipe->CapacityFrames;
-    ULONG channels = pPipe->PipeChannels;
-    ULONG writeIdx = pPipe->WriteFrame;
-    ULONG fill     = pPipe->FillFrames;
-
-    ULONG freeFrames = capacity - fill;
-
-    // Hard reject: entire write rejected if not enough space.
-    if (frameCount > freeFrames)
-    {
-        pPipe->DropCount += frameCount;
-        KeReleaseSpinLock(&pPipe->PipeLock, oldIrql);
-        return 0;
-    }
-
-    ULONG samplesPerFrame = channels;
-    ULONG framesBeforeWrap = capacity - writeIdx;
-
-    if (frameCount <= framesBeforeWrap)
-    {
-        RtlCopyMemory(
-            &pPipe->RingBuffer[writeIdx * samplesPerFrame],
-            srcFrames,
-            frameCount * samplesPerFrame * sizeof(INT32));
-    }
-    else
-    {
-        ULONG firstFrames = framesBeforeWrap;
-        ULONG secondFrames = frameCount - firstFrames;
-
-        RtlCopyMemory(
-            &pPipe->RingBuffer[writeIdx * samplesPerFrame],
-            srcFrames,
-            firstFrames * samplesPerFrame * sizeof(INT32));
-
-        RtlCopyMemory(
-            &pPipe->RingBuffer[0],
-            &srcFrames[firstFrames * samplesPerFrame],
-            secondFrames * samplesPerFrame * sizeof(INT32));
-    }
-
-    pPipe->WriteFrame = (writeIdx + frameCount) % capacity;
-    pPipe->FillFrames = fill + frameCount;
-
-    KeReleaseSpinLock(&pPipe->PipeLock, oldIrql);
-
-    return frameCount;
-}
-
-//=============================================================================
-// FramePipePrefillSilence — Inject silence into ring up to TargetFillFrames
-//
-// Purpose: give the reader immediate headroom on speaker RUN transition so
-// Phone Link's ~1ms WASAPI pulls don't starve while the writer ramps.
-// Called from SetState(KSSTATE_RUN) speaker branch after RegisterFormat.
-// No-op if the ring is not empty — we respect persisted data across
-// STOP/RUN gaps and only cushion fresh openings.
-//=============================================================================
-VOID FramePipePrefillSilence(
-    PFRAME_PIPE     pPipe)
-{
-    if (!pPipe || !pPipe->Initialized || !pPipe->RingBuffer)
-        return;
-
-    KIRQL oldIrql;
-    KeAcquireSpinLock(&pPipe->PipeLock, &oldIrql);
-
-    if (pPipe->FillFrames != 0)
-    {
-        KeReleaseSpinLock(&pPipe->PipeLock, oldIrql);
-        return;
-    }
-
-    ULONG capacity = pPipe->CapacityFrames;
-    ULONG channels = pPipe->PipeChannels;
-    // Fixed 40 ms silence cushion regardless of TargetFillFrames.
-    // Using TargetFillFrames would inject multi-second silence when
-    // the pipe is configured with large headroom, which is audible as
-    // a delay at the start of each speaker run.
-    ULONG toFill = (pPipe->PipeSampleRate * FP_STARTUP_HEADROOM_MS) / 1000;
-    if (toFill == 0)
-        toFill = FP_MIN_TARGET_FILL;
-    if (toFill > capacity - 1)
-        toFill = capacity - 1;
-
-    // Zero the prefill region — ring may contain stale samples from a
-    // previous session even though FillFrames == 0 marks it empty.
-    RtlZeroMemory(
-        pPipe->RingBuffer,
-        toFill * channels * sizeof(INT32));
-
-    pPipe->ReadFrame  = 0;
-    pPipe->WriteFrame = toFill % capacity;
-    pPipe->FillFrames = toFill;
-
-    ULONG prefillFrames = toFill;
-    KeReleaseSpinLock(&pPipe->PipeLock, oldIrql);
-
-    DbgPrint("[FP_PREFILL] pipe=%p frames=%u\n", pPipe, prefillFrames);
-}
-
-//=============================================================================
-// FramePipeReadFrames — Mic DPC reads INT32 frames from pipe
-//
-// Returns: number of frames read from ring (0 if silence-filled).
-// Underrun: output is zero-filled, UnderrunCount incremented (frames).
-// Startup: silence until FillFrames reaches StartThresholdFrames.
-// Called at DISPATCH_LEVEL.
-//=============================================================================
-ULONG FramePipeReadFrames(
-    PFRAME_PIPE     pPipe,
-    INT32*          dstFrames,
-    ULONG           frameCount)
-{
-    if (!pPipe || !pPipe->Initialized || !dstFrames || frameCount == 0)
-        return 0;
-
-    LARGE_INTEGER qpc = KeQueryPerformanceCounter(NULL);
-
-    KIRQL oldIrql;
-    KeAcquireSpinLock(&pPipe->PipeLock, &oldIrql);
-
-    ULONG capacity = pPipe->CapacityFrames;
-    ULONG channels = pPipe->PipeChannels;
-    ULONG readIdx  = pPipe->ReadFrame;
-    ULONG fill     = pPipe->FillFrames;
-    ULONG samplesPerFrame = channels;
-    ULONG outputSamples = frameCount * samplesPerFrame;
-
-    // Case 1: Startup phase — not yet filled to threshold
-    if (!pPipe->StartPhaseComplete && fill < pPipe->StartThresholdFrames)
-    {
-        RtlZeroMemory(dstFrames, outputSamples * sizeof(INT32));
-        KeReleaseSpinLock(&pPipe->PipeLock, oldIrql);
-        DbgPrint("[FP_READ] pipe=%p qpc=%lld req=%u fill=%u STARTUP\n",
-                 pPipe, qpc.QuadPart, frameCount, fill);
-        return 0;  // startup silence, not counted as underrun
-    }
-
-    // We've reached threshold at least once
-    pPipe->StartPhaseComplete = TRUE;
-
-    // Case 2: Empty (post-startup)
-    if (fill == 0)
-    {
-        RtlZeroMemory(dstFrames, outputSamples * sizeof(INT32));
-        pPipe->UnderrunCount += frameCount;
-        KeReleaseSpinLock(&pPipe->PipeLock, oldIrql);
-        DbgPrint("[FP_READ] pipe=%p qpc=%lld req=%u fill=0 UNDERRUN\n",
-                 pPipe, qpc.QuadPart, frameCount);
-        return 0;
-    }
-
-    // Case 3 & 4: Partial or full read
-    ULONG framesToRead = (fill < frameCount) ? fill : frameCount;
-    ULONG framesBeforeWrap = capacity - readIdx;
-
-    if (framesToRead <= framesBeforeWrap)
-    {
-        RtlCopyMemory(
-            dstFrames,
-            &pPipe->RingBuffer[readIdx * samplesPerFrame],
-            framesToRead * samplesPerFrame * sizeof(INT32));
-    }
-    else
-    {
-        ULONG firstFrames = framesBeforeWrap;
-        ULONG secondFrames = framesToRead - firstFrames;
-
-        RtlCopyMemory(
-            dstFrames,
-            &pPipe->RingBuffer[readIdx * samplesPerFrame],
-            firstFrames * samplesPerFrame * sizeof(INT32));
-
-        RtlCopyMemory(
-            &dstFrames[firstFrames * samplesPerFrame],
-            &pPipe->RingBuffer[0],
-            secondFrames * samplesPerFrame * sizeof(INT32));
-    }
-
-    pPipe->ReadFrame = (readIdx + framesToRead) % capacity;
-    pPipe->FillFrames = fill - framesToRead;
-
-    // Partial read: zero-fill remainder
-    if (framesToRead < frameCount)
-    {
-        ULONG remainFrames = frameCount - framesToRead;
-        RtlZeroMemory(
-            &dstFrames[framesToRead * samplesPerFrame],
-            remainFrames * samplesPerFrame * sizeof(INT32));
-        pPipe->UnderrunCount += remainFrames;
-    }
-
-    ULONG readOut = framesToRead;
-    ULONG fillAfter = pPipe->FillFrames;
-    BOOLEAN partial = (framesToRead < frameCount);
-    KeReleaseSpinLock(&pPipe->PipeLock, oldIrql);
-
-    DbgPrint("[FP_READ] pipe=%p qpc=%lld req=%u fill=%u out=%u fillAfter=%u %s\n",
-             pPipe, qpc.QuadPart, frameCount, fill, readOut, fillAfter,
-             partial ? "PARTIAL" : "FULL");
-
-    return framesToRead;
-}
-
-//=============================================================================
-// FramePipeReset — Clear ring state (PASSIVE_LEVEL, after KeFlushQueuedDpcs)
-//=============================================================================
 #pragma code_seg("PAGE")
 VOID FramePipeReset(PFRAME_PIPE pPipe)
 {
     PAGED_CODE();
-
-    if (!pPipe || !pPipe->Initialized)
-        return;
-
-    KIRQL oldIrql;
-    KeAcquireSpinLock(&pPipe->PipeLock, &oldIrql);
-
-    pPipe->WriteFrame         = 0;
-    pPipe->ReadFrame          = 0;
-    pPipe->FillFrames         = 0;
-    pPipe->StartPhaseComplete = FALSE;
-    pPipe->DropCount          = 0;
-    pPipe->UnderrunCount      = 0;
-
-    // Phase 1: per-session pump counters reset on ring reset.
-    // Mirrors VB FUN_1400039ac — per-session fields cleared so the user
-    // sees a clean slate on each RUN, while monotonic run-totals survive
-    // so Phase 3's shadow-window divergence ratio stays measurable across
-    // RUN -> PAUSE -> RUN cycles.
-    pPipe->RenderGatedSkipCount  = 0;
-    pPipe->RenderOverJumpCount   = 0;
-    pPipe->CaptureGatedSkipCount = 0;
-    pPipe->CaptureOverJumpCount  = 0;
-
-    // Do NOT reset on session boundary (monotonic):
-    //   Render/CaptureFramesProcessedTotal
-    //   Render/CapturePumpInvocationCount
-    //   Render/CapturePumpShadowDivergenceCount
-    //   Render/CapturePumpFeatureFlags
-
-    // Zero the ring
-    if (pPipe->RingBuffer)
-    {
-        RtlZeroMemory(
-            pPipe->RingBuffer,
-            pPipe->CapacityFrames * pPipe->PipeChannels * sizeof(INT32));
-    }
-
-    KeReleaseSpinLock(&pPipe->PipeLock, oldIrql);
+    FramePipeResetCable(pPipe);
 }
 #pragma code_seg()
 
-//=============================================================================
-// FramePipeGetFillFrames — Query current fill level (any IRQL)
-//=============================================================================
 ULONG FramePipeGetFillFrames(PFRAME_PIPE pPipe)
 {
-    if (!pPipe || !pPipe->Initialized)
-        return 0;
-
-    return pPipe->FillFrames;
+    return AoRingAvailableFrames(pPipe);
 }
 
-
-//=============================================================================
-//=============================================================================
+//---- Behavior-absent stubs ---------------------------------------------------
 //
-//  FRAME_PIPE Phase 2: Format Registration + INT32 Normalization +
-//                      Channel Mapping + DMA Batch Conversion
+// These functions used to drive the legacy transport. After the struct
+// rewrite their body fields are gone; rather than re-implement against the
+// canonical shape (which is Step 2+ work), we return a safe no-op so that
+// external callers compile and link. Audio will not move through these
+// paths until Step 2 / Step 3 land and external callers migrate to the
+// new canonical API.
 //
-//=============================================================================
-//=============================================================================
+// Step 1 acceptance explicitly notes: "Existing transport callers ...
+// compile, even if behavior incorrect."
+//------------------------------------------------------------------------------
 
-//=============================================================================
-// INT32 ~19-bit normalization helpers (all integer-only, DISPATCH safe)
-//
-// Range: [-262144, +262143] (~18-bit + sign)
-// 16-bit round-trip is lossless: (s16 << 3) >> 3 == s16
-// 24-bit loses lower 5 bits (same trade-off as VB-Cable)
-//=============================================================================
-
-static __forceinline INT32 FpNorm16(INT16 s)
+ULONG FramePipeWriteFrames(
+    PFRAME_PIPE   pPipe,
+    const INT32*  srcFrames,
+    ULONG         frameCount)
 {
-    return (INT32)s << 3;
+    UNREFERENCED_PARAMETER(pPipe);
+    UNREFERENCED_PARAMETER(srcFrames);
+    UNREFERENCED_PARAMETER(frameCount);
+    return 0;
 }
 
-static __forceinline INT16 FpDenorm16(INT32 v)
+ULONG FramePipeReadFrames(
+    PFRAME_PIPE  pPipe,
+    INT32*       dstFrames,
+    ULONG        frameCount)
 {
-    return (INT16)(v >> 3);
+    UNREFERENCED_PARAMETER(pPipe);
+    UNREFERENCED_PARAMETER(dstFrames);
+    UNREFERENCED_PARAMETER(frameCount);
+    return 0;
 }
 
-static __forceinline INT32 FpNorm24(const BYTE* p)
+VOID FramePipePrefillSilence(PFRAME_PIPE pPipe)
 {
-    // Read 24-bit packed little-endian, sign-extend, shift right 5
-    INT32 s24 = (INT32)(p[0] | (p[1] << 8) | ((INT8)p[2] << 16));
-    return s24 >> 5;
+    UNREFERENCED_PARAMETER(pPipe);
 }
 
-static __forceinline VOID FpDenorm24(INT32 v, BYTE* p)
-{
-    INT32 s24 = v << 5;
-    p[0] = (BYTE)(s24 & 0xFF);
-    p[1] = (BYTE)((s24 >> 8) & 0xFF);
-    p[2] = (BYTE)((s24 >> 16) & 0xFF);
-}
-
-// Phase 2 (G9): direct copy matches VB-Cable's observed 32-bit PCM
-// behavior. The pipe carries the application's raw 32-bit samples.
-// Safe on cable-only single-writer / single-reader path; see the
-// Phase 2 proposal (results/phase2_edit_proposal.md §2.3) for the
-// headroom caveat if mixing is ever added in a later phase.
-static __forceinline INT32 FpNorm32i(INT32 s)
-{
-    return s;
-}
-
-// Phase 2 (G9 mirror): direct copy, symmetric with FpNorm32i.
-static __forceinline INT32 FpDenorm32i(INT32 v)
-{
-    return v;
-}
-
-// Phase 2 (G10): direct bit cast matches VB-Cable's observed 32-bit
-// float behavior. The pipe carries the raw IEEE-754 bit pattern
-// reinterpreted as INT32. Consumer (FpDenormFloat) casts it back.
-// Safe on single-writer / single-reader paired cable.
-static __forceinline INT32 FpNormFloat(UINT32 bits)
-{
-    return (INT32)bits;
-}
-
-// Phase 2 (G10 mirror): direct bit cast, symmetric with FpNormFloat.
-static __forceinline UINT32 FpDenormFloat(INT32 v)
-{
-    return (UINT32)v;
-}
-
-//=============================================================================
-// FramePipeRegisterFormat — Stream announces its format (PASSIVE_LEVEL)
-//=============================================================================
 #pragma code_seg("PAGE")
 VOID FramePipeRegisterFormat(
-    PFRAME_PIPE     pPipe,
-    BOOLEAN         isSpeaker,
-    ULONG           sampleRate,
-    ULONG           bitsPerSample,
-    ULONG           nChannels,
-    ULONG           nBlockAlign,
-    BOOLEAN         isFloat)
+    PFRAME_PIPE  pPipe,
+    BOOLEAN      isSpeaker,
+    ULONG        sampleRate,
+    ULONG        bitsPerSample,
+    ULONG        nChannels,
+    ULONG        nBlockAlign,
+    BOOLEAN      isFloat)
 {
     PAGED_CODE();
-
-    if (!pPipe || !pPipe->Initialized)
-        return;
-
-    KIRQL oldIrql;
-    KeAcquireSpinLock(&pPipe->PipeLock, &oldIrql);
-
-    BOOLEAN wasActive = isSpeaker ? pPipe->SpeakerActive : pPipe->MicActive;
-
-    if (isSpeaker)
-    {
-        pPipe->SpeakerSampleRate    = sampleRate;
-        pPipe->SpeakerBitsPerSample = bitsPerSample;
-        pPipe->SpeakerChannels      = nChannels;
-        pPipe->SpeakerBlockAlign    = nBlockAlign;
-        pPipe->SpeakerIsFloat       = isFloat;
-        pPipe->SpeakerActive        = TRUE;
-        pPipe->SpeakerSameRate      = (sampleRate == pPipe->PipeSampleRate);
-        // Do NOT reset pipe or StartPhaseComplete on Speaker re-register.
-        // Ring data and state persist across STOP/RUN gaps (VB-Cable behavior).
-    }
-    else
-    {
-        pPipe->MicSampleRate        = sampleRate;
-        pPipe->MicBitsPerSample     = bitsPerSample;
-        pPipe->MicChannels          = nChannels;
-        pPipe->MicBlockAlign        = nBlockAlign;
-        pPipe->MicIsFloat           = isFloat;
-        pPipe->MicActive            = TRUE;
-        pPipe->MicSameRate          = (sampleRate == pPipe->PipeSampleRate);
-
-        // Re-arm startup gate on every fresh mic open (!wasActive).
-        // FramePipeInit sets StartPhaseComplete=TRUE so the first call
-        // after a reset skips the gate entirely — that is precisely the
-        // bug observed in phase5c_instr_ed23271 where Cable B mic's first
-        // ~7300 reads all returned UNDERRUN zero-fill. Rearming here with
-        // threshold = FP_STARTUP_HEADROOM_MS ensures each new call waits
-        // for the speaker-side prefill cushion to materialize before
-        // delivering data to the reader.
-        if (!wasActive)
-        {
-            ULONG threshold = (pPipe->PipeSampleRate * FP_STARTUP_HEADROOM_MS) / 1000;
-            if (threshold == 0)
-                threshold = FP_MIN_TARGET_FILL;
-            pPipe->StartThresholdFrames = threshold;
-            pPipe->StartPhaseComplete   = FALSE;
-        }
-    }
-
-    // Only increment if transitioning from inactive to active
-    if (isSpeaker && !wasActive)
-        pPipe->ActiveRenderCount++;
-
-    KeReleaseSpinLock(&pPipe->PipeLock, oldIrql);
-
-    {
-        const char* id = (pPipe == &g_CableAPipe) ? "A" : (pPipe == &g_CableBPipe) ? "B" : "?";
-        DbgPrint("AO_PIPE[%s]: RegisterFormat %s rate=%u bps=%u ch=%u align=%u float=%d SameRate=%d PipeRate=%u PipeCh=%u\n",
-            id, isSpeaker ? "SPK" : "MIC", sampleRate, bitsPerSample, nChannels, nBlockAlign,
-            (int)isFloat, isSpeaker ? (int)pPipe->SpeakerSameRate : (int)pPipe->MicSameRate,
-            pPipe->PipeSampleRate, pPipe->PipeChannels);
-    }
+    UNREFERENCED_PARAMETER(pPipe);
+    UNREFERENCED_PARAMETER(isSpeaker);
+    UNREFERENCED_PARAMETER(sampleRate);
+    UNREFERENCED_PARAMETER(bitsPerSample);
+    UNREFERENCED_PARAMETER(nChannels);
+    UNREFERENCED_PARAMETER(nBlockAlign);
+    UNREFERENCED_PARAMETER(isFloat);
 }
 #pragma code_seg()
 
-//=============================================================================
-// FramePipeUnregisterFormat — Stream leaving (PASSIVE_LEVEL)
-//=============================================================================
 #pragma code_seg("PAGE")
 VOID FramePipeUnregisterFormat(
-    PFRAME_PIPE     pPipe,
-    BOOLEAN         isSpeaker)
+    PFRAME_PIPE  pPipe,
+    BOOLEAN      isSpeaker)
 {
     PAGED_CODE();
-
-    if (!pPipe || !pPipe->Initialized)
-        return;
-
-    KIRQL oldIrql;
-    KeAcquireSpinLock(&pPipe->PipeLock, &oldIrql);
-
-    if (isSpeaker)
-    {
-        pPipe->SpeakerActive = FALSE;
-        if (pPipe->ActiveRenderCount > 0)
-            pPipe->ActiveRenderCount--;
-    }
-    else
-    {
-        pPipe->MicActive = FALSE;
-    }
-
-    // Both stopped → reset pipe
-    BOOLEAN bothStopped = !pPipe->SpeakerActive && !pPipe->MicActive;
-
-    KeReleaseSpinLock(&pPipe->PipeLock, oldIrql);
-
-    {
-        const char* id = (pPipe == &g_CableAPipe) ? "A" : (pPipe == &g_CableBPipe) ? "B" : "?";
-        DbgPrint("AO_PIPE[%s]: UnregisterFormat %s bothStopped=%d Fill=%u Drop=%u Underrun=%u\n",
-            id, isSpeaker ? "SPK" : "MIC", (int)bothStopped,
-            pPipe->FillFrames, pPipe->DropCount, pPipe->UnderrunCount);
-    }
-
-    if (bothStopped)
-        FramePipeReset(pPipe);
+    UNREFERENCED_PARAMETER(pPipe);
+    UNREFERENCED_PARAMETER(isSpeaker);
 }
 #pragma code_seg()
 
-//=============================================================================
-// FramePipeWriteFromDma / FramePipeWriteFromDmaEx
-//
-// Speaker DPC batch: DMA bytes → normalize → channel map → optional
-// Y2 fade envelope (Ex variant only) → pipe write. Runs at DISPATCH_LEVEL.
-//
-// Returns frames written (0 = rejected or error).
-// Caller loops over DMA wrap boundary; each call gets contiguous bytes.
-//
-// Phase 6 Y2-1: Ex variant takes an opaque AO_STREAM_RT* for fade hook.
-// Legacy non-Ex entry is a thin forward with rtOpaque == NULL, preserving
-// byte-identical behavior for the current legacy ReadBytes caller.
-//=============================================================================
-
-// Forward declaration of the Y2-1 fade adapter. Defined in
-// transport_engine.cpp; takes an opaque AO_STREAM_RT pointer so this TU
-// stays out of the transport struct layout. Safe to call with NULL.
-extern "C" VOID AoCableApplyRenderFadeInScratch(
-    PVOID   rtOpaque,
-    LONG*   scratch,
-    ULONG   sampleCount);
-
 ULONG FramePipeWriteFromDma(
-    PFRAME_PIPE     pPipe,
-    const BYTE*     dmaData,
-    ULONG           byteCount)
+    PFRAME_PIPE  pPipe,
+    const BYTE*  dmaData,
+    ULONG        byteCount)
 {
-    // Legacy path — byte-identical to pre-Y2 behavior. No fade envelope.
-    return FramePipeWriteFromDmaEx(pPipe, dmaData, byteCount, NULL);
+    UNREFERENCED_PARAMETER(pPipe);
+    UNREFERENCED_PARAMETER(dmaData);
+    UNREFERENCED_PARAMETER(byteCount);
+    return 0;
 }
 
 ULONG FramePipeWriteFromDmaEx(
-    PFRAME_PIPE     pPipe,
-    const BYTE*     dmaData,
-    ULONG           byteCount,
-    PVOID           rtOpaque)
+    PFRAME_PIPE  pPipe,
+    const BYTE*  dmaData,
+    ULONG        byteCount,
+    PVOID        rtOpaque)
 {
-    if (!pPipe || !pPipe->Initialized || !pPipe->SpeakerActive ||
-        !dmaData || byteCount == 0)
-    {
-        return 0;
-    }
-
-    // Fail-closed: rate mismatch requires SRC (Phase 3). Drop until then.
-    if (!pPipe->SpeakerSameRate)
-    {
-        ULONG frameCount = byteCount / pPipe->SpeakerBlockAlign;
-        if (frameCount > 0)
-            pPipe->DropCount += frameCount;
-        {
-            const char* id = (pPipe == &g_CableAPipe) ? "A" : (pPipe == &g_CableBPipe) ? "B" : "?";
-            DbgPrint("AO_PIPE[%s] WR: DROP rate mismatch SpkRate=%u PipeRate=%u frames=%u\n",
-                id, pPipe->SpeakerSampleRate, pPipe->PipeSampleRate, frameCount);
-        }
-        return 0;
-    }
-
-    ULONG spkBlockAlign = pPipe->SpeakerBlockAlign;
-    ULONG totalFrames = byteCount / spkBlockAlign;
-    if (totalFrames == 0)
-        return 0;
-
-    ULONG pipeChannels = pPipe->PipeChannels;
-    ULONG spkChannels  = pPipe->SpeakerChannels;
-    ULONG bps          = pPipe->SpeakerBitsPerSample;
-    BOOLEAN isFloat    = pPipe->SpeakerIsFloat;
-    INT32* scratch     = pPipe->ScratchSpk;
-    ULONG maxFrames    = pPipe->ScratchSizeBytes / (pipeChannels * sizeof(INT32));
-    ULONG copyChannels = (spkChannels < pipeChannels) ? spkChannels : pipeChannels;
-
-    ULONG totalWritten = 0;
-    ULONG offset = 0;
-
-    while (offset < totalFrames)
-    {
-        ULONG chunk = totalFrames - offset;
-        if (chunk > maxFrames)
-            chunk = maxFrames;
-
-        // Normalize + channel map into scratch
-        for (ULONG f = 0; f < chunk; f++)
-        {
-            const BYTE* src = dmaData + (offset + f) * spkBlockAlign;
-            INT32* dst = scratch + f * pipeChannels;
-
-            for (ULONG ch = 0; ch < pipeChannels; ch++)
-                dst[ch] = 0;
-
-            if (bps == 16 && !isFloat)
-            {
-                const INT16* s16 = (const INT16*)src;
-                for (ULONG ch = 0; ch < copyChannels; ch++)
-                    dst[ch] = FpNorm16(s16[ch]);
-            }
-            else if (bps == 24 && !isFloat)
-            {
-                for (ULONG ch = 0; ch < copyChannels; ch++)
-                    dst[ch] = FpNorm24(src + ch * 3);
-            }
-            else if (bps == 32 && isFloat)
-            {
-                const UINT32* bits = (const UINT32*)src;
-                for (ULONG ch = 0; ch < copyChannels; ch++)
-                    dst[ch] = FpNormFloat(bits[ch]);
-            }
-            else if (bps == 32 && !isFloat)
-            {
-                const INT32* s32 = (const INT32*)src;
-                for (ULONG ch = 0; ch < copyChannels; ch++)
-                    dst[ch] = FpNorm32i(s32[ch]);
-            }
-        }
-
-        // Phase 6 Y2-1 fade envelope hook. Applied on the scratch
-        // buffer AFTER normalize-to-INT32 and BEFORE the pipe write,
-        // matching VB FUN_140005634 → 51a8 order. rtOpaque is NULL on
-        // the legacy path (Y2-1 default), so the non-Ex entry is
-        // byte-identical to the pre-Y2 behavior.
-        if (rtOpaque)
-        {
-            AoCableApplyRenderFadeInScratch(
-                rtOpaque,
-                (LONG*)scratch,
-                chunk * pipeChannels);
-        }
-
-        // Write chunk to pipe (all-or-nothing per chunk)
-        ULONG written = FramePipeWriteFrames(pPipe, scratch, chunk);
-        totalWritten += written;
-
-        // If pipe rejected this chunk, stop (pipe full)
-        if (written == 0)
-            break;
-
-        offset += chunk;
-    }
-
-    // Per-write cadence trace (pairs with FP_READ to diagnose mid-call
-    // UNDERRUNs — distinguishes writer jitter from reader starvation).
-    {
-        LARGE_INTEGER qpc2 = KeQueryPerformanceCounter(NULL);
-        ULONG fillNow = pPipe->FillFrames;
-        DbgPrint("[FP_WRITE] pipe=%p qpc=%lld req=%u wrote=%u fillAfter=%u drop=%u\n",
-            pPipe, qpc2.QuadPart, totalFrames, totalWritten,
-            fillNow, pPipe->DropCount);
-    }
-
-    // Rate-limited diagnostics (~1s interval)
-    pPipe->DbgWriteFrames += totalWritten;
-    {
-        LARGE_INTEGER now;
-        now = KeQueryPerformanceCounter(NULL);
-        LONGLONG elapsed = now.QuadPart - pPipe->DbgLastPrintQpc;
-        if (elapsed > 10000000 || pPipe->DbgLastPrintQpc == 0)
-        {
-            {
-                const char* id = (pPipe == &g_CableAPipe) ? "A" : (pPipe == &g_CableBPipe) ? "B" : "?";
-                DbgPrint("AO_PIPE[%s] WR: Fill=%u/%u Drop=%u Underrun=%u Start=%d "
-                    "ReqF=%u DoneF=%u RdF=%u SpkAct=%d MicAct=%d\n",
-                    id, pPipe->FillFrames, pPipe->CapacityFrames,
-                    pPipe->DropCount, pPipe->UnderrunCount,
-                    (int)pPipe->StartPhaseComplete,
-                    totalFrames, totalWritten, pPipe->DbgReadFrames,
-                    (int)pPipe->SpeakerActive, (int)pPipe->MicActive);
-            }
-            pPipe->DbgWriteFrames = 0;
-            pPipe->DbgReadFrames = 0;
-            pPipe->DbgLastPrintQpc = now.QuadPart;
-        }
-    }
-
-    return totalWritten;
+    UNREFERENCED_PARAMETER(pPipe);
+    UNREFERENCED_PARAMETER(dmaData);
+    UNREFERENCED_PARAMETER(byteCount);
+    UNREFERENCED_PARAMETER(rtOpaque);
+    return 0;
 }
 
-//=============================================================================
-// FramePipeReadToDma — Mic DPC batch: pipe read → channel map →
-//                      denormalize → DMA bytes (DISPATCH_LEVEL)
-//
-// Always fills byteCount bytes. Underrun → silence (handled by ReadFrames).
-//=============================================================================
 VOID FramePipeReadToDma(
-    PFRAME_PIPE     pPipe,
-    BYTE*           dmaData,
-    ULONG           byteCount)
+    PFRAME_PIPE  pPipe,
+    BYTE*        dmaData,
+    ULONG        byteCount)
 {
-    if (!pPipe || !pPipe->Initialized || !dmaData || byteCount == 0)
-    {
-        if (dmaData && byteCount > 0)
-            RtlZeroMemory(dmaData, byteCount);
-        return;
-    }
-
-    // Fail-closed: rate mismatch requires SRC (Phase 3). Output silence.
-    if (!pPipe->MicSameRate || !pPipe->MicActive)
-    {
-        // Log once per second max
-        {
-            LARGE_INTEGER now = KeQueryPerformanceCounter(NULL);
-            if (now.QuadPart - pPipe->DbgLastPrintQpc > 10000000 || pPipe->DbgLastPrintQpc == 0)
-            {
-                {
-                    const char* id = (pPipe == &g_CableAPipe) ? "A" : (pPipe == &g_CableBPipe) ? "B" : "?";
-                    DbgPrint("AO_PIPE[%s] RD: SILENCE (MicSameRate=%d MicActive=%d MicRate=%u PipeRate=%u)\n",
-                        id, (int)pPipe->MicSameRate, (int)pPipe->MicActive,
-                        pPipe->MicSampleRate, pPipe->PipeSampleRate);
-                }
-                pPipe->DbgLastPrintQpc = now.QuadPart;
-            }
-        }
-        RtlZeroMemory(dmaData, byteCount);
-        return;
-    }
-
-    ULONG micBlockAlign = pPipe->MicBlockAlign;
-    ULONG totalFrames = byteCount / micBlockAlign;
-    if (totalFrames == 0)
-        return;
-
-    ULONG pipeChannels = pPipe->PipeChannels;
-    ULONG micChannels  = pPipe->MicChannels;
-    ULONG bps          = pPipe->MicBitsPerSample;
-    BOOLEAN isFloat    = pPipe->MicIsFloat;
-    INT32* scratch     = pPipe->ScratchMic;
-    ULONG maxFrames    = pPipe->ScratchSizeBytes / (pipeChannels * sizeof(INT32));
-    ULONG copyChannels = (pipeChannels < micChannels) ? pipeChannels : micChannels;
-
-    ULONG offset = 0;
-
-    while (offset < totalFrames)
-    {
-        ULONG chunk = totalFrames - offset;
-        if (chunk > maxFrames)
-            chunk = maxFrames;
-
-        // Read chunk from pipe (zero-fills on underrun/startup)
-        FramePipeReadFrames(pPipe, scratch, chunk);
-
-        // Channel map + denormalize into DMA
-        for (ULONG f = 0; f < chunk; f++)
-        {
-            INT32* src = scratch + f * pipeChannels;
-            BYTE* dst = dmaData + (offset + f) * micBlockAlign;
-
-            if (bps == 16 && !isFloat)
-            {
-                INT16* d16 = (INT16*)dst;
-                ULONG ch;
-                for (ch = 0; ch < copyChannels; ch++)
-                    d16[ch] = FpDenorm16(src[ch]);
-                for (; ch < micChannels; ch++)
-                    d16[ch] = 0;
-            }
-            else if (bps == 24 && !isFloat)
-            {
-                ULONG ch;
-                for (ch = 0; ch < copyChannels; ch++)
-                    FpDenorm24(src[ch], dst + ch * 3);
-                for (; ch < micChannels; ch++)
-                {
-                    BYTE* p = dst + ch * 3;
-                    p[0] = p[1] = p[2] = 0;
-                }
-            }
-            else if (bps == 32 && isFloat)
-            {
-                UINT32* d32 = (UINT32*)dst;
-                ULONG ch;
-                for (ch = 0; ch < copyChannels; ch++)
-                    d32[ch] = FpDenormFloat(src[ch]);
-                for (; ch < micChannels; ch++)
-                    d32[ch] = 0;
-            }
-            else if (bps == 32 && !isFloat)
-            {
-                INT32* d32 = (INT32*)dst;
-                ULONG ch;
-                for (ch = 0; ch < copyChannels; ch++)
-                    d32[ch] = FpDenorm32i(src[ch]);
-                for (; ch < micChannels; ch++)
-                    d32[ch] = 0;
-            }
-        }
-
-        offset += chunk;
-    }
-
-    pPipe->DbgReadFrames += totalFrames;
-
-    // Handle trailing bytes that don't form a complete frame
-    ULONG usedBytes = totalFrames * micBlockAlign;
-    if (usedBytes < byteCount)
-        RtlZeroMemory(dmaData + usedBytes, byteCount - usedBytes);
+    UNREFERENCED_PARAMETER(pPipe);
+    UNREFERENCED_PARAMETER(dmaData);
+    UNREFERENCED_PARAMETER(byteCount);
 }
 
 //=============================================================================
+//=============================================================================
 //
-//  Frame Pipe — Cross-TU helpers (Phase 1 Step 0)
+//  Phase 1 Step 0 cross-TU helpers — converted to behavior-absent stubs
+//  against the new FRAME_PIPE shape (Phase 1 Step 1).
 //
-//  Narrow accessors that own legacy FRAME_PIPE field access for callers
-//  outside loopback.cpp. Behavior-preserving: each helper does exactly
-//  what the inlined direct member access used to do in
-//  minwavertstream.cpp.
+//  These four helpers were introduced in commit ddbb977 (Phase 1 Step 0)
+//  to remove direct FRAME_PIPE field access from minwavertstream.cpp.
+//  Their bodies in Step 0 read/wrote legacy fields (Initialized,
+//  Speaker/MicActive, Render/CapturePumpFeatureFlags, all six
+//  Render/Capture*Count fields). Those fields are gone in the canonical
+//  shape, so the bodies are now stubs:
+//    - FramePipeIsDirectionActive returns FALSE unconditionally
+//    - FramePipeSetPumpFeatureFlags is a no-op
+//    - FramePipeResetPumpFeatureFlags is a no-op
+//    - FramePipePublishPumpCounters is a no-op
 //
-//  Guard layering (matches the legacy inline behavior, not a uniform
-//  "NULL + Initialized" check):
-//    - Active query (FramePipeIsDirectionActive) checks both NULL and
-//      Initialized — it is the gate for the pause-reset path.
-//    - Write/reset/publish helpers (FramePipeSetPumpFeatureFlags,
-//      FramePipeResetPumpFeatureFlags, FramePipePublishPumpCounters)
-//      check NULL only. The legacy code wrote these fields
-//      unconditionally once a non-NULL pPipe had been resolved from
-//      the cable globals; the helpers preserve that contract exactly.
+//  minwavertstream.cpp is untouched; it continues to call these helpers
+//  in the legacy pump / pause-reset / counter-publish paths. The calls
+//  link, but produce no observable cable-transport behavior. Phase 5
+//  ownership flip preceded this step, so the legacy pump path is no
+//  longer driving audio. Phase 6 cleanup deletes both these helpers
+//  and the minwavertstream.cpp call sites together with the AO_V2_DIAG
+//  legacy fields.
 //
-//  When Phase 1 Step 1 replaces the FRAME_PIPE struct shape, these
-//  helper bodies are the only place that needs a coordinated update;
-//  the external callers compile unchanged.
-//
+//=============================================================================
 //=============================================================================
 
 BOOLEAN FramePipeIsDirectionActive(PFRAME_PIPE pipe, BOOLEAN isSpeaker)
 {
-    if (!pipe || !pipe->Initialized)
-        return FALSE;
-
-    return isSpeaker ? pipe->SpeakerActive : pipe->MicActive;
+    UNREFERENCED_PARAMETER(isSpeaker);
+    UNREFERENCED_PARAMETER(pipe);
+    return FALSE;
 }
 
 VOID FramePipeSetPumpFeatureFlags(
@@ -2226,24 +1643,15 @@ VOID FramePipeSetPumpFeatureFlags(
     BOOLEAN      isRenderSide,
     ULONG        flags)
 {
-    if (!pipe)
-        return;
-
-    if (isRenderSide)
-        pipe->RenderPumpFeatureFlags = flags;
-    else
-        pipe->CapturePumpFeatureFlags = flags;
+    UNREFERENCED_PARAMETER(pipe);
+    UNREFERENCED_PARAMETER(isRenderSide);
+    UNREFERENCED_PARAMETER(flags);
 }
 
 VOID FramePipeResetPumpFeatureFlags(PFRAME_PIPE pipe, BOOLEAN isRenderSide)
 {
-    if (!pipe)
-        return;
-
-    if (isRenderSide)
-        pipe->RenderPumpFeatureFlags = 0;
-    else
-        pipe->CapturePumpFeatureFlags = 0;
+    UNREFERENCED_PARAMETER(pipe);
+    UNREFERENCED_PARAMETER(isRenderSide);
 }
 
 VOID FramePipePublishPumpCounters(
@@ -2256,27 +1664,14 @@ VOID FramePipePublishPumpCounters(
     ULONG        shadowDivergenceCount,
     ULONG        featureFlags)
 {
-    if (!pipe)
-        return;
-
-    if (isRenderSide)
-    {
-        pipe->RenderGatedSkipCount             = gatedSkipCount;
-        pipe->RenderOverJumpCount              = overJumpCount;
-        pipe->RenderFramesProcessedTotal       = framesProcessedTotal;
-        pipe->RenderPumpInvocationCount        = invocationCount;
-        pipe->RenderPumpShadowDivergenceCount  = shadowDivergenceCount;
-        pipe->RenderPumpFeatureFlags           = featureFlags;
-    }
-    else
-    {
-        pipe->CaptureGatedSkipCount            = gatedSkipCount;
-        pipe->CaptureOverJumpCount             = overJumpCount;
-        pipe->CaptureFramesProcessedTotal      = framesProcessedTotal;
-        pipe->CapturePumpInvocationCount       = invocationCount;
-        pipe->CapturePumpShadowDivergenceCount = shadowDivergenceCount;
-        pipe->CapturePumpFeatureFlags          = featureFlags;
-    }
+    UNREFERENCED_PARAMETER(pipe);
+    UNREFERENCED_PARAMETER(isRenderSide);
+    UNREFERENCED_PARAMETER(gatedSkipCount);
+    UNREFERENCED_PARAMETER(overJumpCount);
+    UNREFERENCED_PARAMETER(framesProcessedTotal);
+    UNREFERENCED_PARAMETER(invocationCount);
+    UNREFERENCED_PARAMETER(shadowDivergenceCount);
+    UNREFERENCED_PARAMETER(featureFlags);
 }
 
 //=============================================================================
@@ -2295,20 +1690,9 @@ VOID FramePipePublishPumpCounters(
 //      engine. The declaration in loopback.h and the four call sites in
 //      adapter.cpp's IOCTL_AO_SET_PUMP_FEATURE_FLAGS handler stayed,
 //      leaving the link unresolved.
-//
-//  Resolution (Phase 1, ADR-014 phase/1-int32-ring branch):
-//    The IOCTL surface is preserved for ABI stability — adapter.cpp is
-//    out of scope for the current step (per step0.md STOP condition).
-//    Restoring the original definition by itself is not possible because
-//    the dependent globals / static helpers / member body were all
-//    deleted by 5a013b1 and the post-Phase-6 transport ownership model
-//    no longer matches the per-cable-active-render-stream pattern that
-//    the original definition assumed.
-//
-//    Fail-closed stub: returns STATUS_NOT_SUPPORTED so the IOCTL caller
-//    sees a clear "not supported in this build" result. No state is
-//    mutated. Phase 6 cleanup is expected to retire both the IOCTL
-//    handler in adapter.cpp and this stub together.
+//    f7801bd (Phase 1 build fix) — fail-closed stub added here so the
+//      link target exists. Phase 6 cleanup is expected to retire both
+//      the IOCTL handler and this stub together.
 //
 //=============================================================================
 extern "C"
