@@ -159,7 +159,45 @@ Do not touch in this step:
    step) link without modification. Step 2+ migrates each caller to
    the new canonical API; Phase 6 cleanup deletes the shim layer.
 
-5. STOP condition: if the build requires touching
+5. Convert the four cross-TU helpers introduced in Phase 1 Step 0
+   (commit `ddbb977`) into behavior-absent stubs against the new
+   `FRAME_PIPE` shape. These helpers were not in `step1.md` originally
+   because they did not exist when Step 1 was written, but they are
+   now part of the compile-preserving shim contract:
+   `minwavertstream.cpp` (untouched in this step) calls them in the
+   legacy pump / pause-reset / counter-publish paths, and they must
+   continue to link without referencing fields that the new struct
+   shape no longer carries.
+
+   - `FramePipeIsDirectionActive(pipe, isSpeaker)` → `return FALSE;`
+     (NULL guard preserved). The legacy `Initialized` /
+     `SpeakerActive` / `MicActive` fields are gone in the new shape;
+     returning `FALSE` means the pause-reset gate in
+     `minwavertstream.cpp` will treat the other side as "not active",
+     which causes `FramePipeReset` to fire on every pause. This is
+     acceptable for Step 1 because `FramePipeReset` is a wrapper to
+     `FramePipeResetCable` (real impl) and the legacy ring transport
+     is not driving audio in this step.
+   - `FramePipeSetPumpFeatureFlags(pipe, isRenderSide, flags)` →
+     no-op (NULL guard preserved). Legacy
+     `Render*PumpFeatureFlags` / `Capture*PumpFeatureFlags` removed.
+   - `FramePipeResetPumpFeatureFlags(pipe, isRenderSide)` → no-op
+     (NULL guard preserved). Same field removal as above.
+   - `FramePipePublishPumpCounters(pipe, isRenderSide, ...)` → no-op
+     (NULL guard preserved). All six `Render*` and six `Capture*`
+     pump counters are gone in the new struct shape.
+
+   These four stubs exist solely to preserve the Phase 1 Step 0
+   compile boundary that already removed direct `FRAME_PIPE` field
+   access from `minwavertstream.cpp`. Their absence of behavior is
+   deliberate: pump / pause-reset / counter-mirror semantics are
+   replaced by the new diagnostics surface (Phase 1 Step 6) and the
+   canonical helper (Phase 3+); they have no role on the new
+   `FRAME_PIPE` shape. Phase 6 cleanup deletes both these helpers
+   and the `minwavertstream.cpp` call sites together with the
+   `AO_V2_DIAG` legacy fields.
+
+6. STOP condition: if the build requires touching
    `Source/Main/minwavertstream.cpp`,
    `Source/Utilities/transport_engine.cpp`,
    `Source/Utilities/transport_engine.h`,
@@ -195,6 +233,14 @@ Do not touch in this step:
       The legacy bodies in `loopback.cpp` are forward wrappers (Init /
       Cleanup / Reset / GetFillFrames) or behavior-absent stubs (the
       other 8) per § 4 of Required Edits.
+- [ ] The four Phase 1 Step 0 cross-TU helpers
+      (`FramePipeIsDirectionActive`, `FramePipeSetPumpFeatureFlags`,
+      `FramePipeResetPumpFeatureFlags`, `FramePipePublishPumpCounters`)
+      still link from `minwavertstream.cpp` with **no edits to that
+      translation unit**. Their bodies are converted to behavior-absent
+      stubs against the new `FRAME_PIPE` shape per § 5 of Required
+      Edits. `FramePipeIsDirectionActive` returns `FALSE`
+      unconditionally; the other three are no-ops.
 - [ ] `LOOPBACK_BUFFER` is unchanged. `Loopback*` functions are
       unchanged. Phase 6 owns retiring the legacy ring.
 - [ ] `adapter.cpp` AO_V2_DIAG fields whose source was a removed
@@ -215,6 +261,18 @@ Do not touch in this step:
   stubs (Write/Read/etc.) intentionally do not move audio. Step 2
   (write same-rate) and Step 3 (read same-rate) restore behavior on
   the new canonical API; Step 4-6 migrate callers off the shim.
+- **Does NOT claim** that the legacy pump path (Speaker/Mic active
+  tracking, pump feature flags, pump counter mirror) still functions.
+  The Phase 1 Step 0 cross-TU helpers are converted to
+  behavior-absent stubs in this step (§ 5). One observable
+  consequence: the `KSSTATE_PAUSE` cable branch in
+  `minwavertstream.cpp` will see `FramePipeIsDirectionActive` return
+  `FALSE` for the other side and therefore fire `FramePipeReset` on
+  every pause, even when the other-side stream is still active.
+  This is acceptable here because the legacy pump path is no longer
+  driving audio (Phase 5 ownership flip preceded this step), and the
+  ring reset itself is a wrapper to `FramePipeResetCable` (real
+  impl) on the new shape.
 
 ## What This Step Does NOT Do
 
