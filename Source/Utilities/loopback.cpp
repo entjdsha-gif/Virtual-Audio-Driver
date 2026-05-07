@@ -1403,7 +1403,125 @@ VOID FramePipeResetCable(PFRAME_PIPE pipe)
 #pragma code_seg()
 
 //=============================================================================
-// AoRingWriteFromScratch — Step 2 implements; Step 1 stub.
+// AoRingAvailableSpaceFrames_Locked — writable frames behind the 2-frame
+// guard band. Caller must already hold pipe->Lock.
+//
+// Returns `WrapBound - currentFill - 2` (clamped to >= 0). The -2 guard
+// band prevents writer/reader cursor collision (single source of guard
+// per step1.md / step2.md — callers must NOT subtract another 2).
+//=============================================================================
+static __forceinline LONG
+AoRingAvailableSpaceFrames_Locked(PFRAME_PIPE pipe)
+{
+    LONG wrap = pipe->WrapBound;
+    LONG fill = pipe->WritePos - pipe->ReadPos;
+    if (fill < 0) fill += wrap;          // wrap-corrected current fill
+    LONG free = wrap - fill - 2;         // 2-frame guard band
+    return free < 0 ? 0 : free;
+}
+
+//=============================================================================
+// NormalizeToInt19 — bit-depth dispatch per DESIGN § 2.5.
+//
+// Reads one channel of one frame from `scratch` and returns the value
+// normalized to ~19-bit signed-magnitude (range ≈ [-2^18, +2^18]) so the
+// SRC accumulator's 13-bit headroom invariant holds across width changes.
+//
+// 8 PCM (unsigned, byte-centered on 0x80): (byte - 0x80) << 11
+// 16 PCM (signed LE):                      ((INT16)int16) << 3
+// 24 PCM (signed packed LE, 3 bytes):      sign-extend 24->32 then >> 5
+//                                          (equivalent to DESIGN § 2.5
+//                                          (raw24 << 8) >> 13 after the
+//                                          implicit sign extension that
+//                                          the <<8 lift causes)
+// 32 PCM (signed LE):                      int32 >> 13
+//
+// 24-bit sign extension: explicit branch instead of `(<< 8) >> 13` to
+// avoid C signed-shift UB. The ring stores INT32 values directly.
+// Caller must filter `srcBits` to {8, 16, 24, 32} before reaching here;
+// the default branch returns 0 (silence) defensively.
+//=============================================================================
+static __forceinline LONG
+NormalizeToInt19(
+    const BYTE* scratch,
+    ULONG       srcBits,
+    ULONG       frame,
+    ULONG       channel,
+    ULONG       srcChannels)
+{
+    SIZE_T bytesPerSample = (SIZE_T)(srcBits / 8);
+    SIZE_T offset = ((SIZE_T)frame * (SIZE_T)srcChannels + (SIZE_T)channel)
+                  * bytesPerSample;
+    const BYTE* p = scratch + offset;
+
+    switch (srcBits)
+    {
+    case 8:
+    {
+        // 8-bit PCM is unsigned, centered on 0x80. Range -128..127.
+        // <<11 lifts into ~19-bit signed-magnitude.
+        return ((LONG)(*p) - 0x80) << 11;
+    }
+
+    case 16:
+    {
+        // Little-endian INT16. <<3 lifts 16-bit signed into ~19-bit.
+        LONG v = (LONG)(SHORT)((USHORT)p[0] | ((USHORT)p[1] << 8));
+        return v << 3;
+    }
+
+    case 24:
+    {
+        // 24-bit packed signed LE. Explicit sign-extension to avoid the
+        // signed-shift UB risk of the (<<8) >> 13 trick from DESIGN § 2.5.
+        // Net effect of (raw24 << 8) >> 13 (signed INT32 ops with sign
+        // extension via the <<8 lift) is equivalent to a 5-bit
+        // arithmetic right shift on the sign-extended 24-bit value.
+        LONG raw24 = (LONG)p[0] | ((LONG)p[1] << 8) | ((LONG)p[2] << 16);
+        if (raw24 & 0x00800000)            // bit 23 set → negative
+            raw24 |= (LONG)0xFF000000;     // sign-extend into bits 24..31
+        return raw24 >> 5;
+    }
+
+    case 32:
+    {
+        // INT32 LE. Same value range as machine-native, so simple OR-build
+        // and arithmetic right shift suffices. Per DESIGN § 2.5, 32-bit
+        // PCM is NOT direct copy: full INT32 range >> 13 to match the
+        // 19-bit invariant.
+        LONG v = (LONG)((ULONG)p[0]
+                      | ((ULONG)p[1] << 8)
+                      | ((ULONG)p[2] << 16)
+                      | ((ULONG)p[3] << 24));
+        return v >> 13;
+    }
+
+    default:
+        return 0;
+    }
+}
+
+//=============================================================================
+// AoRingWriteFromScratch — same-rate ring write (Phase 1 Step 2).
+//
+// Path:
+//   1. Validate parameters (defensive guards).
+//   2. ADR-008: srcBits must be PCM 8/16/24/32; otherwise STATUS_NOT_SUPPORTED.
+//   3. Acquire pipe->Lock at DISPATCH_LEVEL.
+//   4. Step 2 contract: srcRate must equal pipe->InternalRate. SRC path
+//      is Phase 2; rate-mismatch returns STATUS_NOT_SUPPORTED here.
+//   5. ADR-005 hard-reject: if frames > AoRingAvailableSpaceFrames_Locked,
+//      OverflowCounter++ and return STATUS_INSUFFICIENT_RESOURCES without
+//      advancing WritePos.
+//   6. Per-frame, per-channel normalize-and-write with 4-way bit-depth
+//      dispatch (NormalizeToInt19). Channel mapping copies
+//      min(srcChannels, pipe->Channels); excess ring slots retain prior data.
+//   7. Advance WritePos with WrapBound modulus.
+//
+// NOT covered here:
+//   - SRC (rate conversion) — Phase 2.
+//   - Caller migration — all external callers still go through legacy
+//     shims until Step 4-6.
 //=============================================================================
 NTSTATUS AoRingWriteFromScratch(
     PFRAME_PIPE  pipe,
@@ -1413,13 +1531,63 @@ NTSTATUS AoRingWriteFromScratch(
     ULONG        srcChannels,
     ULONG        srcBits)
 {
-    UNREFERENCED_PARAMETER(pipe);
-    UNREFERENCED_PARAMETER(scratch);
-    UNREFERENCED_PARAMETER(frames);
-    UNREFERENCED_PARAMETER(srcRate);
-    UNREFERENCED_PARAMETER(srcChannels);
-    UNREFERENCED_PARAMETER(srcBits);
-    return STATUS_NOT_IMPLEMENTED;
+    // --- Defensive guards (no state change on failure) ---
+    if (!pipe || !scratch)
+        return STATUS_INVALID_PARAMETER;
+    if (frames == 0 || srcChannels == 0)
+        return STATUS_INVALID_PARAMETER;
+    if (!pipe->Data || pipe->Channels <= 0 || pipe->WrapBound <= 2)
+        return STATUS_INVALID_PARAMETER;
+
+    // ADR-008: V1 supports KSDATAFORMAT_SUBTYPE_PCM only.
+    // Bit widths {8, 16, 24, 32} match DESIGN § 2.5 dispatch table.
+    if (srcBits != 8 && srcBits != 16 && srcBits != 24 && srcBits != 32)
+        return STATUS_NOT_SUPPORTED;
+
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&pipe->Lock, &oldIrql);
+
+    // Step 2 = same-rate only. SRC path is Phase 2.
+    if (srcRate != pipe->InternalRate)
+    {
+        KeReleaseSpinLock(&pipe->Lock, oldIrql);
+        return STATUS_NOT_SUPPORTED;
+    }
+
+    // ADR-005: hard-reject overflow. WritePos NOT advanced on full ring.
+    LONG writable = AoRingAvailableSpaceFrames_Locked(pipe);
+    if ((LONG)frames > writable)
+    {
+        pipe->OverflowCounter++;
+        KeReleaseSpinLock(&pipe->Lock, oldIrql);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    // Channel mapping: client channels [0 .. min(srcChannels, ringCh)).
+    // Ring slots beyond the client channel count keep their prior contents
+    // (no zero-fill — DESIGN § 2.3 contract: "moja란 채널은 0-fill 안 함").
+    LONG ringChannels = pipe->Channels;
+    LONG copyChannels = (LONG)srcChannels < ringChannels
+                      ? (LONG)srcChannels
+                      : ringChannels;
+
+    for (ULONG f = 0; f < frames; ++f)
+    {
+        LONG slotBase = pipe->WritePos * ringChannels;
+        for (LONG ch = 0; ch < copyChannels; ++ch)
+        {
+            LONG sample = NormalizeToInt19(scratch, srcBits, f,
+                                           (ULONG)ch, srcChannels);
+            pipe->Data[slotBase + ch] = sample;
+        }
+
+        pipe->WritePos++;
+        if (pipe->WritePos >= pipe->WrapBound)
+            pipe->WritePos = 0;
+    }
+
+    KeReleaseSpinLock(&pipe->Lock, oldIrql);
+    return STATUS_SUCCESS;
 }
 
 //=============================================================================
