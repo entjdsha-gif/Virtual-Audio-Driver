@@ -238,6 +238,7 @@ AoTransportAllocStreamRt(CMiniportWaveRTStream* stream)
     }
 
     RtlZeroMemory(rt, sizeof(*rt));
+    KeInitializeSpinLock(&rt->PositionLock);
     InitializeListHead(&rt->Link);
     rt->Stream = stream;
     rt->Active = FALSE;
@@ -652,10 +653,9 @@ AoRunRenderEvent(AO_STREAM_RT* rt, LONGLONG qpc)
 // cursor is NOT advanced. Once the cushion is ready, StartupArmed is
 // dropped.
 //
-// Partial read / tail zero fill: ring underruns are detected before the
-// read and counted in rt->UnderrunEvents. FramePipeReadToDma already
-// silence-fills any shortfall internally so the DMA tail is guaranteed
-// clean regardless.
+// Partial read / tail zero fill: ring underruns are detected before
+// the read. FramePipeReadToDma already silence-fills any shortfall
+// internally so the DMA tail is guaranteed clean regardless.
 //
 // Runs at DISPATCH_LEVEL. Acquires PipeLock via FramePipeReadToDma.
 static VOID

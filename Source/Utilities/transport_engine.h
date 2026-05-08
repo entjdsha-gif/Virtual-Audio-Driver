@@ -1,13 +1,13 @@
 ﻿//=============================================================================
 // transport_engine.h
 //
-// Phase 6 (VB-equivalent core replacement) — Step 1 skeleton.
+// Phase 6 (VB-equivalent core replacement) -- Step 1 skeleton.
 //
 // Owns the global shared transport timer and the active-stream scheduler
 // metadata. Does NOT own the ring (that stays in loopback.cpp / FRAME_PIPE)
 // and does NOT own stream lifetime (that stays in CMiniportWaveRTStream).
 //
-// Step 1 goals (see docs/PHASE6_PLAN.md §8):
+// Step 1 goals (see docs/PHASE6_PLAN.md section8):
 //   - shared timer exists
 //   - streams can register/unregister
 //   - timer callback can schedule no-op events safely
@@ -27,18 +27,18 @@
 
 #include <ntddk.h>
 #include <wdm.h>
-#include "loopback.h"   // FRAME_PIPE full definition — engine event runners need it
+#include "loopback.h"   // FRAME_PIPE full definition -- engine event runners need it
 
-// Forward declaration — the miniport header pulls in the whole WaveRT/PortCls
+// Forward declaration -- the miniport header pulls in the whole WaveRT/PortCls
 // world, so we keep the stream type opaque at the engine API boundary.
 class CMiniportWaveRTStream;
 
 //=============================================================================
-// AO_STREAM_RT — per-stream transport runtime state
+// AO_STREAM_RT -- per-stream transport runtime state
 //
 // Owned by CMiniportWaveRTStream via m_pTransportRt. The engine active list
 // holds non-owning references only. All latency values are stored in frames
-// (samples) — see docs/PHASE6_PLAN.md § "Latency Unit Policy".
+// (samples) -- see docs/PHASE6_PLAN.md section "Latency Unit Policy".
 //=============================================================================
 typedef struct _AO_STREAM_RT {
     // Active-list linkage (engine-owned field, not the stream).
@@ -50,27 +50,34 @@ typedef struct _AO_STREAM_RT {
     // Reference count. +1 from the stream owner at alloc time. The timer
     // callback takes additional refs under EngineLock while building its
     // due-stream snapshot and releases them after each event runs. The
-    // allocation is freed when RefCount reaches zero — either by the
+    // allocation is freed when RefCount reaches zero -- either by the
     // destructor's FreeStreamRt call or by the last in-flight event's
     // release, whichever comes later. This is how we close the UAF race
     // between the timer callback's drop-lock-then-run pattern and stream
     // destruction.
     volatile LONG           RefCount;
 
-    // Classification — filled on first registration, stable thereafter.
+    // Per-stream advance state lock. Introduced in Phase 3 Step 0 and
+    // initialized in AoTransportAllocStreamRt. Phase 3 Step 1 makes
+    // AoCableAdvanceByQpc acquire it before reading/writing cursor,
+    // phase, and residual state; later call-source wiring funnels
+    // through the helper under that discipline.
+    KSPIN_LOCK              PositionLock;
+
+    // Classification -- filled on first registration, stable thereafter.
     BOOLEAN                 IsCapture;
     BOOLEAN                 IsCable;
     BOOLEAN                 IsSpeakerSide;
 
-    // Scheduling state — flipped by OnRun / OnPause / OnStop.
+    // Scheduling state -- flipped by OnRun / OnPause / OnStop.
     BOOLEAN                 Active;
 
-    // Format snapshot — populated at RUN, used by event runners.
+    // Format snapshot -- populated at RUN, used by event runners.
     ULONG                   SampleRate;
     ULONG                   Channels;
     ULONG                   BlockAlign;
 
-    // Target FRAME_PIPE and DMA buffer info — populated at RUN so the
+    // Target FRAME_PIPE and DMA buffer info -- populated at RUN so the
     // engine event runners can move data without looking up globals or
     // touching the stream object.
     PFRAME_PIPE             Pipe;
@@ -79,48 +86,72 @@ typedef struct _AO_STREAM_RT {
 
     // Render-side DMA cursor anchoring. The render event runner is NOT
     // allowed to free-run a DmaOffset that drifts away from what WaveRT
-    // has actually produced into the DMA — that makes the engine re-read
-    // stale or future bytes on every cadence skew, which is what the
-    // Step 3-alone live-call showed as screechy audio. Instead, the
-    // stream side publishes the authoritative produced byte count
-    // (monotonic LinearPosition for cable render streams) into
-    // DmaProducedMono from CMiniportWaveRTStream::UpdatePosition. The
-    // render runner moves only the produced->consumed delta.
+    // has actually produced into the DMA -- that makes the engine
+    // re-read stale or future bytes on every cadence skew, which is
+    // what the Step 3-alone live-call showed as screechy audio.
+    // Instead, the stream side publishes the authoritative produced
+    // byte count (monotonic LinearPosition) into DmaProducedMono from
+    // CMiniportWaveRTStream::UpdatePosition. The render runner moves
+    // only the produced->consumed delta.
+    //
+    // TODO(Phase 4 / Phase 5): Phase 3 baseline (commit 422a598)
+    // restored UpdatePosition (minwavertstream.cpp:~2089) as the sole
+    // publisher of DmaProducedMono for both render and capture; the
+    // helper-side write inside AoCableWriteRenderFromDma (cpp:~1210)
+    // is dead in shadow because RenderAudibleActive is forced FALSE.
+    // Owner: event runners (cpp:~564 render, ~644 capture) + helper
+    // shadow read. Retire: Phase 4 (render) + Phase 5 (capture)
+    // audible flip commits transfer producer ownership to the helper.
     volatile LONGLONG       DmaProducedMono;
     ULONGLONG               DmaConsumedMono;
 
-    // Event sizing — frame-count authoritative.
+    // Event sizing -- frame-count authoritative.
     ULONG                   FramesPerEvent;
     ULONG                   BytesPerEvent;
     LONGLONG                EventPeriodQpc;
     LONGLONG                NextEventQpc;
 
-    // Startup state machine — used by Step 4 capture path.
+    // Startup state machine -- used by Step 4 capture path.
+    //
+    // TODO(Phase 5): capture startup gate. StartupArmed is set TRUE on
+    // capture RUN (cpp:~406), FALSE on render RUN (cpp:~414); paired
+    // StartupTargetFrames (cpp:~409 init) and StartupThresholdFrames
+    // (cpp:~407 init, cpp:~650 read in AoRunCaptureEvent gate).
+    // Owner: capture event runner. Retire: Phase 5 capture coupling.
     BOOLEAN                 StartupArmed;
     ULONG                   StartupTargetFrames;
     ULONG                   StartupThresholdFrames;
-    ULONG                   MinHeadroomFrames;
 
-    // Diagnostic counters — populated by event runners in Step 3/4.
+    // Diagnostic counter -- populated by the timer DPC overdue path.
+    //
+    // TODO(Phase 4 / Phase 5): timer DPC overdue/drift counter.
+    // Incremented by AoTransportTimerCallback overdue handler
+    // (cpp:~783) when the scheduler defers more than the per-tick
+    // budget. Owner: timer DPC overdue path. Retire: Phase 4 (render)
+    // / Phase 5 (capture) when audible coupling lands and timer DPC
+    // bookkeeping is reorganized.
     ULONG                   LateEventCount;
-    ULONG                   UnderrunEvents;
-    ULONG                   DropEvents;
 
     // Sub-sample carry for non-integer event sizes (44.1k family etc.).
     // Still zero until the GCD SRC step lands; kept here so the later
     // work doesn't have to widen the runtime struct.
+    //
+    // TODO(TBD): preserved for future SRC integration. Currently
+    // unused (no init/read/write outside this declaration). Owner:
+    // future cable SRC integration step (no current caller). Retire:
+    // TBD when 44.1 kHz cable consumer SRC integration lands.
     ULONG                   CarryFrames;
 
     //=========================================================================
-    // Phase 6 Option Y — Y1A runtime structure freeze
+    // Phase 6 Option Y -- Y1A runtime structure freeze
     //
     // Fields below are the VB-equivalent cable runtime state. Added in Y1A
     // (header freeze); populated + read by AoCableAdvanceByQpc starting in
-    // Y1B (shadow mode — helper computes everything, externally visible
+    // Y1B (shadow mode -- helper computes everything, externally visible
     // truth stays on legacy MSVAD path). Retired in Y2 (render) and Y3
     // (capture) when audible ownership moves into the canonical helper.
     //
-    // Source spec: results/phase6_vb_verification.md §2, §5, §7, §9.5
+    // Source spec: results/phase6_vb_verification.md section2, section5, section7, section9.5
     // Layout mapped 1:1 to VB stream offsets where practical.
     //=========================================================================
 
@@ -130,11 +161,11 @@ typedef struct _AO_STREAM_RT {
     USHORT                  BitsPerSample;
 
     // Cable ring buffer size in frames. Distinct from DmaBufferSize (bytes
-    // of raw DMA container) — this is the frame-denominated cable ring the
+    // of raw DMA container) -- this is the frame-denominated cable ring the
     // canonical helper wraps cursor arithmetic against. VB +0xA8.
     ULONG                   RingSizeFrames;
 
-    // Canonical advance helper state — VB 6320 direct translation.
+    // Canonical advance helper state -- VB 6320 direct translation.
     ULONGLONG               AnchorQpc100ns;              // VB +0x180
     ULONG                   PublishedFramesSinceAnchor;  // VB +0x198
     ULONGLONG               DmaCursorFrames;             // VB +0x0D0 (frame-denominated)
@@ -157,7 +188,7 @@ typedef struct _AO_STREAM_RT {
     // FRAME_PIPE conversion/write. VB stores at stream +0x178 and uses a
     // plain memcpy (FUN_140007680) into it. Allocated at RUN, freed at
     // STOP / free. Size is bounded by the worst-case single advance
-    // (overrun guard = SampleRate/2 frames × BlockAlign bytes).
+    // (overrun guard = SampleRate/2 frames x BlockAlign bytes).
     PVOID                   CableScratchBuffer;
     ULONG                   CableScratchSize;
 
@@ -167,7 +198,7 @@ typedef struct _AO_STREAM_RT {
     // This is the VB click-suppression mechanism.
     LONG                    FadeSampleCounter;
 
-    // Y1 debug hit counters. Shadow-mode observability only — lets the
+    // Y1 debug hit counters. Shadow-mode observability only -- lets the
     // Y1C gate confirm the helper is reached from query + timer paths
     // without log flooding. Remove in Y4. Guarded by AO_PHASE6_DEBUG in
     // the cpp so release builds can drop them cheaply.
@@ -176,19 +207,23 @@ typedef struct _AO_STREAM_RT {
     volatile LONG           DbgShadowTimerHits;
 
     //=========================================================================
-    // Phase 6 Y2-1 audible switch (render path)
+    // Render audible-flip scaffold (Phase 6 Y2-1 / Y2-2 origin)
     //
     // When TRUE, AoCableAdvanceByQpc's render branch does the actual
     // DMA -> scratch -> FRAME_PIPE write via AoCableWriteRenderFromDma
-    // and applies the fade envelope. When FALSE (Y2-1 default), the
-    // render branch stays in shadow mode and the legacy ReadBytes path
-    // (called from CMiniportWaveRTStream::UpdatePosition) remains the
-    // audible owner. Y2-2 flips this to TRUE and retires ReadBytes
-    // ownership for cable render streams.
-    //
-    // Capture has no equivalent flag yet — Y3 adds its own audible
-    // switch mirroring this pattern.
+    // and applies the fade envelope. When FALSE the render branch
+    // stays in shadow mode and the legacy ReadBytes path (called
+    // from CMiniportWaveRTStream::UpdatePosition) remains the audible
+    // owner.
     //=========================================================================
+    //
+    // TODO(Phase 4): Phase 6 Y2-2 audible-flip scaffold. Phase 3
+    // baseline (commit 422a598) forces this to FALSE in
+    // AoTransportOnRunEx (cpp:~382) and alloc init (cpp:~1060) so the
+    // AoCableAdvanceByQpc render gate (cpp:~1399) is unreachable.
+    // Field, gate, and AoCableWriteRenderFromDma function body are
+    // retained as scaffold for the Phase 4 audible-flip commit
+    // (single-step ownership transfer per ADR-006).
     BOOLEAN                 RenderAudibleActive;
 
     //=========================================================================
@@ -221,6 +256,18 @@ typedef struct _AO_STREAM_RT {
     //
     // Removed in Y4 with the rest of the DbgShadow* counters.
     //=========================================================================
+    //
+    // TODO(Phase 3 step4 / Phase 4): helper-vs-legacy render byte diff
+    // diagnostic. Helper-side bumps DbgY2HelperRenderBytes /
+    // DbgY2RenderByteDiffMax / DbgY2RenderMismatchHits inside
+    // AoCableAdvanceByQpc shadow body (cpp:~1366-1385); 1 Hz delta
+    // print uses DbgY2LastPrintQpc / DbgY2HelperPrevSnapshot /
+    // DbgY2LegacyPrevSnapshot (cpp:~615-633). Legacy side bumps
+    // DbgY2LegacyRenderBytes from CMiniportWaveRTStream::
+    // UpdatePosition (minwavertstream.cpp:~1989). Owner: helper shadow
+    // body + legacy UpdatePosition. Phase 3 step4 plans to rename
+    // DbgY2RenderMismatchHits to DbgShadowDivergenceHits per
+    // step4.md:23. Retire: Phase 4 with the audible-flip commit.
     volatile LONGLONG       DbgY2HelperRenderBytes;
     volatile LONGLONG       DbgY2LegacyRenderBytes;
     volatile LONGLONG       DbgY2RenderByteDiffMax;
@@ -230,13 +277,18 @@ typedef struct _AO_STREAM_RT {
     // log can show per-second helper/legacy byte deltas in addition to
     // cumulative totals. Written only by the timer DPC while holding
     // its per-stream reference, so no atomics required.
+    //
+    // TODO(Phase 4): per-second helper/legacy snapshots paired with
+    // the diagnostic above. Read+written by AoCableAdvanceByQpc shadow
+    // body (cpp:~615-633). Owner: 1 Hz delta print pacer in helper.
+    // Retire: Phase 4 with the diagnostic block above.
     LONGLONG                DbgY2LastPrintQpc;
     LONGLONG                DbgY2HelperPrevSnapshot;
     LONGLONG                DbgY2LegacyPrevSnapshot;
 } AO_STREAM_RT, *PAO_STREAM_RT;
 
 //=============================================================================
-// AO_TRANSPORT_ENGINE — global singleton. Declared here so the public API
+// AO_TRANSPORT_ENGINE -- global singleton. Declared here so the public API
 // documentation has something concrete to point at; the single instance lives
 // in transport_engine.cpp and is not exposed directly.
 //=============================================================================
@@ -252,12 +304,12 @@ typedef struct _AO_TRANSPORT_ENGINE {
 } AO_TRANSPORT_ENGINE, *PAO_TRANSPORT_ENGINE;
 
 //=============================================================================
-// Public API — invoked by adapter.cpp (engine bring-up / teardown) and by
+// Public API -- invoked by adapter.cpp (engine bring-up / teardown) and by
 // CMiniportWaveRTStream::SetState (per-stream lifecycle events).
 //=============================================================================
 
 // Global engine bring-up. Called from adapter.cpp after the FRAME_PIPE globals
-// have been initialized. Idempotent — calling twice returns STATUS_SUCCESS.
+// have been initialized. Idempotent -- calling twice returns STATUS_SUCCESS.
 NTSTATUS AoTransportEngineInit(VOID);
 
 // Global engine teardown. Stops the timer, waits for any in-flight DPC via
@@ -324,7 +376,7 @@ extern "C" VOID          AoTransportPublishProducedBytes(AO_STREAM_RT* rt,
                                                           ULONGLONG producedBytesMono);
 
 //=============================================================================
-// Phase 6 Option Y — canonical cable advance API (Y1A prototypes)
+// Phase 6 Option Y -- canonical cable advance API (Y1A prototypes)
 //
 // These functions implement the VB-equivalent cable transport model. In Y1
 // the helper runs in shadow mode: it computes advance, updates shadow
@@ -361,8 +413,8 @@ extern "C" VOID AoCableAdvanceByQpc(AO_STREAM_RT* rt,
 
 // Fade envelope application. Used by the render path inside the canonical
 // helper starting in Y2 to suppress packet-boundary clicks. samples is an
-// in-place int32_t array of frameCount frames × channel samples (channel-
-// planar or interleaved — envelope is applied per sample regardless).
+// in-place int32_t array of frameCount frames x channel samples (channel-
+// planar or interleaved -- envelope is applied per sample regardless).
 // perStreamCounter is the stream's FadeSampleCounter, advanced by this
 // function. Values match VB's 95-entry +0x12a60 table exactly.
 extern "C" VOID AoApplyFadeEnvelope(LONG* samples,
@@ -381,7 +433,7 @@ extern "C" VOID AoResetFadeCounter(AO_STREAM_RT* rt);
 extern "C" VOID AoCableResetRuntimeFields(AO_STREAM_RT* rt);
 
 //=============================================================================
-// Phase 6 Y2-1 — render audible path API
+// Phase 6 Y2-1 -- render audible path API
 //
 // AoCableWriteRenderFromDma performs DMA-bytes -> scratch linearize ->
 // normalize -> fade envelope -> FRAME_PIPE write for cable render streams.
