@@ -14,7 +14,9 @@
     {
       "step": 1,
       "name": "ring-write-src-path",
-      "status": "pending"
+      "status": "completed",
+      "completed_at": "2026-05-08T16:15:20+0900",
+      "summary": "Write SRC path added with phase-aware capacity and hard-reject overflow."
     },
     {
       "step": 2,
