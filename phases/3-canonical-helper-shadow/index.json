@@ -12,7 +12,9 @@
     {
       "step": 1,
       "name": "helper-body-shadow",
-      "status": "pending"
+      "status": "completed",
+      "completed_at": "2026-05-09T02:55:50+0900",
+      "summary": "AoCableAdvanceByQpc shadow body aligned: PositionLock, long-window rebase before advance, MonoFrames mutation removed, same audible ownership preserved."
     },
     {
       "step": 2,
