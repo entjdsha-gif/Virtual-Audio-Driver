@@ -160,13 +160,20 @@ acquire(pipe->Lock);
 reconcile_wrapbound_to_target(pipe);  // grow/shrink WrapBound toward TargetLatencyFrames
 
 // GCD divisor selection FIRST (so capacity check uses output ring frames).
-divisor = pickGCD(srcRate, pipe->InternalRate, [300, 100, 75]);
-if (divisor < 0) {
+// PickGCDDivisor takes the first candidate from the priority list
+// [300, 100, 75] that divides both rates evenly (ADR-004 Decision
+// step 1 — first-match, NOT "smallest divisor"). Returns:
+//   STATUS_INVALID_PARAMETER — caller bug (zero rate, NULL out)
+//   STATUS_NOT_SUPPORTED     — in-range rate pair with no matching
+//                              divisor (ADR-008 § Consequences)
+AO_GCD_RATIO ratio;
+NTSTATUS gcdStatus = PickGCDDivisor(srcRate, pipe->InternalRate, &ratio);
+if (!NT_SUCCESS(gcdStatus)) {
     release(pipe->Lock);
-    return STATUS_INVALID_PARAMETER;
+    return gcdStatus;
 }
-srcRatio = srcRate / divisor;
-dstRatio = pipe->InternalRate / divisor;
+srcRatio = ratio.SrcRatio;
+dstRatio = ratio.DstRatio;
 
 // Capacity check uses OUTPUT ring frames — for 44.1k → 48k expansion,
 // the actual ring write count is larger than the input frame count.
@@ -203,17 +210,22 @@ Same structure, inverted direction.
 acquire(pipe->Lock);
 reconcile_wrapbound_to_target(pipe);
 
-// GCD divisor selection FIRST. Read direction maps client (dst) rate
-// onto pipe internal (src) rate, so the relevant ratios are:
-//   srcRatio = pipe->InternalRate / divisor   (ring side)
-//   dstRatio = dstRate            / divisor   (client side)
-divisor = pickGCD(pipe->InternalRate, dstRate, [300, 100, 75]);
-if (divisor < 0) {
+// GCD divisor selection FIRST. Read direction maps pipe internal rate
+// (src) onto client (dst) rate. Same first-match contract as the write
+// path (ADR-004 Decision step 1 — first candidate from [300, 100, 75]
+// that divides both rates wins; this is NOT "smallest divisor").
+// PickGCDDivisor returns:
+//   STATUS_INVALID_PARAMETER — caller bug (zero rate, NULL out)
+//   STATUS_NOT_SUPPORTED     — in-range rate pair with no matching
+//                              divisor (ADR-008 § Consequences)
+AO_GCD_RATIO ratio;
+NTSTATUS gcdStatus = PickGCDDivisor(pipe->InternalRate, dstRate, &ratio);
+if (!NT_SUCCESS(gcdStatus)) {
     release(pipe->Lock);
-    return STATUS_INVALID_PARAMETER;
+    return gcdStatus;
 }
-srcRatio = pipe->InternalRate / divisor;
-dstRatio = dstRate            / divisor;
+srcRatio = ratio.SrcRatio;   // ring side  (= pipe->InternalRate / Divisor)
+dstRatio = ratio.DstRatio;   // client side (= dstRate            / Divisor)
 
 // `frames` is the OUTPUT (client) frame count requested. Convert to
 // the INPUT (ring) frame count needed before any availability check —
@@ -760,8 +772,9 @@ In `Source/Filters/cablewavtable.h` (or per-cable filter table):
     range — wrong subtype (IEEE_FLOAT), unadvertised rate, unsupported
     bit-depth, unsupported channel count, etc.
   - `STATUS_NOT_SUPPORTED` when the request is in-range PCM but
-    `pickGCD(requestedRate, pipe->InternalRate)` returns no divisor
-    (e.g. `22050 ↔ {8000, 16000, 32000}`).
+    `PickGCDDivisor(requestedRate, pipe->InternalRate, ...)` returns
+    `STATUS_NOT_SUPPORTED` (no first-match in `[300, 100, 75]` —
+    e.g. `22050 ↔ {8000, 16000, 32000}`).
 
 The two-tier contract is the same across ARCHITECTURE § 10.3 and
 ADR-008. Implementations must not collapse both to one status — see

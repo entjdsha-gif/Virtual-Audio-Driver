@@ -7,22 +7,30 @@
     {
       "step": 0,
       "name": "gcd-divisor-helper",
-      "status": "pending"
+      "status": "completed",
+      "completed_at": "2026-05-08T15:18:47+0900",
+      "summary": "PickGCDDivisor first-match helper added and verified."
     },
     {
       "step": 1,
       "name": "ring-write-src-path",
-      "status": "pending"
+      "status": "completed",
+      "completed_at": "2026-05-08T16:15:20+0900",
+      "summary": "Write SRC path added with phase-aware capacity and hard-reject overflow."
     },
     {
       "step": 2,
       "name": "ring-read-src-path",
-      "status": "pending"
+      "status": "completed",
+      "completed_at": "2026-05-08T17:28:24+0900",
+      "summary": "Read SRC path added with phase-aware capacity, conditional reload, and consumedBeforeLastOutput-aware lookahead."
     },
     {
       "step": 3,
       "name": "round-trip-rate-tests",
-      "status": "pending"
+      "status": "completed",
+      "completed_at": "2026-05-08T18:15:44+0900",
+      "summary": "Round-trip rate matrix PASS (contract gates; diagnostics non-gating)."
     }
   ]
 }

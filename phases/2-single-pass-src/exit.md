@@ -16,7 +16,7 @@ via single-pass linear-interp SRC with GCD divisor 300/100/75. The
 write path hard-rejects on overflow; the read path silence-fills with
 hysteretic recovery on underrun.
 
-The cable transport ownership has not yet flipped — Phases 1 and 2 are
+The cable transport ownership has not yet flipped -- Phases 1 and 2 are
 **under the hood**. Cable streams still flow through the legacy
 `UpdatePosition`-driven path. Phase 3 introduces the canonical helper
 in shadow mode; Phases 4 and 5 flip ownership.
@@ -28,7 +28,7 @@ in shadow mode; Phases 4 and 5 flip ownership.
 - Do not let Phase 3 weaken hard-reject to "soft skip" because the
   helper makes overflow easier to mitigate. Hard-reject stays.
 
-## Phase 2 → Phase 3 Handoff
+## Phase 2 -> Phase 3 Handoff
 
 Phase 3 implements `AoCableAdvanceByQpc` in `transport_engine.cpp`,
 hooks every cable call source (query path, shared timer, packet

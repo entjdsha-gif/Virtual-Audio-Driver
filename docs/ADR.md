@@ -221,7 +221,8 @@ Bit-depth dispatch (8/16/24/32) happens once, inside the SRC function.
 - one atomic operation per direction → no inter-stage race window.
 - linear interpolation is robust against amplitude spikes.
 - GCD divisor handles the rate pairs that matter for live calls
-  (48000/44100 via 300, 48000/96000 via 100, etc.).
+  (48000/44100 via 300, 48000/8000 via 100, 48000/22050 via 75 —
+  first-match across `[300, 100, 75]` per Decision step 1).
 - VB has been running this for years on millions of installs.
 
 ### Consequences
