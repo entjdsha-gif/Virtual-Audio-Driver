@@ -1212,22 +1212,39 @@ AoCableWriteRenderFromDma(AO_STREAM_RT* rt, ULONG advanceFrames)
 }
 
 //-----------------------------------------------------------------------------
-// AoCableAdvanceByQpc — Y1B shadow body.
+// AoCableAdvanceByQpc -- Phase 3 Step 1 shadow body.
 //
-// Direct translation of VB FUN_140006320 per results/phase6_vb_verification.md
-// §2. Runs at any IRQL ≤ DISPATCH_LEVEL. Not called from anywhere in
-// Y1B — Y1C wires GetPosition / GetPositions / shared timer DPC.
+// Direct translation of VB FUN_140006320 per
+// results/phase6_vb_verification.md section 2. Runs at any IRQL
+// <= DISPATCH_LEVEL.
 //
-// SHADOW RULE: this function writes ONLY the Y-specific shadow fields
-// listed in the file header comment above. It never writes
-// DmaProducedMono, DmaConsumedMono, NextEventQpc, or any legacy
-// authoritative state. It never calls into FRAME_PIPE.
+// SHADOW RULE: this function writes ONLY shadow fields
+// (LastAdvanceDelta, PublishedFramesSinceAnchor, AnchorQpc100ns on
+// rebase, DmaCursorFrames / DmaCursorFramesPrev shadow cursor,
+// DbgShadow*Hits, StatOverrunCounter, retained scaffold fields)
+// inside the per-stream PositionLock. It never writes
+// MonoFramesLow / MonoFramesMirror -- audible owner is the legacy
+// CMiniportWaveRTStream::UpdatePosition path until Phase 4 (render
+// flip) and Phase 5 (capture flip). It never writes DmaProducedMono,
+// DmaConsumedMono, NextEventQpc, or any other authoritative state.
 //
-// Race discipline in Y1B: single-threaded shadow updates are good
-// enough (double counting would only affect DbgShadow* diagnostics).
-// Y2 will wrap real cursor advancement in a per-stream spinlock when
-// audible ownership arrives. For now we rely on Interlocked* on the
-// volatile counters and tolerate minor races on ULONGLONG cursors.
+// In Phase 3 the retained RenderAudibleActive scaffold below is
+// unreachable because RenderAudibleActive is forced FALSE in
+// AoTransportOnRunEx. The scaffold's AoCableWriteRenderFromDma
+// call would touch FRAME_PIPE / DMA / scratch linearization; this
+// body must not run that scaffold under PositionLock. Phase 4 must
+// re-author that call path (move it outside PositionLock or
+// redesign locking) BEFORE enabling the gate. The 63/64 phase
+// correction is timer-DPC-owned (ADR-007 Decision 2, Phase 3
+// Step 5) and is not invoked from this body.
+//
+// PositionLock discipline: KeAcquireSpinLockRaiseToDpc on entry,
+// KeReleaseSpinLock on every return path. DbgShadow*Hits is bumped
+// immediately after lock acquisition and counts every effective
+// helper invocation -- anchor-seed, qpc-backwards, rebase,
+// gate-fail, overrun-bail, and main-success. The pre-lock guards
+// (null rt, SampleRate==0, invalid QPC frequency) do not bump
+// DbgShadow*Hits because the helper is not effectively reached.
 //-----------------------------------------------------------------------------
 extern "C" VOID
 AoCableAdvanceByQpc(
@@ -1238,14 +1255,28 @@ AoCableAdvanceByQpc(
 {
     UNREFERENCED_PARAMETER(flags);
 
+    // Pre-lock guards. The helper cannot execute meaningfully when any
+    // of these holds, so DbgShadow*Hits stays unbumped and the lock is
+    // not acquired.
     if (rt == NULL || rt->SampleRate == 0)
     {
         return;
     }
+    if (g_AoTeQpcFrequency <= 0)
+    {
+        return;
+    }
 
-    // Unconditional "helper was reached" counter — Y1C gate uses the
-    // per-reason counters below for a finer breakdown, this one is the
-    // aggregate.
+    // Acquire per-stream PositionLock for all advance state reads and
+    // writes below. KeAcquireSpinLockRaiseToDpc returns the prior IRQL
+    // -- capture it so KeReleaseSpinLock restores correctly on every
+    // return path.
+    KIRQL oldIrql = KeAcquireSpinLockRaiseToDpc(&rt->PositionLock);
+
+    // Helper invocation counter -- bumped immediately after lock
+    // acquisition so Phase 3 Step 2 / Step 3 can prove every query /
+    // timer call source reached the helper. Includes every path past
+    // the pre-lock guards.
     InterlockedIncrement(&rt->DbgShadowAdvanceHits);
 
     switch (reason)
@@ -1265,40 +1296,64 @@ AoCableAdvanceByQpc(
     // --- QPC raw -> 100ns conversion ---
     // VB 6320 does ((arg_r8 * 10M) + (arg_rdx * 10M)) / freq. The
     // caller passes a single monotonic QPC counter so we collapse to
-    // one 10M-scale conversion. Use the cached QPC frequency captured
-    // at engine init.
-    if (g_AoTeQpcFrequency <= 0)
-    {
-        return;
-    }
-
+    // one 10M-scale conversion against the cached QPC frequency from
+    // engine init.
     ULONGLONG nowQpc100ns =
         (nowQpcRaw * 10000000ULL) / (ULONGLONG)g_AoTeQpcFrequency;
 
-    // --- Elapsed frames since anchor ---
-    // First invocation (anchor == 0) seeds the anchor and bails out
-    // without recording a frame delta — the next call will establish
-    // the real baseline. This matches VB's startup gate behavior in
-    // FUN_1400068ac (+0x190 == 0 branch).
+    // --- First-call anchor seed (explicit branch) ---
+    // Seed the anchor and bail; the next call establishes the real
+    // baseline. Kept as a separate branch rather than folded into the
+    // long-window rebase below: relying on the unsigned subtraction
+    // (nowQpc100ns - 0 == nowQpc100ns) to fall into rebase risks
+    // multiplication overflow in the elapsed-frames probe and obscures
+    // intent.
     if (rt->AnchorQpc100ns == 0)
     {
         rt->AnchorQpc100ns             = nowQpc100ns;
         rt->PublishedFramesSinceAnchor = 0;
+        rt->LastAdvanceDelta           = 0;
+        KeReleaseSpinLock(&rt->PositionLock, oldIrql);
         return;
     }
 
-    LONGLONG  qpc100nsDelta    = (LONGLONG)(nowQpc100ns - rt->AnchorQpc100ns);
+    // --- Backwards-clock defensive guard ---
+    // KeQueryPerformanceCounter is expected to be monotonic. If it
+    // ever isn't (clock retrograde, QPC source change), bail without
+    // advancing state. DbgShadow*Hits is already bumped above.
+    LONGLONG qpc100nsDelta = (LONGLONG)(nowQpc100ns - rt->AnchorQpc100ns);
     if (qpc100nsDelta <= 0)
     {
-        // Clock went backwards or stayed put — nothing to advance.
+        KeReleaseSpinLock(&rt->PositionLock, oldIrql);
         return;
     }
 
-    LONGLONG  elapsedFrames64  =
+    // --- Elapsed frames probe ---
+    LONGLONG elapsedFrames64 =
         (qpc100nsDelta * (LONGLONG)rt->SampleRate) / 10000000LL;
 
     if (elapsedFrames64 < 0)
     {
+        KeReleaseSpinLock(&rt->PositionLock, oldIrql);
+        return;
+    }
+
+    // --- Long-window rebase BEFORE advance compute ---
+    // ADR-007 helper-owned drift mechanism. When elapsed frames exceed
+    // sampleRate << 7 (~128 s of stream time at any rate), reset the
+    // anchor to the current QPC and zero PublishedFramesSinceAnchor.
+    // The rebase tick consumes itself: release the lock and return so
+    // the next call computes a fresh, small elapsed against the new
+    // anchor. Earlier code performed the rebase AFTER advance compute
+    // and fell through; that republished the OLD elapsed into
+    // PublishedFramesSinceAnchor and made the next call see an
+    // underflowed advance.
+    if (elapsedFrames64 >= ((LONGLONG)rt->SampleRate << AO_CABLE_REBASE_SHIFT))
+    {
+        rt->AnchorQpc100ns             = nowQpc100ns;
+        rt->PublishedFramesSinceAnchor = 0;
+        rt->LastAdvanceDelta           = 0;
+        KeReleaseSpinLock(&rt->PositionLock, oldIrql);
         return;
     }
 
@@ -1307,36 +1362,27 @@ AoCableAdvanceByQpc(
     // --- 8-frame minimum gate (VB: cmp ebx,8; jl end) ---
     if (advance < (LONG)AO_CABLE_MIN_FRAMES_GATE)
     {
+        KeReleaseSpinLock(&rt->PositionLock, oldIrql);
         return;
-    }
-
-    // --- 127-frame rebase (VB: elapsed >= sampleRate << 7) ---
-    // Reset the anchor once the accumulated frame count exceeds
-    // ~2.7 seconds (at 48 kHz) to prevent the 100ns arithmetic from
-    // losing precision over long-running streams.
-    if (elapsedFrames64 >= ((LONGLONG)rt->SampleRate << AO_CABLE_REBASE_SHIFT))
-    {
-        rt->PublishedFramesSinceAnchor = 0;
-        rt->AnchorQpc100ns             = nowQpc100ns;
     }
 
     // --- 0.5s overrun reject (VB: advance > sampleRate/2) ---
     // If this single advance would move more than half a second of
     // frames, treat it as a stall recovery and reject the move. Bump
-    // the overrun stat so Y1C shadow diagnostics show how often the
-    // path would have bailed if audible ownership were active.
+    // the overrun stat so shadow diagnostics show how often the path
+    // would have bailed if audible ownership were active.
     if ((ULONG)advance > (rt->SampleRate / AO_CABLE_OVERRUN_DIVISOR))
     {
         rt->StatOverrunCounter++;
+        KeReleaseSpinLock(&rt->PositionLock, oldIrql);
         return;
     }
 
     // --- Shadow cursor update ---
     // VB 6320 advances +0xD0 by `advance` frames modulo buffer size.
-    // In Y1B the wrap uses RingSizeFrames which is still zero (Y1A
-    // didn't populate it — Y1C seeds it from the stream format). Fall
-    // back to unwrapped advancement when ring size is unknown so the
-    // shadow cursor still grows monotonically for observation.
+    // RingSizeFrames is seeded from the stream format; fall back to
+    // unwrapped advancement when ring size is unknown so the shadow
+    // cursor still grows monotonically for observation.
     rt->DmaCursorFramesPrev = rt->DmaCursorFrames;
     if (rt->RingSizeFrames > 0)
     {
@@ -1355,27 +1401,23 @@ AoCableAdvanceByQpc(
     // See AO_STREAM_RT comments for interpretation rules. The helper
     // runs for both query and timer reasons, so cumulative helper
     // counter grows faster than legacy cumulative whenever a timer
-    // tick fires without a matching UpdatePosition — that is normal
+    // tick fires without a matching UpdatePosition -- that is normal
     // and reflected in the diff reading. The meaningful signal is
     // whether the two cumulatives converge over multi-second windows,
-    // not whether they match on any single advance call.
+    // not whether they match on any single advance call. Retained as
+    // Phase 6 cleanup target; not removed in Step 1.
     if (rt->IsCable && !rt->IsCapture && rt->BlockAlign > 0)
     {
         LONGLONG advanceBytes = (LONGLONG)advance * (LONGLONG)rt->BlockAlign;
         LONGLONG newHelper    =
             InterlockedAdd64(&rt->DbgY2HelperRenderBytes, advanceBytes);
 
-        // Volatile read of the legacy counter — single 64-bit load on
-        // x64 is atomic enough for a diagnostic snapshot. We do not
-        // need a strict happens-before edge here; worst case the diff
-        // reads a slightly stale legacy total and the next helper
-        // entry records a more up-to-date one.
+        // Volatile read of the legacy counter -- single 64-bit load on
+        // x64 is atomic enough for a diagnostic snapshot.
         LONGLONG legacy  = rt->DbgY2LegacyRenderBytes;
         LONGLONG diff    = newHelper - legacy;
         LONGLONG absDiff = (diff < 0) ? -diff : diff;
 
-        // Max update is best-effort — a racing writer could overwrite
-        // with a smaller value, but over time the true max will land.
         if (absDiff > rt->DbgY2RenderByteDiffMax)
         {
             rt->DbgY2RenderByteDiffMax = absDiff;
@@ -1395,38 +1437,43 @@ AoCableAdvanceByQpc(
     // ReadBytes path. The gate and the function body are retained as
     // scaffold for Phase 4, where the audible flip lands in a single
     // commit per ADR-006 / REVIEW_POLICY (no two-commit ownership
-    // split).
+    // split). Not removed in Step 1.
+    //
+    // LOCK BOUNDARY WARNING: this gate runs while PositionLock is held.
+    // AoCableWriteRenderFromDma touches FRAME_PIPE / DMA / scratch
+    // linearization, none of which is presently designed to execute
+    // inside per-stream PositionLock. Phase 4 must re-author this
+    // call path (move it outside PositionLock or redesign locking)
+    // BEFORE enabling RenderAudibleActive. Failing to do so risks
+    // holding PositionLock across blocking ring operations.
     if (rt->RenderAudibleActive && rt->IsCable && !rt->IsCapture)
     {
         AoCableWriteRenderFromDma(rt, (ULONG)advance);
     }
 
     // --- Packet notification check (shadow only) ---
-    // VB fires [+0x8188] when the cursor crosses +0x7C. In Y1B we do
-    // NOT dispatch the callback — shared-mode clients never arm this
-    // path (NotifyArmed stays 0), and event-driven clients are still
-    // served by the legacy PortCls contract. We keep the predicate
-    // here so Y1C can observe boundary crossings in diagnostic logs
-    // without calling into portcls.
+    // VB fires [+0x8188] when the cursor crosses +0x7C. We do NOT
+    // dispatch the callback in Phase 3 -- shared-mode clients never
+    // arm this path (NotifyArmed stays 0), and event-driven clients
+    // are still served by the legacy PortCls contract. The predicate
+    // is kept so Step 4 / Phase 7 can observe boundary crossings in
+    // diagnostic logs without calling into portcls.
     if (rt->NotifyArmed && !rt->NotifyFired && rt->RingSizeFrames > 0)
     {
         if ((rt->DmaCursorFrames % rt->RingSizeFrames) == rt->NotifyBoundaryBytes)
         {
             rt->NotifyFired = 1;
-            // Intentionally no call-through in Y1B. Y3 will decide
-            // whether event-driven clients need direct dispatch here
-            // or whether the portcls contract handles it upstream.
         }
     }
 
-    // --- Monotonic counter mirror (VB +0xE0/+0xE8) ---
-    // Both counters receive the same delta. Volatile + interlocked
-    // add so a concurrent shadow reader cannot observe a torn 64-bit
-    // mid-write value — matches VB's single-writer-under-lock pattern
-    // without needing the per-stream spinlock Y2 will introduce.
-    InterlockedAdd64(&rt->MonoFramesLow,    (LONGLONG)advance);
-    InterlockedAdd64(&rt->MonoFramesMirror, (LONGLONG)advance);
+    // MonoFramesLow / MonoFramesMirror mutation: REMOVED per Phase 3
+    // shadow invariant (step1.md "What This Step Does NOT Do").
+    // GetPosition continues to read these fields from the legacy
+    // UpdatePosition path until Phase 4 (render flip) / Phase 5
+    // (capture flip).
 
     rt->LastAdvanceDelta           = advance;
     rt->PublishedFramesSinceAnchor = (ULONG)elapsedFrames64;
+
+    KeReleaseSpinLock(&rt->PositionLock, oldIrql);
 }
