@@ -2,7 +2,16 @@
 
 ## Exit Gate
 
-- [ ] Steps 0..4 marked completed.
+- [ ] All steps in `phases/3-canonical-helper-shadow/index.json`
+      marked completed.
+- [ ] 63/64 phase correction (ADR-007 Decision 2) implemented in
+      timer DPC scheduling. `AO_TRANSPORT_ENGINE` has
+      `BaselineQpc` / `TickCounter` / `LastTickQpc` fields and
+      `AoTransportTimerCallback` advances them. (Pre-Phase-4
+      precondition because long-call drift would otherwise become
+      observable after audible flip.)
+- [ ] Final shadow-divergence evidence is collected after the
+      63/64 timer scheduling step, not before it.
 - [ ] Build clean.
 - [ ] Live call test: `DbgShadowQueryHits` and `DbgShadowTimerHits`
       both increase steadily during a live call. Helper is reached.
@@ -45,6 +54,9 @@ Phase 4 audible flip on the render side.
 - Phase 4 must not flip audible ownership without re-confirming
   divergence counter <= 5/min on a live call **immediately before**
   the flip commit (not on a stale Phase 3 measurement).
+- Phase 4 must not flip audible ownership before the 63/64 phase
+  correction step is committed and verified. Long-call drift would
+  otherwise become audible.
 
 ## Phase 3 -> Phase 4 Handoff
 

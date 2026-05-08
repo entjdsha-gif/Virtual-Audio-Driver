@@ -128,10 +128,13 @@ position freshness. Every active call source funnels into it. Pseudocode
 
 ```c
 AoCableAdvanceByQpc(rt, nowQpcRaw, reason, flags) {
-    // KeAcquireSpinLockRaiseToDpc returns the old IRQL — capture it.
+    // KeAcquireSpinLockRaiseToDpc returns the old IRQL -- capture it.
     oldIrql = KeAcquireSpinLockRaiseToDpc(&rt->PositionLock);
 
-    apply_drift_correction(rt, nowQpcRaw);                    // 63/64 phase
+    // 63/64 phase correction is NOT applied here. It is owned by
+    // timer-DPC scheduling (see ADR-007 Decision 2 and DESIGN
+    // section 4.3). The helper consumes nowQpcRaw as-is. The long-
+    // window QPC rebase below is the helper-owned drift mechanism.
     nowQpc100ns  = AoQpcTo100ns(nowQpcRaw);
 
     // Long-window rebase BEFORE elapsed/advance calc — the rebase tick

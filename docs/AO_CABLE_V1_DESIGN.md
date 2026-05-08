@@ -484,6 +484,18 @@ VOID AoTransportTimerCallback(PEX_TIMER timer)
 {
     LARGE_INTEGER nowQpcRaw = KeQueryPerformanceCounter(NULL);
 
+    // 63/64 phase correction (ADR-007 Decision 2). Engine-owned;
+    // updates BaselineQpc / TickCounter / LastTickQpc. At
+    // TickCounter == 100 it re-baselines (BaselineQpc = nowQpcRaw,
+    // TickCounter = 0). The query path never enters this function
+    // and never advances the phase counter.
+    apply_drift_correction(&g_engine, nowQpcRaw.QuadPart);
+    // Phase 3 Step 5 applies the corrected phase to timer
+    // scheduling. The engine-global vs per-stream
+    // (rt->NextEventQpc) deadline-model reconciliation is resolved
+    // there; do not interpret g_engine.NextTickQpc as the active
+    // deadline source until then.
+
     // Snapshot active list under engine lock; take ref on each
     KIRQL oldIrql;
     KeAcquireSpinLock(&g_engine.EngineLock, &oldIrql);

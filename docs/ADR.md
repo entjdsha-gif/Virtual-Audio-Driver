@@ -405,25 +405,45 @@ V1 implements all three:
    AO_ADVANCE_QUERY, 0)` inside the position spinlock before reading
    `MonoFramesLow` / `MonoFramesMirror`. Returned values reflect "now".
 
-2. **63/64 phase correction + long-window QPC rebase** — inside
-   `AoCableAdvanceByQpc`, two distinct mechanisms work together:
-   - Per-tick phase correction: the timer cadence is phase-corrected
-     against QPC drift (`base + (count * interval) * 63/64`), so
-     small per-tick scheduling jitter does not accumulate. This is
-     applied every helper invocation.
-   - Long-window QPC rebase: when the elapsed frames exceed
-     `sampleRate << 7` (i.e. 128 seconds of stream time at any rate),
-     the helper resets `AnchorQpc100ns` to the current QPC and zeros
-     `PublishedFramesSinceAnchor`. This bounds the integer growth of
-     the elapsed-frames computation and re-syncs the notional clock
-     against wall time. (At 48 kHz this fires once every ~128 s; at
+2. **63/64 phase correction (timer-DPC-owned) + long-window QPC
+   rebase (helper-owned)** -- two distinct mechanisms with distinct
+   owners and distinct state:
+
+   - **Per-tick phase correction -- timer DPC owns**: the timer's
+     next-deadline schedule is phase-corrected against QPC drift
+     using `BaselineQpc + (TickCounter * PeriodQpc * 63 / 64)`,
+     with `TickCounter` reset every 100 ticks (re-baselining
+     `BaselineQpc` to the current QPC at reset). State
+     (`BaselineQpc`, `TickCounter`, `LastTickQpc`) lives in
+     `AO_TRANSPORT_ENGINE` (engine-global, not per-stream). The
+     correction is applied **at timer-DPC scheduling**, i.e. when
+     the DPC computes the next-tick deadline -- not inside
+     `AoCableAdvanceByQpc`. `GetPosition` / `GetPositions` call
+     the helper with the current raw QPC and **do not advance the
+     timer phase counter**: the query path is read-side and timer-
+     cadence-neutral.
+
+   - **Long-window QPC rebase -- helper owns**: when elapsed frames
+     against the stream's anchor exceed `sampleRate << 7` (~128 s
+     of stream time at any rate), `AoCableAdvanceByQpc` resets
+     `rt->AnchorQpc100ns` to the current QPC and zeros
+     `rt->PublishedFramesSinceAnchor`. This bounds the integer
+     growth of the elapsed-frames computation and re-syncs the
+     notional clock against wall time. The rebase tick consumes
+     itself; the next call measures a fresh, small elapsed against
+     the new anchor. (At 48 kHz this fires once every ~128 s; at
      192 kHz also every ~128 s of stream time.)
 
-   The two mechanisms are independent: the 63/64 correction is per-
-   tick fine adjustment; the long-window rebase is a coarse periodic
-   re-sync. Earlier drafts mistakenly described the rebase as "every
-   100 ticks" — that came from a 1-ms-tick × 100 = 100 ms reading
-   that did not match the `<< 7` constant. The actual trigger is
+   The two mechanisms have **separate state (engine-global vs
+   per-stream) and separate owners (timer DPC vs helper)**. Earlier
+   drafts described 63/64 phase correction as "applied every helper
+   invocation" while also calling it "the timer cadence is phase-
+   corrected" -- a self-contradiction. The corrected statement: the
+   63/64 correction is timer-DPC-owned. Helper invocation by the
+   query path does not advance it. Earlier drafts also mistakenly
+   described the long-window rebase as "every 100 ticks" -- that
+   came from a 1-ms-tick x 100 = 100 ms reading that did not match
+   the `<< 7` constant. The actual trigger is
    `elapsedFrames >= sampleRate << 7`.
 
 3. **8-frame minimum gate** — `if (advance < 8): return` skips

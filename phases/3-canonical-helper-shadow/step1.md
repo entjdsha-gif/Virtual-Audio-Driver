@@ -10,15 +10,20 @@
 
 Implement the `AoCableAdvanceByQpc` body in **shadow mode**.
 
-The helper performs all advance math:
+The helper performs the helper-owned advance math:
 
 - `PositionLock` acquire / release.
-- Drift correction (ADR-007 63/64 phase correction).
 - `nowQpcRaw` -> `nowQpc100ns` via `AoQpcTo100ns`.
 - Long-window QPC rebase (~128 s of stream time) BEFORE advance
-  compute.
+  compute. (Helper-owned drift mechanism.)
 - 8-frame minimum gate.
 - DMA overrun guard (`advance > sampleRate / 2`).
+
+The 63/64 per-tick phase correction is **timer-DPC-owned** (see
+ADR-007 Decision 2 and `docs/AO_CABLE_V1_DESIGN.md` section 4.3)
+and is implemented in a separate Phase 3 step, not in this helper
+body. Helper invocations from the query path must not advance the
+timer phase counter.
 
 The helper writes its own bookkeeping fields
 (`LastAdvanceDelta`, `PublishedFramesSinceAnchor`, and
@@ -58,9 +63,10 @@ AoCableAdvanceByQpc(PAO_STREAM_RT rt,
      * #9 from review of 8afa59a). */
     KIRQL oldIrql = KeAcquireSpinLockRaiseToDpc(&rt->PositionLock);
 
-    /* drift correction (ADR-007) */
-    apply_drift_correction(rt, nowQpcRaw);
-
+    /* 63/64 phase correction is NOT applied here -- timer DPC owns
+     * that (ADR-007 Decision 2). The helper consumes nowQpcRaw
+     * as-is and uses long-window rebase below as the helper-owned
+     * drift mechanism. */
     ULONGLONG nowQpc100ns = AoQpcTo100ns(nowQpcRaw);
 
     /* Long-window rebase BEFORE computing elapsed/advance -- so the
@@ -128,9 +134,9 @@ AoCableAdvanceByQpc(PAO_STREAM_RT rt,
 }
 ```
 
-`apply_drift_correction` and `AoQpcTo100ns` are static helpers. The
-63/64 phase correction is conservative on the first call (no
-correction yet); subsequent ticks accumulate the correction state.
+`AoQpcTo100ns` is a static helper. The 63/64 phase correction
+state and routine live in the engine timer DPC, implemented in a
+separate Phase 3 step.
 
 ## Rules
 
