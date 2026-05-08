@@ -28,7 +28,9 @@
     {
       "step": 3,
       "name": "round-trip-rate-tests",
-      "status": "pending"
+      "status": "completed",
+      "completed_at": "2026-05-08T18:15:44+0900",
+      "summary": "Round-trip rate matrix PASS (contract gates; diagnostics non-gating)."
     }
   ]
 }
