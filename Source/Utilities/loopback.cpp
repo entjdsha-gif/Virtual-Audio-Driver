@@ -1533,11 +1533,6 @@ NormalizeToInt19(
 // On every non-SUCCESS path the out fields are zeroed (when out != NULL)
 // so callers do not read stale state. No allocations, no locks, no side
 // effects. Any IRQL.
-//
-// Step 0 introduces the file-static helper before Step 1/2 callers land,
-// so /W4 + /WX would emit C4505 (unreferenced local function has been
-// removed) until the first SRC-path caller is wired in. Same suppression
-// pattern as AoComputeFramesForEvent in transport_engine.cpp:552-559.
 //=============================================================================
 typedef struct _AO_GCD_RATIO {
     ULONG Divisor;     // 300, 100, 75 on success; 0 on failure
@@ -1545,10 +1540,6 @@ typedef struct _AO_GCD_RATIO {
     ULONG DstRatio;    // dstRate / Divisor on success; 0 on failure
 } AO_GCD_RATIO;
 
-#pragma warning(push)
-#pragma warning(disable: 4505)   // unreferenced local function has been removed
-                                 // Step 0 introduces the file-static helper
-                                 // before Step 1/2 callers land.
 static
 NTSTATUS
 PickGCDDivisor(
@@ -1586,29 +1577,41 @@ PickGCDDivisor(
     // ADR-008 § Consequences requires STATUS_NOT_SUPPORTED here.
     return STATUS_NOT_SUPPORTED;
 }
-#pragma warning(pop)
 
 //=============================================================================
-// AoRingWriteFromScratch — same-rate ring write (Phase 1 Step 2).
+// AoRingWriteFromScratch — ring write with optional SRC (Phase 1 Step 2 +
+// Phase 2 Step 1).
 //
 // Path:
 //   1. Validate parameters (defensive guards).
 //   2. ADR-008: srcBits must be PCM 8/16/24/32; otherwise STATUS_NOT_SUPPORTED.
 //   3. Acquire pipe->Lock at DISPATCH_LEVEL.
-//   4. Step 2 contract: srcRate must equal pipe->InternalRate. SRC path
-//      is Phase 2; rate-mismatch returns STATUS_NOT_SUPPORTED here.
-//   5. ADR-005 hard-reject: if frames > AoRingAvailableSpaceFrames_Locked,
-//      OverflowCounter++ and return STATUS_INSUFFICIENT_RESOURCES without
-//      advancing WritePos.
-//   6. Per-frame, per-channel normalize-and-write with 4-way bit-depth
-//      dispatch (NormalizeToInt19). Channel mapping copies
-//      min(srcChannels, pipe->Channels); excess ring slots retain prior data.
-//   7. Advance WritePos with WrapBound modulus.
+//   4. Branch on srcRate vs pipe->InternalRate:
+//        - SRC branch (rate mismatch): PickGCDDivisor (ADR-004 first-
+//          match across [300, 100, 75]); reject hostile srcChannels
+//          (srcChannels > pipe->Channels or
+//           srcChannels > ARRAYSIZE(WriteSrcResidual)) with
+//          STATUS_INVALID_PARAMETER before any SRC state mutation;
+//          phase-aware EXACT capacity
+//            outputFrames = floor((WriteSrcPhase + frames*DstRatio) / SrcRatio)
+//          (deliberate divergence from VB's floor+1 safety per
+//          vbcable_pipeline_analysis.md § 3.4 — keeps OverflowCounter
+//          free of false positives); ADR-005 hard-reject on
+//          outputFrames > writable; input-driven linear-interp loop
+//          per DESIGN § 2.3 with WriteSrcPhase + WriteSrcResidual[]
+//          carried across calls.
+//        - Same-rate fast path (rate match): ADR-005 hard-reject if
+//          frames > available; per-frame normalize-and-write with
+//          NormalizeToInt19; channel mapping copies
+//          min(srcChannels, pipe->Channels), excess ring slots retain
+//          prior data; WritePos advances with WrapBound modulus.
+//   5. Both paths: on hard-reject, OverflowCounter++ and WritePos
+//      (and SRC state, when applicable) are all unchanged.
 //
 // NOT covered here:
-//   - SRC (rate conversion) — Phase 2.
-//   - Caller migration — all external callers still go through legacy
-//     shims until Step 4-6.
+//   - Read SRC (Phase 2 Step 2 — AoRingReadToScratch).
+//   - Caller migration — external callers still use legacy shims
+//     until Phases 4-6.
 //=============================================================================
 NTSTATUS AoRingWriteFromScratch(
     PFRAME_PIPE  pipe,
@@ -1634,11 +1637,158 @@ NTSTATUS AoRingWriteFromScratch(
     KIRQL oldIrql;
     KeAcquireSpinLock(&pipe->Lock, &oldIrql);
 
-    // Step 2 = same-rate only. SRC path is Phase 2.
+    // SRC branch — Phase 2 Step 1. Same-rate fast path follows below
+    // (byte-identical to Phase 1 Step 2 — control flow falls through
+    // to it when srcRate == pipe->InternalRate).
     if (srcRate != pipe->InternalRate)
     {
+        AO_GCD_RATIO ratio;
+        NTSTATUS gcdSt = PickGCDDivisor(srcRate, pipe->InternalRate, &ratio);
+        if (!NT_SUCCESS(gcdSt))
+        {
+            // Helper status propagated as-is. No state mutation.
+            KeReleaseSpinLock(&pipe->Lock, oldIrql);
+            return gcdSt;
+        }
+
+        // Reject hostile srcChannels before any state-mutating step.
+        // The ring's per-frame slot count is pipe->Channels and the SRC
+        // per-channel residual is sized by ARRAYSIZE(WriteSrcResidual);
+        // a client requesting more channels than either bound cannot be
+        // served, so reject cleanly here without touching OverflowCounter
+        // or any SRC state. Placed AFTER PickGCDDivisor (so genuinely
+        // unsupported rate pairs surface STATUS_NOT_SUPPORTED first) and
+        // BEFORE the capacity check (so a hostile input never increments
+        // OverflowCounter). The unsigned comparisons guard against
+        // signed-cast wrap on srcChannels values up to ULONG_MAX.
+        if (srcChannels > (ULONG)pipe->Channels ||
+            srcChannels > (ULONG)ARRAYSIZE(pipe->WriteSrcResidual))
+        {
+            KeReleaseSpinLock(&pipe->Lock, oldIrql);
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        // Phase-aware EXACT output frame count for this call.
+        //
+        // VB-Cable (results/vbcable_pipeline_analysis.md § 3.4 line 193)
+        // uses a `floor(frames*DstRatio/SrcRatio) + 1` safety idiom.
+        // AO Cable V1 deliberately diverges to a phase-aware EXACT form:
+        // WriteSrcPhase carries the precise common-tick offset since the
+        // last emit, so the actual emit count for this call is
+        //   outputFrames = floor((WriteSrcPhase + frames*DstRatio) / SrcRatio)
+        // Both forms satisfy ADR-005 hard-reject; the exact form keeps
+        // OverflowCounter free of false positives in cases where the
+        // emit count would have fit. WriteSrcPhase is a single LONG
+        // already in the cache line we touched on Lock acquire, so the
+        // accuracy gain has zero observable cost.
+        //
+        // INVARIANT (1:1 emit count <-> capacity check):
+        // The SRC loop below performs `accum += DstRatio` once per input
+        // frame and `accum -= SrcRatio` once per emit (inside the inner
+        // while). Total accumulator delta over the call is therefore
+        // `frames*DstRatio - emits*SrcRatio`, while the loop terminates
+        // with accum in [0, SrcRatio). Solving:
+        //   emits = floor((WriteSrcPhase + frames*DstRatio) / SrcRatio)
+        //         = outputFrames64 (computed below).
+        // The capacity check therefore matches the actual emit count
+        // bit-for-bit; no over- or under-counting is possible.
+        ULONGLONG totalDst = (ULONGLONG)(ULONG)pipe->WriteSrcPhase
+                           + (ULONGLONG)frames * (ULONGLONG)ratio.DstRatio;
+        ULONGLONG outputFrames64 = totalDst / (ULONGLONG)ratio.SrcRatio;
+
+        LONG writable = AoRingAvailableSpaceFrames_Locked(pipe);
+        if (outputFrames64 > (ULONGLONG)writable)
+        {
+            // ADR-005 hard-reject. Mutate ONLY OverflowCounter; the SRC
+            // loop below has not been entered, so WritePos /
+            // WriteSrcPhase / WriteSrcResidual[] are guaranteed
+            // unchanged. The caller may retry once the consumer drains
+            // the ring.
+            //
+            // The comparison stays in ULONGLONG. Truncating outputFrames64
+            // to ULONG (or LONG) before the compare would let
+            // pathological frames * DstRatio combinations wrap to a
+            // small positive (or negative) value that defeats this
+            // check, breaking the hard-reject invariant. writable is
+            // LONG-bounded and non-negative
+            // (AoRingAvailableSpaceFrames_Locked clamps to >= 0), so
+            // the (ULONGLONG)cast on writable is safe.
+            pipe->OverflowCounter++;
+            KeReleaseSpinLock(&pipe->Lock, oldIrql);
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+
+        // Channel mapping. srcChannels was bounded by the hostile-input
+        // reject guard above (srcChannels <= pipe->Channels &&
+        // srcChannels <= ARRAYSIZE(pipe->WriteSrcResidual)), so the cast
+        // to LONG is safe and the value already fits the residual array.
+        LONG ringChannels = pipe->Channels;
+        LONG copyChannels = (LONG)srcChannels;
+
+        // Input-driven linear-interpolation loop (DESIGN § 2.3 / ADR-004).
+        //
+        // Time model: per common-tick GCD basis, one input frame spans
+        // DstRatio common ticks and one output (ring) frame spans SrcRatio
+        // common ticks. accum is the common-tick distance since the last
+        // emit, in [0, SrcRatio); it carries across calls via WriteSrcPhase.
+        //
+        // Per emit (the inner while body), the fractional position within
+        // the [prev, curr] segment is (DstRatio - accum) / DstRatio after
+        // the SrcRatio subtract:
+        //   sample = (prev*accum + curr*(DstRatio - accum)) / DstRatio
+        // Range invariant (DESIGN § 2.5 19-bit headroom):
+        //   prev, curr in [-2^18, 2^18]; accum, DstRatio-accum in
+        //   [0, DstRatio-1] with DstRatio <= 2560. LONGLONG intermediate
+        //   matches DenormalizeFromInt19's defensive style and removes
+        //   any future doubt about overflow at the two-product sum.
+        LONG accum = pipe->WriteSrcPhase;
+
+        for (ULONG f = 0; f < frames; ++f)
+        {
+            LONG curr[FP_MAX_CHANNELS];
+            for (LONG ch = 0; ch < copyChannels; ++ch)
+            {
+                curr[ch] = NormalizeToInt19(scratch, srcBits, f,
+                                            (ULONG)ch, srcChannels);
+            }
+
+            accum += (LONG)ratio.DstRatio;
+
+            while (accum >= (LONG)ratio.SrcRatio)
+            {
+                accum -= (LONG)ratio.SrcRatio;
+
+                LONG slotBase = pipe->WritePos * ringChannels;
+                for (LONG ch = 0; ch < copyChannels; ++ch)
+                {
+                    LONGLONG mixed =
+                        ((LONGLONG)pipe->WriteSrcResidual[ch] * (LONGLONG)accum)
+                      + ((LONGLONG)curr[ch] *
+                         (LONGLONG)((LONG)ratio.DstRatio - accum));
+                    pipe->Data[slotBase + ch] =
+                        (LONG)(mixed / (LONGLONG)ratio.DstRatio);
+                }
+                // Ring slots beyond copyChannels keep prior contents
+                // (Phase 1 Step 2 channel policy preserved).
+
+                pipe->WritePos++;
+                if (pipe->WritePos >= pipe->WrapBound)
+                    pipe->WritePos = 0;
+            }
+
+            for (LONG ch = 0; ch < copyChannels; ++ch)
+            {
+                pipe->WriteSrcResidual[ch] = curr[ch];
+            }
+        }
+
+        // Persist phase across the call boundary. New phase satisfies
+        // 0 <= accum < SrcRatio (post-subtract invariant of the inner
+        // while loop), matching the contract WriteSrcPhase in [0, SrcRatio).
+        pipe->WriteSrcPhase = accum;
+
         KeReleaseSpinLock(&pipe->Lock, oldIrql);
-        return STATUS_NOT_SUPPORTED;
+        return STATUS_SUCCESS;
     }
 
     // ADR-005: hard-reject overflow. WritePos NOT advanced on full ring.

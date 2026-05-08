@@ -182,18 +182,27 @@ pipe->WriteSrcPhase = accum;
 |---|---|---|---|---|
 | SRC success (any `outputFrames`, including 0) | advanced by `outputFrames` (modulo `WrapBound`) | updated to post-loop `accum` | updated for `ch < copyChannels` | unchanged |
 | SRC hard-reject (`outputFrames > writable`) | **unchanged** | **unchanged** | **unchanged** | `++` |
+| SRC hostile-srcChannels reject (`STATUS_INVALID_PARAMETER`) | **unchanged** | **unchanged** | **unchanged** | **unchanged** |
 | `PickGCDDivisor` failure | unchanged | unchanged | unchanged | unchanged |
 | Same-rate path | (unchanged from Phase 1 Step 2) | n/a (not used in same-rate) | n/a | per existing Phase 1 contract |
 
-Channel bound:
+Channel bound (option A — reject):
 
 ```text
-copyChannels = min(srcChannels, pipe->Channels, ARRAYSIZE(pipe->WriteSrcResidual))
+if (srcChannels > pipe->Channels ||
+    srcChannels > ARRAYSIZE(pipe->WriteSrcResidual))
+{
+    return STATUS_INVALID_PARAMETER;   // before any state mutation
+}
+copyChannels = (LONG)srcChannels;       // safe; bounded by guard above
 ```
 
 Indexing past `WriteSrcResidual[]` is forbidden -- the residual array
 is the only state that survives the call boundary, and a write past
-its end would corrupt adjacent FRAME_PIPE fields.
+its end would corrupt adjacent FRAME_PIPE fields. The reject guard
+runs AFTER `PickGCDDivisor` (so unsupported rate pairs surface
+`STATUS_NOT_SUPPORTED` first) and BEFORE the capacity check (so a
+hostile input never increments `OverflowCounter`).
 
 ## Rules
 
@@ -248,10 +257,14 @@ its end would corrupt adjacent FRAME_PIPE fields.
       exact-form check reports overflow only when actually
       warranted, not on VB's `floor + 1` slack.
 - [ ] Channel bound: a hostile input with `srcChannels` larger
-      than `ARRAYSIZE(pipe->WriteSrcResidual)` is clamped (no
-      out-of-bounds residual write); `copyChannels` follows the
-      `min(srcChannels, pipe->Channels, ARRAYSIZE(WriteSrcResidual))`
-      contract.
+      than `pipe->Channels` or larger than
+      `ARRAYSIZE(pipe->WriteSrcResidual)` is **rejected with
+      `STATUS_INVALID_PARAMETER` before any SRC state mutation**
+      (option A — supersedes the earlier "clamp" approach). The
+      reject path leaves `WritePos`, `WriteSrcPhase`,
+      `WriteSrcResidual[]`, and `OverflowCounter` all unchanged.
+      Boundary case `srcChannels == pipe->Channels` (and
+      `srcChannels == ARRAYSIZE(WriteSrcResidual)`) is accepted.
 - [ ] No memory allocations on the hot path beyond stack
       accumulators (`curr[FP_MAX_CHANNELS]`).
 
