@@ -1,28 +1,45 @@
-# Phase 3 Step 1: AoCableAdvanceByQpc body — shadow mode
+# Phase 3 Step 1: AoCableAdvanceByQpc body -- shadow mode
 
 ## Read First
 
 - `docs/ADR.md` ADR-006, ADR-007.
-- `docs/AO_CABLE_V1_ARCHITECTURE.md` § 4 (helper signature + body).
-- `docs/AO_CABLE_V1_DESIGN.md` § 3, § 4.
+- `docs/AO_CABLE_V1_ARCHITECTURE.md` section 4 (helper signature + body).
+- `docs/AO_CABLE_V1_DESIGN.md` section 3, section 4.
 
 ## Goal
 
-Implement the `AoCableAdvanceByQpc` body fully — drift correction,
-QPC → frames math, 8-frame gate, long-window QPC rebase (~128 s), DMA overrun guard,
-scratch linearization, ring write/read, position update — but keep
-**audible** cable transport on the legacy path. The helper writes
-**shadow** state (its own bookkeeping fields) and bumps debug counters
-to prove it's reached, but does not yet replace the legacy ring
-write/read or position publication.
+Implement the `AoCableAdvanceByQpc` body in **shadow mode**.
+
+The helper performs all advance math:
+
+- `PositionLock` acquire / release.
+- Drift correction (ADR-007 63/64 phase correction).
+- `nowQpcRaw` -> `nowQpc100ns` via `AoQpcTo100ns`.
+- Long-window QPC rebase (~128 s of stream time) BEFORE advance
+  compute.
+- 8-frame minimum gate.
+- DMA overrun guard (`advance > sampleRate / 2`).
+
+The helper writes its own bookkeeping fields
+(`LastAdvanceDelta`, `PublishedFramesSinceAnchor`, and
+`AnchorQpc100ns` on rebase only) and bumps debug counters
+(`DbgShadowAdvanceHits`, plus per-reason `DbgShadowQueryHits` or
+`DbgShadowTimerHits`) so that Phase 3 acceptance can prove the
+helper is reached on every relevant call source.
+
+The helper does not perform scratch linearization, FRAME_PIPE write
+or read, DMA buffer write, or position publication into fields read
+by `GetPosition`. The legacy `UpdatePosition`-driven path continues
+to own audible cable transport unchanged. See "What This Step Does
+NOT Do" below for the full shadow invariant.
 
 ## Planned Files
 
 Edit only:
 
-- `Source/Utilities/transport_engine.cpp` — implement the helper body
-  per `docs/AO_CABLE_V1_ARCHITECTURE.md` § 4.2 pseudocode and
-  `docs/AO_CABLE_V1_DESIGN.md` § 4.
+- `Source/Utilities/transport_engine.cpp` -- implement the helper body
+  per `docs/AO_CABLE_V1_ARCHITECTURE.md` section 4.2 pseudocode and
+  `docs/AO_CABLE_V1_DESIGN.md` section 4.
 
 ## Required Edits
 
@@ -35,7 +52,7 @@ AoCableAdvanceByQpc(PAO_STREAM_RT rt,
                     AO_ADVANCE_REASON reason,
                     ULONG         flags)
 {
-    /* KeAcquireSpinLockRaiseToDpc() RETURNS the old IRQL — capture it.
+    /* KeAcquireSpinLockRaiseToDpc() RETURNS the old IRQL -- capture it.
      * The earlier draft passed an uninitialized KIRQL to KeReleaseSpinLock,
      * which would corrupt scheduler state on restore (real BSOD trigger,
      * #9 from review of 8afa59a). */
@@ -46,7 +63,7 @@ AoCableAdvanceByQpc(PAO_STREAM_RT rt,
 
     ULONGLONG nowQpc100ns = AoQpcTo100ns(nowQpcRaw);
 
-    /* Long-window rebase BEFORE computing elapsed/advance — so the
+    /* Long-window rebase BEFORE computing elapsed/advance -- so the
      * post-rebase elapsed is small (relative to the new anchor) and
      * the publish step writes a consistent value. The earlier draft
      * rebased mid-function and then republished the OLD elapsed into
@@ -57,7 +74,7 @@ AoCableAdvanceByQpc(PAO_STREAM_RT rt,
                                   * rt->SampleRate) / 10000000ULL;
         if (elapsedProbe >= ((ULONGLONG)rt->SampleRate << 7)) {
             /* ~128 s of stream time at any rate has accumulated against
-             * the current anchor — re-anchor to "now" and zero the
+             * the current anchor -- re-anchor to "now" and zero the
              * publication counter. This tick consumes the rebase; do
              * not advance audible state. Next tick computes a fresh,
              * small elapsed against the new anchor. */
@@ -121,7 +138,7 @@ correction yet); subsequent ticks accumulate the correction state.
 - Helper must run at `DISPATCH_LEVEL` safe (no allocations, no paged
   memory, no waits).
 - Helper must be re-entrant safe via the per-stream `PositionLock`.
-- Do not yet wire any caller — Steps 2 / 3 do that.
+- Do not yet wire any caller -- Steps 2 / 3 do that.
 - Do not perform any FRAME_PIPE write or DMA write in this step.
 
 ## Acceptance Criteria
@@ -139,10 +156,26 @@ correction yet); subsequent ticks accumulate the correction state.
 
 ## What This Step Does NOT Do
 
-- Does not flip audible ownership.
-- Does not change `MonoFramesLow` / `MonoFramesMirror` (those stay
-  driven by legacy `UpdatePosition` until Phase 4 / 5).
-- Does not write FRAME_PIPE.
+The helper must NOT, in Phase 3 shadow mode:
+
+- Flip audible ownership for either render or capture.
+- Mutate `MonoFramesLow` / `MonoFramesMirror`. These are read by
+  `GetPosition` and remain driven by legacy `UpdatePosition` until
+  Phase 4 (render flip) and Phase 5 (capture flip).
+- Mutate `DmaProducedMono` / `DmaConsumedMono`. These are the legacy
+  single-publisher mono counters; ownership transfers in Phase 4 / 5.
+- Mutate `NextEventQpc` or any timer scheduling state.
+- Touch `RenderAudibleActive` or any `DbgY2*` scaffold field
+  (Phase 6 cleanup target).
+- Write FRAME_PIPE (no `AoRingWriteFromScratch` / `AoRingReadToScratch`
+  inside the helper).
+- Write the DMA buffer or the cable scratch buffer.
+- Linearize scratch (that is loopback's job, not the helper's).
+- Wire any caller. Caller wiring is Steps 2 / 3.
+
+These restrictions are scoped to Phase 3. Phase 4 and Phase 5
+re-author ownership of the relevant fields under the helper; this
+step file is not the place that authorizes those flips.
 
 ## Completion
 
