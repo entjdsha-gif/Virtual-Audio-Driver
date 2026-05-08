@@ -2035,21 +2035,20 @@ VOID CMiniportWaveRTStream::UpdatePosition
         }
 
         {
-            // Phase 6 Y2-2: cable render audible ownership now lives in
-            // AoCableAdvanceByQpc -> AoCableWriteRenderFromDma inside the
-            // transport engine. The helper reads DMA bytes via its own
-            // DmaProducedMono cursor, applies the fade envelope on the
-            // scratch buffer, and publishes to FRAME_PIPE. Skip the
-            // legacy ReadBytes path for cable render streams.
+            // Phase 3 shadow-only baseline: legacy ReadBytes is the
+            // sole audible owner for cable render. AoCableAdvanceByQpc
+            // is invoked from the query and timer call sources (Phase
+            // 3 step 2 / step 3 wiring) but operates in shadow mode
+            // only -- it never touches the audible cable render data
+            // flow during Phase 3. The Phase 6 Y2-2 audible-flip
+            // (helper-owned ReadBytes replacement) is rolled back for
+            // Phase 3 baseline; it lands in Phase 4 in a single
+            // ownership-flip commit per ADR-006.
             //
-            // Non-cable streams (file-save diagnostic) keep ReadBytes
-            // when g_DoNotCreateDataFiles is FALSE, same as Phase 4
-            // baseline — their transport and the file-save path are
-            // unrelated to the cable audible switch.
-            CMiniportWaveRT* pMp = m_pMiniport;
-            BOOL isCable = (pMp && (pMp->m_DeviceType == eCableASpeaker ||
-                                     pMp->m_DeviceType == eCableBSpeaker));
-            if (!isCable && !g_DoNotCreateDataFiles)
+            // file-save diagnostic gate g_DoNotCreateDataFiles is
+            // independent of the cable audible owner and is preserved
+            // unchanged.
+            if (!g_DoNotCreateDataFiles)
             {
                 ReadBytes(ByteDisplacement);
             }
@@ -2067,22 +2066,29 @@ VOID CMiniportWaveRTStream::UpdatePosition
     //
     m_ullLinearPosition += ByteDisplacement;
 
-    // Phase 6 Y2-2: publish the new monotonic position for cable
-    // CAPTURE streams only. Cable render DmaProducedMono is now
-    // helper-owned (AoCableWriteRenderFromDma publishes after each
-    // successful pipe write), so the legacy publish must NOT touch
-    // it or we create a dual-writer race on the render cursor.
+    // Phase 3 shadow-only baseline: publish the monotonic position
+    // for every cable stream (render AND capture). Legacy
+    // UpdatePosition is the sole publisher of DmaProducedMono in
+    // Phase 3; AoCableAdvanceByQpc is a shadow reader only. The
+    // helper's render branch reads DmaProducedMono for diagnostic
+    // advance computation but never writes it during Phase 3 (the
+    // Y2-2 helper-owned writer was rolled back to restore the
+    // single-publisher invariant).
     //
-    // Cable capture is still legacy-owned until Y3 — WriteBytes runs
-    // in the m_bCapture branch above and the capture runner (still
-    // a no-op under Option Z) needs the published linear position
-    // to drive its DMA fill logic.
+    // Cable capture retains its legacy owner unchanged through
+    // Phase 5; cable render returns to legacy owner here for
+    // Phase 3 and through Phase 4 entry. Phase 4 audible flip will
+    // retire this publish for cable render in the same commit that
+    // promotes the helper to producer ownership (ADR-006: no
+    // dual-publisher window).
     //
-    // Non-cable streams skip this entirely — they still run on the
+    // Non-cable streams skip this entirely -- they still run on the
     // legacy ReadBytes/WriteBytes diagnostic path and have no engine
     // runtime attached.
     if (m_pTransportRt && m_pMiniport &&
-        (m_pMiniport->m_DeviceType == eCableAMic ||
+        (m_pMiniport->m_DeviceType == eCableASpeaker ||
+         m_pMiniport->m_DeviceType == eCableBSpeaker ||
+         m_pMiniport->m_DeviceType == eCableAMic ||
          m_pMiniport->m_DeviceType == eCableBMic))
     {
         AoTransportPublishProducedBytes(m_pTransportRt, m_ullLinearPosition);

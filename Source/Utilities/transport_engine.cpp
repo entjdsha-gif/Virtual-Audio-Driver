@@ -352,34 +352,34 @@ AoTransportOnRunEx(const AO_STREAM_SNAPSHOT* snapshot)
     rt->DmaBuffer     = snapshot->DmaBuffer;
     rt->DmaBufferSize = snapshot->DmaBufferSize;
 
-    // Fresh session → reset monotonic cursors. Both render and capture
+    // Fresh session -> reset monotonic cursors. Both render and capture
     // anchor their event runners against rt->DmaProducedMono, which is
     // published by the stream side via AoTransportPublishProducedBytes
     // from within CMiniportWaveRTStream::UpdatePosition whenever the
     // stream's LinearPosition advances.
     //
-    // Phase 6 Y2-2: for cable render the writer of DmaProducedMono is
-    // now AoCableWriteRenderFromDma (helper-owned). Legacy publish is
-    // retired for cable render; cable capture still publishes here
-    // until Y3. Zero-reset on RUN is still correct — both writers
-    // expect a fresh 0 baseline per stream session.
+    // Phase 3 shadow-only baseline: legacy CMiniportWaveRTStream::
+    // UpdatePosition is the sole publisher of DmaProducedMono for both
+    // cable render AND cable capture. The canonical helper
+    // AoCableAdvanceByQpc is wired into the query and timer call
+    // sources but only computes diagnostic shadow state; it does NOT
+    // touch DmaProducedMono. Helper-owned producer ownership lands in
+    // Phase 4 (render) / Phase 5 (capture).
     rt->DmaProducedMono  = 0;
     rt->DmaConsumedMono  = 0;
 
-    // Phase 6 Y2-2: flip the render audible switch on cable render
-    // streams. This promotes AoCableWriteRenderFromDma to the sole
-    // owner of DMA -> FRAME_PIPE transfer for cable render, replacing
-    // the legacy ReadBytes path in CMiniportWaveRTStream::UpdatePosition.
-    // Cleared on STOP via AoCableResetRuntimeFields so pause/resume
-    // cycles re-enable the switch on the next RUN.
-    if (rt->IsCable && !rt->IsCapture)
-    {
-        rt->RenderAudibleActive = TRUE;
-    }
-    else
-    {
-        rt->RenderAudibleActive = FALSE;
-    }
+    // Phase 3 shadow-only baseline: RenderAudibleActive is forced
+    // FALSE for every stream. The Phase 6 Y2-2 audible-flip switch
+    // (which would have promoted AoCableWriteRenderFromDma to the
+    // sole DMA -> FRAME_PIPE owner for cable render) is intentionally
+    // kept off for the entirety of Phase 3. Helper body's render gate
+    // (see AoCableAdvanceByQpc cpp:~1397) reads this flag; with the
+    // flag forced FALSE the gate is unreachable and AoCableWriteRender
+    // FromDma is dead in the running driver. The function body is
+    // retained as scaffold for Phase 4. Legacy ReadBytes in
+    // CMiniportWaveRTStream::UpdatePosition remains the cable render
+    // audible owner.
+    rt->RenderAudibleActive = FALSE;
 
     // Samples-only seeding: scale the reference frame constants to this
     // stream's actual rate. The engine period in QPC is the same for every
@@ -1386,14 +1386,16 @@ AoCableAdvanceByQpc(
         }
     }
 
-    // --- Y2-1 render audible path (switch off by default) ---
-    // When RenderAudibleActive is TRUE, the helper owns the DMA ->
-    // FRAME_PIPE transfer for cable render streams. In Y2-1 this flag
-    // is never set, so the call is dead code for diagnostic build
-    // purposes — compiles, links, passes kernel verifier, but never
-    // executes. Y2-2 is the commit that flips the switch and retires
-    // legacy ReadBytes ownership. Gated on IsCable && !IsCapture so
-    // capture streams (which enter the same helper) skip it.
+    // --- Render audible path gate (scaffold, unreachable in Phase 3) ---
+    // RenderAudibleActive is forced FALSE in AoTransportOnRunEx for
+    // every stream during Phase 3, so this gate never enters and
+    // AoCableWriteRenderFromDma is dead in the running driver. Helper
+    // operates in shadow mode only; cable render audible ownership
+    // remains on the legacy CMiniportWaveRTStream::UpdatePosition ->
+    // ReadBytes path. The gate and the function body are retained as
+    // scaffold for Phase 4, where the audible flip lands in a single
+    // commit per ADR-006 / REVIEW_POLICY (no two-commit ownership
+    // split).
     if (rt->RenderAudibleActive && rt->IsCable && !rt->IsCapture)
     {
         AoCableWriteRenderFromDma(rt, (ULONG)advance);
