@@ -1516,6 +1516,79 @@ NormalizeToInt19(
 }
 
 //=============================================================================
+// PickGCDDivisor — first-match GCD divisor for Phase 2 SRC rate ratios.
+//
+// Phase 2 Step 0. ADR-004 Decision step 1: tries the priority list
+// [300, 100, 75] in fixed order and returns on the first candidate that
+// divides BOTH rates evenly. NOT "smallest divisor" — for example
+// 48000/96000 matches at 300 (ratio 160:320), not at 100 (480:960).
+//
+// Status contract (per phases/2-single-pass-src/step0.md, commit 04609ae):
+//   STATUS_INVALID_PARAMETER — caller bug: out == NULL, srcRate == 0,
+//                              or dstRate == 0
+//   STATUS_NOT_SUPPORTED     — rate pair with no matching divisor in
+//                              [300, 100, 75] (ADR-008 § Consequences)
+//   STATUS_SUCCESS           — fills out->{Divisor, SrcRatio, DstRatio}
+//
+// On every non-SUCCESS path the out fields are zeroed (when out != NULL)
+// so callers do not read stale state. No allocations, no locks, no side
+// effects. Any IRQL.
+//
+// Step 0 introduces the file-static helper before Step 1/2 callers land,
+// so /W4 + /WX would emit C4505 (unreferenced local function has been
+// removed) until the first SRC-path caller is wired in. Same suppression
+// pattern as AoComputeFramesForEvent in transport_engine.cpp:552-559.
+//=============================================================================
+typedef struct _AO_GCD_RATIO {
+    ULONG Divisor;     // 300, 100, 75 on success; 0 on failure
+    ULONG SrcRatio;    // srcRate / Divisor on success; 0 on failure
+    ULONG DstRatio;    // dstRate / Divisor on success; 0 on failure
+} AO_GCD_RATIO;
+
+#pragma warning(push)
+#pragma warning(disable: 4505)   // unreferenced local function has been removed
+                                 // Step 0 introduces the file-static helper
+                                 // before Step 1/2 callers land.
+static
+NTSTATUS
+PickGCDDivisor(
+    _In_  ULONG          srcRate,
+    _In_  ULONG          dstRate,
+    _Out_ AO_GCD_RATIO*  out)
+{
+    // Caller-bug guard: NULL out cannot be touched.
+    if (out == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // Zero output up front so every failure path leaves it clean.
+    out->Divisor  = 0;
+    out->SrcRatio = 0;
+    out->DstRatio = 0;
+    if (srcRate == 0 || dstRate == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    // First-match across the priority list (ADR-004 Decision step 1).
+    // The first candidate that evenly divides BOTH rates wins. This is
+    // NOT "smallest divisor": e.g. 48000/96000 matches at 300 (ratio
+    // 160:320), not at 100 (480:960).
+    static const ULONG divisors[] = { 300, 100, 75 };
+    for (ULONG i = 0; i < ARRAYSIZE(divisors); ++i) {
+        ULONG d = divisors[i];
+        if ((srcRate % d) == 0 && (dstRate % d) == 0) {
+            out->Divisor  = d;
+            out->SrcRatio = srcRate / d;
+            out->DstRatio = dstRate / d;
+            return STATUS_SUCCESS;
+        }
+    }
+    // Rate pair that fails the priority probe.
+    // ADR-008 § Consequences requires STATUS_NOT_SUPPORTED here.
+    return STATUS_NOT_SUPPORTED;
+}
+#pragma warning(pop)
+
+//=============================================================================
 // AoRingWriteFromScratch — same-rate ring write (Phase 1 Step 2).
 //
 // Path:
