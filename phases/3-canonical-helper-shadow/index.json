@@ -28,6 +28,11 @@
       "step": 4,
       "name": "shadow-divergence-counter",
       "status": "pending"
+    },
+    {
+      "step": 5,
+      "name": "timer-63-64-phase-correction",
+      "status": "pending"
     }
   ]
 }
