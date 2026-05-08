@@ -1477,3 +1477,100 @@ AoCableAdvanceByQpc(
 
     KeReleaseSpinLock(&rt->PositionLock, oldIrql);
 }
+
+//=============================================================================
+// AoTransportSnapshotShadowCounters -- read-only telemetry export of
+// AO_STREAM_RT::DbgShadow{Advance,Query,Timer}Hits for every currently
+// registered cable stream. Called from adapter.cpp's
+// IOCTL_AO_GET_STREAM_STATUS handler at PASSIVE_LEVEL but is itself
+// DISPATCH_LEVEL safe (takes g_AoTransportEngine.Lock at DPC IRQL).
+//
+// Stream identity mapping:
+//   - rt->Pipe == &g_CableAPipe  -> A side
+//   - rt->Pipe == &g_CableBPipe  -> B side
+//   - rt->IsCapture              -> _Capture vs _Render slot
+//
+// Counter read uses InterlockedCompareExchange(&val, 0, 0) so the read is
+// atomic against the InterlockedIncrement writers in AoCableAdvanceByQpc;
+// g_AoTransportEngine.Lock is held only for ActiveStreams list stability,
+// not for serializing the counter values themselves.
+//
+// Single-cable build guard mirrors the adapter.cpp ring-snapshot pattern
+// (lines ~1861/1873 of adapter.cpp). loopback.cpp defines both globals
+// unconditionally, but mirroring the existing guard keeps the symbol
+// reference rules consistent across the driver.
+//=============================================================================
+extern "C" VOID
+AoTransportSnapshotShadowCounters(AO_SHADOW_COUNTERS_SNAPSHOT* out)
+{
+    if (out == NULL)
+    {
+        return;
+    }
+    RtlZeroMemory(out, sizeof(*out));
+
+    if (!g_AoTransportEngine.Initialized)
+    {
+        return;
+    }
+
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&g_AoTransportEngine.Lock, &oldIrql);
+
+    for (PLIST_ENTRY entry = g_AoTransportEngine.ActiveStreams.Flink;
+         entry != &g_AoTransportEngine.ActiveStreams;
+         entry = entry->Flink)
+    {
+        AO_STREAM_RT* rt = CONTAINING_RECORD(entry, AO_STREAM_RT, Link);
+
+        if (!rt->IsCable)
+        {
+            continue;
+        }
+
+        AO_SHADOW_COUNTERS_PER_STREAM* slot = NULL;
+
+#if defined(CABLE_A) || !defined(CABLE_B)
+        if (rt->Pipe == &g_CableAPipe)
+        {
+            slot = rt->IsCapture ? &out->A_Capture : &out->A_Render;
+        }
+#endif
+#if defined(CABLE_B) || !defined(CABLE_A)
+        if (rt->Pipe == &g_CableBPipe)
+        {
+            slot = rt->IsCapture ? &out->B_Capture : &out->B_Render;
+        }
+#endif
+
+        if (slot != NULL)
+        {
+            // Endpoint-aggregate policy: the ABI surface
+            // (A_R_ShadowQueryHits etc.) reads as per-endpoint totals,
+            // so when more than one active AO_STREAM_RT maps to the
+            // same (cable, direction) slot -- e.g. concurrent client
+            // opens against the same endpoint, or a paused stream
+            // that is still on the engine ActiveStreams list while a
+            // new live stream registers -- the counters sum into the
+            // slot. The earlier last-write-wins variant let iteration
+            // order silently mask one of the streams' counters; the
+            // aggregate keeps the per-endpoint reading honest.
+            //
+            // The += sequence is single-threaded against itself: the
+            // snapshot runs inside g_AoTransportEngine.Lock so no
+            // other call to AoTransportSnapshotShadowCounters can
+            // interleave with this loop. 32-bit unsigned wraparound
+            // matches the wrap semantics of the underlying volatile
+            // LONG DbgShadow*Hits counters (monotonic increment with
+            // implicit wrap).
+            slot->ShadowAdvanceHits += (ULONG)InterlockedCompareExchange(
+                &rt->DbgShadowAdvanceHits, 0, 0);
+            slot->ShadowQueryHits += (ULONG)InterlockedCompareExchange(
+                &rt->DbgShadowQueryHits, 0, 0);
+            slot->ShadowTimerHits += (ULONG)InterlockedCompareExchange(
+                &rt->DbgShadowTimerHits, 0, 0);
+        }
+    }
+
+    KeReleaseSpinLock(&g_AoTransportEngine.Lock, oldIrql);
+}

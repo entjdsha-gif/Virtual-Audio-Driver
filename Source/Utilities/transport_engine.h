@@ -456,4 +456,53 @@ extern "C" VOID AoCableApplyRenderFadeInScratch(PVOID rtOpaque,
                                                  LONG* scratch,
                                                  ULONG sampleCount);
 
+//=============================================================================
+// Phase 3 Step 2 prep -- shadow helper counter snapshot for AO_V2_DIAG
+// telemetry surface.
+//
+// Per-stream slot fields are unprefixed (Shadow*Hits) on the ABI surface;
+// they map 1:1 to the runtime AO_STREAM_RT::DbgShadow*Hits counters that
+// AoCableAdvanceByQpc bumps. The "Dbg" prefix is dropped on the public
+// surface because consumer-facing schema (ioctl.h, test_stream_monitor.py)
+// has no use for the kernel-side debug-build trace marker.
+//=============================================================================
+typedef struct _AO_SHADOW_COUNTERS_PER_STREAM {
+    ULONG ShadowAdvanceHits;   // <- AO_STREAM_RT::DbgShadowAdvanceHits
+    ULONG ShadowQueryHits;     // <- AO_STREAM_RT::DbgShadowQueryHits
+    ULONG ShadowTimerHits;     // <- AO_STREAM_RT::DbgShadowTimerHits
+} AO_SHADOW_COUNTERS_PER_STREAM;
+
+typedef struct _AO_SHADOW_COUNTERS_SNAPSHOT {
+    AO_SHADOW_COUNTERS_PER_STREAM A_Render;
+    AO_SHADOW_COUNTERS_PER_STREAM A_Capture;
+    AO_SHADOW_COUNTERS_PER_STREAM B_Render;
+    AO_SHADOW_COUNTERS_PER_STREAM B_Capture;
+} AO_SHADOW_COUNTERS_SNAPSHOT;
+
+// Snapshot the shadow helper counters for every currently-registered cable
+// stream. Called from adapter.cpp's IOCTL_AO_GET_STREAM_STATUS handler.
+//
+// Stream identity mapping is by FRAME_PIPE pointer (g_CableAPipe vs
+// g_CableBPipe) and by AO_STREAM_RT::IsCapture. Streams whose RT is not on
+// the engine's ActiveStreams list at snapshot time contribute zero --
+// `out` is zero-initialized on entry. Out is null-checked; passing NULL
+// is a no-op.
+//
+// Multi-stream-per-endpoint: counters AGGREGATE per endpoint slot.
+// When more than one active AO_STREAM_RT maps to the same (cable,
+// direction) -- e.g. concurrent client opens, or a paused stream
+// that is still on ActiveStreams alongside a new live stream -- the
+// per-stream Dbg*Hits values sum into the slot. The ABI surface
+// (A_R_ShadowQueryHits etc.) is named like an endpoint total, and
+// aggregation keeps that reading honest. 32-bit wrap matches the
+// underlying DbgShadow*Hits wrap semantics.
+//
+// Lock discipline: takes g_AoTransportEngine.Lock for ActiveStreams list
+// stability only. The counter values themselves are bumped via
+// InterlockedIncrement on a different code path; this snapshot uses
+// InterlockedCompareExchange(..., 0, 0) as the no-op atomic read so the
+// snapshot is not racing against the writer. Safe at DISPATCH_LEVEL.
+extern "C" VOID
+AoTransportSnapshotShadowCounters(AO_SHADOW_COUNTERS_SNAPSHOT* out);
+
 #endif // AO_TRANSPORT_ENGINE_H
