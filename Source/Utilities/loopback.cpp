@@ -1951,30 +1951,57 @@ ZeroFillScratch(
 }
 
 //=============================================================================
-// AoRingReadToScratch — same-rate ring read (Phase 1 Step 3).
+// AoRingReadToScratch — ring read with optional SRC (Phase 1 Step 3 +
+// Phase 2 Step 2).
 //
 // Path:
 //   1. Validate parameters (defensive guards).
 //   2. ADR-008: dstBits must be PCM 8/16/24/32; otherwise STATUS_NOT_SUPPORTED.
 //   3. Acquire pipe->Lock at DISPATCH_LEVEL.
-//   4. Step 3 contract: dstRate must equal pipe->InternalRate. SRC path
-//      is Phase 2; rate-mismatch returns STATUS_NOT_SUPPORTED here.
-//   5. ADR-005 hysteretic underrun:
-//        - If UnderrunFlag set and available < WrapBound/2: silence-fill
-//          and return STATUS_SUCCESS (stay in recovery).
-//        - If UnderrunFlag set and available >= WrapBound/2: clear flag,
-//          fall through to real read.
-//        - If frames > available (hard underrun): UnderrunCounter++,
-//          UnderrunFlag = 1, silence-fill, return STATUS_SUCCESS.
-//   6. Per-frame, per-channel denormalize-and-write with 4-way bit-depth
-//      dispatch (DenormalizeFromInt19). When dstChannels > pipe->Channels,
-//      the surplus client channels receive silence (8-bit 0x80 / else 0x00).
-//   7. Advance ReadPos with WrapBound modulus.
+//   4. Branch on dstRate vs pipe->InternalRate:
+//        - SRC branch (rate mismatch): PickGCDDivisor (ADR-004 first-
+//          match across [300, 100, 75]); reject hostile dstChannels
+//          (dstChannels > ARRAYSIZE(ReadSrcResidual)) with
+//          STATUS_INVALID_PARAMETER before any state mutation;
+//          phase-aware EXACT
+//            ringFramesNeeded64 =
+//              floor((ReadSrcPhase + frames*SrcRatio) / DstRatio)
+//          drives ReadPos advance count, and lookahead-aware
+//            consumedBeforeLastOutput =
+//              floor((ReadSrcPhase + (frames-1)*SrcRatio) / DstRatio)
+//            requiredReadableFrames64 =
+//              (consumedBeforeLastOutput == ringFramesNeeded64)
+//                ? ringFramesNeeded64 + 1
+//                : ringFramesNeeded64
+//          drives the capacity check (the +1 covers the trailing
+//          lookahead when the final consume precedes the last
+//          output frame -- e.g. 48k->96k frames=3 phase=0 where
+//          K=1 but f=2 still needs ring[R+1]). ADR-005 hysteresis
+//          stay/exit identical to same-rate; hard underrun on
+//          (requiredReadableFrames64 > available) sets UnderrunFlag,
+//          increments UnderrunCounter, delivers silence via
+//          ZeroFillScratch with all other state unchanged. Output-
+//          driven linear-interp loop with CONDITIONAL multi-consume
+//          reload (mid-consume reload only; final-consume position
+//          left unread to keep memory reads tied exactly to
+//          requiredReadableFrames64). dstChannels > pipe->Channels
+//          is allowed; surplus client channels receive inline silence
+//          per Phase 1 Step 3 policy / DESIGN § 2.3 "no hidden upmix".
+//        - Same-rate fast path (rate match): Phase 1 Step 3 logic,
+//          BYTE-IDENTICAL — ADR-005 hysteresis stay/exit, hard
+//          underrun on (LONG)frames > available, per-frame
+//          DenormalizeFromInt19 with surplus-channel silence,
+//          ReadPos advance with WrapBound modulus.
+//   5. Both paths: underrun / recovery paths deliver silence (via
+//      ZeroFillScratch); parameter / status failures (defensive
+//      guards, ADR-008 dstBits gate, PickGCDDivisor failure, hostile
+//      dstChannels reject) return without touching scratch. ReadPos
+//      / ReadSrcPhase / ReadSrcResidual[] mutated only on SRC
+//      success.
 //
 // NOT covered here:
-//   - SRC (rate conversion) — Phase 2.
-//   - Caller migration — all external callers still go through legacy
-//     shims until Step 4-6.
+//   - Caller migration — external callers still use legacy shims
+//     until Phases 4-6.
 //=============================================================================
 NTSTATUS AoRingReadToScratch(
     PFRAME_PIPE  pipe,
@@ -2000,11 +2027,297 @@ NTSTATUS AoRingReadToScratch(
     KIRQL oldIrql;
     KeAcquireSpinLock(&pipe->Lock, &oldIrql);
 
-    // Step 3 = same-rate only. SRC path is Phase 2.
+    // SRC branch — Phase 2 Step 2. Same-rate fast path follows below
+    // (byte-identical to Phase 1 Step 3 — control flow falls through
+    // to it when dstRate == pipe->InternalRate).
     if (dstRate != pipe->InternalRate)
     {
+        AO_GCD_RATIO ratio;
+        NTSTATUS gcdSt = PickGCDDivisor(pipe->InternalRate, dstRate, &ratio);
+        if (!NT_SUCCESS(gcdSt))
+        {
+            // Helper status propagated as-is. No state mutation.
+            KeReleaseSpinLock(&pipe->Lock, oldIrql);
+            return gcdSt;
+        }
+
+        // Reject hostile dstChannels before any state-mutating step.
+        // Option B (hybrid) — reject only on the residual-array bound.
+        // dstChannels > pipe->Channels is a legitimate Phase 1 Step 3
+        // case (mono ring -> stereo client, etc.) handled by inline
+        // surplus-channel silence below; the SRC branch preserves that
+        // policy. The unsigned comparison guards against signed-cast
+        // wrap on dstChannels values up to ULONG_MAX. Placed AFTER
+        // PickGCDDivisor (so unsupported rate pairs surface
+        // STATUS_NOT_SUPPORTED first) and BEFORE hysteresis / hard
+        // underrun (so hostile input never touches UnderrunFlag /
+        // UnderrunCounter or any SRC state).
+        if (dstChannels > (ULONG)ARRAYSIZE(pipe->ReadSrcResidual))
+        {
+            KeReleaseSpinLock(&pipe->Lock, oldIrql);
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        // Phase-aware EXACT ReadPos advance count for this call.
+        //
+        // VB-Cable (results/vbcable_pipeline_analysis.md § 3.4) uses a
+        // `floor + 1` safety idiom on the write direction. AO Cable V1
+        // chooses the symmetric phase-aware EXACT form on read:
+        // ReadSrcPhase carries the precise common-tick offset since
+        // the most recently consumed ring frame, so the actual ReadPos
+        // advance count for this call is
+        //   ringFramesNeeded64 =
+        //     floor((ReadSrcPhase + frames*SrcRatio) / DstRatio)
+        //
+        // INVARIANT (1:1 ReadPos advance <-> ringFramesNeeded64):
+        // The SRC loop below `accum += SrcRatio` once per output frame
+        // and `accum -= DstRatio` once per ReadPos++; total advances
+        // bit-for-bit match this formula (proof: accum delta =
+        // frames*SrcRatio - emits*DstRatio, terminator accum in
+        // [0, DstRatio), solve).
+        //
+        // requiredReadableFrames64 is the lookahead-aware capacity
+        // bound. The naive `max(K, 1)` form is INSUFFICIENT for
+        // multi-output-frame upsample calls where the final consume
+        // happens BEFORE the last output frame: the trailing outer
+        // iteration would still need to load curr from a position
+        // ONE PAST ringFramesNeeded64, which is outside the readable
+        // window when `available == ringFramesNeeded64` exactly.
+        //
+        // Detect that case by comparing the cumulative consume count
+        // up to (but not including) the final output frame against
+        // ringFramesNeeded64:
+        //   consumedBeforeLastOutput =
+        //     floor((ReadSrcPhase + (frames-1)*SrcRatio) / DstRatio)
+        // When consumedBeforeLastOutput == ringFramesNeeded64, the
+        // final consume has already happened before f = frames - 1
+        // begins, and that last iteration must load curr from
+        // ring[ReadPos + ringFramesNeeded64] -> require K + 1.
+        // Otherwise the final consume is inside the last output
+        // frame's while loop, and no extra lookahead is needed beyond
+        // ringFramesNeeded64 -> require K.
+        //
+        // Examples:
+        //   K=0 (small upsample chunk): consumedBeforeLastOutput == 0
+        //     == K -> require K+1 = 1 (initial lookahead of ring[R]).
+        //   48k->96k frames=2: K=1, consumedBeforeLastOutput=0 != K
+        //     -> require K=1 (final consume IS in f=1's while loop).
+        //   48k->96k frames=3: K=1, consumedBeforeLastOutput=1 == K
+        //     -> require K+1=2 (final consume in f=1, but f=2 still
+        //     needs lookahead from ring[R+1]).
+        //   96k->48k frames=2: K=4, consumedBeforeLastOutput=2 != K
+        //     -> require K=4 (final consume IS in f=1's while loop).
+        //
+        // ReadPos advance count is ALWAYS == ringFramesNeeded64 (NOT
+        // requiredReadableFrames64) -- the +1 only covers the trailing
+        // lookahead, never actual consumption. frames > 0 is
+        // guaranteed by the entry guard, so (frames - 1) does not
+        // underflow.
+        ULONGLONG totalSrc = (ULONGLONG)(ULONG)pipe->ReadSrcPhase
+                           + (ULONGLONG)frames * (ULONGLONG)ratio.SrcRatio;
+        ULONGLONG ringFramesNeeded64 = totalSrc / (ULONGLONG)ratio.DstRatio;
+        ULONGLONG consumedBeforeLastOutput =
+            ((ULONGLONG)(ULONG)pipe->ReadSrcPhase
+              + (ULONGLONG)(frames - 1) * (ULONGLONG)ratio.SrcRatio)
+            / (ULONGLONG)ratio.DstRatio;
+        ULONGLONG requiredReadableFrames64 =
+            (consumedBeforeLastOutput == ringFramesNeeded64)
+                ? (ringFramesNeeded64 + 1ULL)
+                : ringFramesNeeded64;
+
+        LONG available = AoRingAvailableFrames_Locked(pipe);
+
+        // ADR-005 hysteretic underrun -- mirror Phase 1 Step 3 on the
+        // SRC branch. The same WrapBound/2 threshold separates "stay"
+        // (deliver silence, no state change) from "exit" (clear flag,
+        // fall through to capacity check).
+        if (pipe->UnderrunFlag)
+        {
+            if (available < pipe->WrapBound / 2)
+            {
+                // Stay in recovery — silence delivered, no SRC state
+                // mutation, UnderrunCounter unchanged.
+                ZeroFillScratch(scratch, frames, dstBits, dstChannels);
+                KeReleaseSpinLock(&pipe->Lock, oldIrql);
+                return STATUS_SUCCESS;
+            }
+            // Refill crossed the 50% threshold -- exit recovery, fall
+            // through to the capacity check.
+            pipe->UnderrunFlag = 0;
+        }
+
+        if (requiredReadableFrames64 > (ULONGLONG)available)
+        {
+            // Hard underrun — enter recovery, deliver silence. ReadPos
+            // / ReadSrcPhase / ReadSrcResidual[] all unchanged so the
+            // caller may retry on the next tick once more frames
+            // arrive. The (ULONGLONG) comparison keeps the
+            // hard-underrun invariant intact under hostile inputs --
+            // truncating ringFramesNeeded64 (or
+            // requiredReadableFrames64) to ULONG before the compare
+            // would let pathological frames * SrcRatio combos wrap to
+            // a small value that defeats this check.
+            pipe->UnderrunCounter++;
+            pipe->UnderrunFlag = 1;
+            ZeroFillScratch(scratch, frames, dstBits, dstChannels);
+            KeReleaseSpinLock(&pipe->Lock, oldIrql);
+            return STATUS_SUCCESS;
+        }
+
+        // SRC channel mapping. dstChannels was bounded by the
+        // residual-array reject above (dstChannels <=
+        // ARRAYSIZE(ReadSrcResidual)). copyChannels is the count of
+        // channels the SRC actually computes for; surplus client
+        // channels (copyChannels..dstChannels-1) get inline silence
+        // below per Phase 1 Step 3 policy.
+        LONG  ringChannels   = pipe->Channels;
+        ULONG copyChannelsU  = dstChannels;
+        if (copyChannelsU > (ULONG)ringChannels)
+            copyChannelsU = (ULONG)ringChannels;
+        LONG   copyChannels   = (LONG)copyChannelsU;
+        SIZE_T bytesPerSample = (SIZE_T)(dstBits / 8);
+
+        // Output-driven linear-interpolation loop (DESIGN § 2.4 / ADR-004).
+        //
+        // Time model: per common-tick GCD basis, one ring frame spans
+        // DstRatio common ticks and one client (output) frame spans
+        // SrcRatio common ticks. accum is the common-tick distance
+        // since the most recently consumed ring frame, in
+        // [0, DstRatio); it carries across calls via ReadSrcPhase.
+        //
+        // Per emit, alpha = accum / DstRatio gives the fractional
+        // position within the [prev, curr] ring interval:
+        //   sample = (prev*(DstRatio-accum) + curr*accum) / DstRatio
+        // Range invariant (DESIGN § 2.5 19-bit headroom):
+        //   prev, curr in [-2^18, 2^18]; accum, (DstRatio-accum) in
+        //   [0, DstRatio-1] with DstRatio <= 2560. LONGLONG
+        //   intermediate matches DenormalizeFromInt19's defensive
+        //   style.
+        LONG accum = pipe->ReadSrcPhase;
+        LONG prev[FP_MAX_CHANNELS];
+        LONG curr[FP_MAX_CHANNELS];
+
+        // prev[] carries from the prior call. curr[] is loaded fresh
+        // at every outer iteration's start and conditionally inside
+        // the inner while (mid-consume only).
+        for (LONG ch = 0; ch < copyChannels; ++ch)
+        {
+            prev[ch] = pipe->ReadSrcResidual[ch];
+        }
+
+        for (ULONG f = 0; f < frames; ++f)
+        {
+            // Per-iteration curr reload from current ReadPos. The
+            // capacity check guarantees the position read here is
+            // inside the readable window:
+            //   f == 0 is covered either as the first consumed
+            //          position or as the trailing/lookahead slot
+            //          required by the consumedBeforeLastOutput rule.
+            //   f >= 1: ReadPos is one position past the previous
+            //          iteration's last consume (no reload happened
+            //          after that consume — this iteration's start
+            //          reads the now-current outer position). The
+            //          position is covered by requiredReadableFrames64
+            //          either as a consumed position or as the
+            //          trailing lookahead slot.
+            {
+                LONG slotBase = pipe->ReadPos * ringChannels;
+                for (LONG ch = 0; ch < copyChannels; ++ch)
+                {
+                    curr[ch] = pipe->Data[slotBase + ch];
+                }
+            }
+
+            // Emit at fractional position accum/DstRatio between prev
+            // and curr (alpha = accum / DstRatio).
+            for (LONG ch = 0; ch < copyChannels; ++ch)
+            {
+                LONGLONG mixed =
+                    ((LONGLONG)prev[ch] *
+                     (LONGLONG)((LONG)ratio.DstRatio - accum))
+                  + ((LONGLONG)curr[ch] * (LONGLONG)accum);
+                LONG sample = (LONG)(mixed / (LONGLONG)ratio.DstRatio);
+                DenormalizeFromInt19(scratch, dstBits, f, (ULONG)ch,
+                                     dstChannels, sample);
+            }
+            // Surplus client channels (ch >= ringChannels): inline
+            // silence per Phase 1 Step 3 policy / DESIGN § 2.3 "no
+            // hidden upmix". Same idiom as the same-rate body
+            // (8-bit 0x80, else RtlZeroMemory).
+            for (ULONG ch = (ULONG)ringChannels; ch < dstChannels; ++ch)
+            {
+                SIZE_T off = ((SIZE_T)f * (SIZE_T)dstChannels + (SIZE_T)ch)
+                           * bytesPerSample;
+                BYTE* p = scratch + off;
+                if (dstBits == 8)
+                    *p = 0x80;
+                else
+                    RtlZeroMemory(p, bytesPerSample);
+            }
+
+            accum += (LONG)ratio.SrcRatio;
+
+            // Multi-consume reload (BLOCKER fix), CONDITIONAL on more
+            // consumes ahead in this iteration.
+            //
+            // Two cases per inner advance:
+            // (a) MID-consume: another consume is still pending in this
+            //     iteration (`accum >= DstRatio` after the subtract).
+            //     curr MUST be reloaded so the next prev = curr
+            //     promotion captures the actual intermediate ring
+            //     sample. Without this reload, prev = curr would store
+            //     the SAME value as the previous promotion and
+            //     ring[R+1..R+K-1] would never enter the prev sequence.
+            //     96k -> 48k (SrcRatio=320, DstRatio=160) emits once,
+            //     accum becomes 320, the while body runs twice; the
+            //     FIRST consume MUST reload curr = ring[R+1].
+            // (b) FINAL consume: `accum < DstRatio` after the subtract.
+            //     curr MUST NOT be reloaded — the new ReadPos can sit
+            //     outside the readable window when `available ==
+            //     ringFramesNeeded64` exactly. Next outer iteration's
+            //     start (when present) handles the reload; otherwise
+            //     the call ends with the post-final-consume position
+            //     untouched until the next call's capacity re-eval.
+            //
+            // The conditional reload below ties memory reads to
+            // requiredReadableFrames64: all consumed positions, plus
+            // exactly one trailing lookahead when
+            // consumedBeforeLastOutput == ringFramesNeeded64. It must
+            // not add an unconditional K + 1 read.
+            while (accum >= (LONG)ratio.DstRatio)
+            {
+                accum -= (LONG)ratio.DstRatio;
+                for (LONG ch = 0; ch < copyChannels; ++ch)
+                {
+                    prev[ch] = curr[ch];
+                }
+                pipe->ReadPos++;
+                if (pipe->ReadPos >= pipe->WrapBound) pipe->ReadPos = 0;
+                if (accum >= (LONG)ratio.DstRatio)
+                {
+                    // Mid-consume: more consumes ahead, reload curr.
+                    LONG slotBase = pipe->ReadPos * ringChannels;
+                    for (LONG ch = 0; ch < copyChannels; ++ch)
+                    {
+                        curr[ch] = pipe->Data[slotBase + ch];
+                    }
+                }
+                // else: final consume; skip reload.
+            }
+        }
+
+        // Persist phase + residuals across the call boundary. New
+        // accum satisfies 0 <= accum < DstRatio (post-subtract
+        // invariant of the inner while), matching the contract
+        // ReadSrcPhase in [0, DstRatio).
+        for (LONG ch = 0; ch < copyChannels; ++ch)
+        {
+            pipe->ReadSrcResidual[ch] = prev[ch];
+        }
+        pipe->ReadSrcPhase = accum;
+
         KeReleaseSpinLock(&pipe->Lock, oldIrql);
-        return STATUS_NOT_SUPPORTED;
+        return STATUS_SUCCESS;
     }
 
     LONG available = AoRingAvailableFrames_Locked(pipe);

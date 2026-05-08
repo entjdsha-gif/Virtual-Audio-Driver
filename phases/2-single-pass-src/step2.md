@@ -91,22 +91,56 @@ if (dstRate != pipe->InternalRate)
                        + (ULONGLONG)frames * (ULONGLONG)ratio.SrcRatio;
     ULONGLONG ringFramesNeeded64 = totalSrc / (ULONGLONG)ratio.DstRatio;
 
-    // Lookahead-aware readable-frame requirement (BLOCKER 2 fix).
+    // Lookahead-aware readable-frame requirement.
     //
-    // The output-driven SRC loop loads curr = ring[ReadPos] BEFORE the
-    // first emit and uses it as the upper interpolation bound. When
-    // ringFramesNeeded64 == 0 (small upsample chunk: total time
-    // advance < one ring period), no ReadPos++ happens, but the
-    // initial curr load still touches ring[ReadPos]. Treating
-    // ringFramesNeeded64 alone as the readable requirement would let
-    // (0 > available) accept available == 0 and read stale ring data.
-    // Require >= 1 always; otherwise == ringFramesNeeded64.
+    // The naive `max(K, 1)` form is INSUFFICIENT for multi-output-
+    // frame upsample calls where the final consume happens BEFORE the
+    // last output frame: the trailing outer iteration would still
+    // need to load curr from a position ONE PAST ringFramesNeeded64,
+    // which is outside the readable window when `available ==
+    // ringFramesNeeded64` exactly. Concretely, 48k->96k frames=3
+    // phase=0 has K=1 but the consume happens during f=1, leaving
+    // f=2's iteration-start reload to read ring[R+1]; with available
+    // = 1 (only ring[R] valid), R+1 is stale.
     //
-    // ReadPos advance count is ALWAYS == ringFramesNeeded64 (not
-    // requiredReadableFrames64) -- the +1 only covers the lookahead
-    // load, not actual consumption.
+    // Detect that case by comparing the cumulative consume count up
+    // to (but not including) the final output frame against
+    // ringFramesNeeded64:
+    //   consumedBeforeLastOutput =
+    //     floor((ReadSrcPhase + (frames - 1) * SrcRatio) / DstRatio)
+    //   requiredReadableFrames64 =
+    //     (consumedBeforeLastOutput == ringFramesNeeded64)
+    //       ? ringFramesNeeded64 + 1
+    //       : ringFramesNeeded64
+    //
+    // Examples:
+    //   K=0 (small upsample chunk):
+    //     consumedBeforeLastOutput == 0 == K -> require K + 1 = 1
+    //     (initial lookahead of ring[R]).
+    //   48k->96k frames=2 phase=0:
+    //     K=1, consumedBeforeLastOutput=0, K != cBLO
+    //     -> require K = 1 (final consume IS in f=1's while loop).
+    //   48k->96k frames=3 phase=0:
+    //     K=1, consumedBeforeLastOutput=1, K == cBLO
+    //     -> require K + 1 = 2 (final consume is in f=1, but f=2
+    //     still needs lookahead from ring[R+1]).
+    //   96k->48k frames=2 phase=0:
+    //     K=4, consumedBeforeLastOutput=2, K != cBLO
+    //     -> require K = 4 (final consume IS in f=1's while loop;
+    //     no post-final-consume read).
+    //
+    // ReadPos advance count is ALWAYS == ringFramesNeeded64 (NOT
+    // requiredReadableFrames64) -- the +1 only covers the trailing
+    // lookahead, never actual consumption. frames > 0 is guaranteed
+    // by the entry guard, so (frames - 1) does not underflow.
+    ULONGLONG consumedBeforeLastOutput =
+        ((ULONGLONG)(ULONG)pipe->ReadSrcPhase
+          + (ULONGLONG)(frames - 1) * (ULONGLONG)ratio.SrcRatio)
+        / (ULONGLONG)ratio.DstRatio;
     ULONGLONG requiredReadableFrames64 =
-        (ringFramesNeeded64 == 0) ? 1ULL : ringFramesNeeded64;
+        (consumedBeforeLastOutput == ringFramesNeeded64)
+            ? (ringFramesNeeded64 + 1ULL)
+            : ringFramesNeeded64;
 
     LONG available = AoRingAvailableFrames_Locked(pipe);
 
@@ -309,11 +343,16 @@ emits = floor((ReadSrcPhase + frames * SrcRatio) / DstRatio)
 **Capacity check guarantees** (BLOCKER reload-fix invariant):
 
 - the **initial `ring[ReadPos]` lookahead** read at the start of the
-  first outer iteration is readable (covered by the `>= 1` floor of
-  `requiredReadableFrames64`),
+  first outer iteration is readable,
 - **every ring frame actually consumed by `ReadPos++`** is readable
   (covered by the `ringFramesNeeded64` portion of
-  `requiredReadableFrames64`).
+  `requiredReadableFrames64`),
+- **every per-iteration-start lookahead at `f >= 1`** is readable,
+  including the case where the final consume already happened at
+  `f < frames - 1` and the trailing outer iteration must load curr
+  from `ring[ReadPos + ringFramesNeeded64]` -- the
+  `consumedBeforeLastOutput == ringFramesNeeded64` check adds the
+  `+ 1` lookahead exactly when this trailing read is required.
 
 The loop **must not reload the post-final-consume `ReadPos`** inside
 the same call. When `available == ringFramesNeeded64` exactly, the
@@ -417,6 +456,17 @@ clears `UnderrunFlag`).
       `prev` sequence demonstrates this invariant. Specifically:
       96k -> 48k with frames=2, phase=0, available=4 must read ring
       slots `[R, R+1, R+2, R+3]` and NOT `R+4`.
+- [ ] **Trailing-output lookahead** (BLOCKER `consumedBeforeLastOutput`):
+      48k -> 96k upsample with frames=3, phase=0 has K=1 but the
+      final consume happens during f=1, leaving f=2 to load curr
+      from `ring[R+1]` at iteration start.
+      `requiredReadableFrames64` must therefore be 2, not 1.
+      - With `available == 1`: hard underrun (silence delivered,
+        `UnderrunCounter += 1`, `UnderrunFlag = 1`, `ReadPos /
+        ReadSrcPhase / ReadSrcResidual[]` all unchanged).
+      - With `available == 2`: success, ring positions read are
+        exactly `[R, R+1]`, `ReadPos` advances by 1, no read of
+        `R+2`.
 - [ ] **`ringFramesNeeded64 == 0` cases** (BLOCKER 2):
       - `available == 0` -> hard underrun (silence delivered,
         `UnderrunCounter += 1`, `UnderrunFlag = 1`, `ReadPos`
