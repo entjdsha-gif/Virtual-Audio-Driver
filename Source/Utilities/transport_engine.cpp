@@ -87,6 +87,58 @@ static AO_TRANSPORT_ENGINE g_AoTransportEngine;
 static EXT_CALLBACK AoTransportTimerCallback;
 
 //=============================================================================
+// Phase 3 Step 5 -- DBG-bounded DbgPrint budget for apply_drift_correction.
+//
+// Reset to AO_TE_DBG_6364_BUDGET ticks at every timer arm site
+// (Running == FALSE -> active stream arms, in AoTransportOnRunEx).
+// Decremented in apply_drift_correction; lines are only emitted while
+// the budget is positive. 120 ticks covers one full TickCounter
+// 0..99 cycle plus the first re-baseline event of the next cycle,
+// which is sufficient evidence for Step 5 acceptance and avoids
+// flooding DebugView in long live calls.
+//
+// Declared here (above first use site in OnRunEx) so the AO_TE_DBG_*
+// macro and storage are visible at every reference. Compiled out in
+// Release (#if DBG).
+//=============================================================================
+#if DBG
+#define AO_TE_DBG_6364_BUDGET 120
+static volatile LONG g_AoTeDbg6364Budget = 0;
+#endif
+
+//=============================================================================
+// Phase 3 Step 5 -- ADR-007 Decision 2 (63/64 phase correction).
+//
+// Engine-global state lives on AO_TRANSPORT_ENGINE (BaselineQpc /
+// TickCounter / LastTickQpc / NextTickQpc). apply_drift_correction is
+// the SOLE mutator and is called only from AoTransportTimerCallback,
+// once per firing, BEFORE the active-stream traversal, while holding
+// EngineLock. NextTickQpc snapshot and per-stream due computation
+// therefore land in the same lock window.
+//
+// The query path (GetPosition / GetPositions) and the helper
+// (AoCableAdvanceByQpc) MUST NOT call this function -- the query path
+// stays timer-cadence-neutral, helper anchors are per-stream and run
+// under PositionLock. ADR-007 Decision 2 explicitly separates
+// timer-DPC-owned 63/64 phase correction from helper-owned long-window
+// QPC rebase.
+//
+// ExSetTimer arming convention (relative due + periodic period in
+// 100ns units; see AoTransportEngineInit / OnRunEx) is NOT changed by
+// Step 5. NextTickQpc is the DPC virtual-deadline reference for
+// per-stream overdue computation, NOT a re-arm input. Each ExSetTimer
+// firing wakes the DPC; the DPC then computes corrected NextTickQpc
+// and uses it as the cadence reference inside its own body.
+//
+// First-tick semantics: TickCounter == 0 uniformly arms BaselineQpc =
+// nowQpcRaw. This handles both the initial ExSetTimer firing
+// (RtlZeroMemory + arm-site reset both leave TickCounter at 0) and
+// the wrap-around at every 100th firing.
+//=============================================================================
+static VOID
+apply_drift_correction(PAO_TRANSPORT_ENGINE engine, LONGLONG nowQpcRaw);
+
+//=============================================================================
 // Helper: QPC frequency is constant for the life of the system — we query it
 // once on init and reuse it for all period conversions.
 //=============================================================================
@@ -484,6 +536,27 @@ AoTransportOnRunEx(const AO_STREAM_SNAPSHOT* snapshot)
     // this line is in frames or QPC ticks.
     if (!g_AoTransportEngine.Running && g_AoTransportEngine.Timer != NULL)
     {
+        // Phase 3 Step 5 -- ADR-007 Decision 2: reset engine 63/64 state
+        // BEFORE arming the timer. ExCancelTimer in OnStopEx leaves
+        // BaselineQpc / TickCounter / LastTickQpc / NextTickQpc holding
+        // stale values from the previous timer session; the first DPC of
+        // the new session would otherwise compute NextTickQpc against an
+        // anchor that no longer matches reality, breaking per-stream
+        // overdue computation. Zero them under EngineLock so the first
+        // post-arm firing hits the TickCounter == 0 baseline-arm path
+        // and re-anchors against fresh nowQpcRaw.
+        g_AoTransportEngine.BaselineQpc = 0;
+        g_AoTransportEngine.TickCounter = 0;
+        g_AoTransportEngine.LastTickQpc = 0;
+        g_AoTransportEngine.NextTickQpc = 0;
+#if DBG
+        // Reset DBG-bounded DbgPrint budget so each timer session can
+        // produce its own first ~120 ticks of evidence. Compiled out in
+        // Release. AO_TE_DBG_6364_BUDGET = 120 covers one full
+        // TickCounter cycle (100) plus the first re-baseline event.
+        InterlockedExchange(&g_AoTeDbg6364Budget, AO_TE_DBG_6364_BUDGET);
+#endif
+
         LARGE_INTEGER dueTime;
         dueTime.QuadPart = -g_AoTeEventPeriod100ns;
         (VOID)ExSetTimer(
@@ -746,6 +819,67 @@ AoRunCaptureEvent(AO_STREAM_RT* rt, LONGLONG qpc)
 // collected into the snapshot but their events are still no-ops — Step 4
 // fills in the capture runner.
 //=============================================================================
+
+//=============================================================================
+// apply_drift_correction -- ADR-007 Decision 2 timer-DPC body.
+//
+// Called once per AoTransportTimerCallback firing, after
+// KeQueryPerformanceCounter and BEFORE active-list traversal, while
+// holding g_AoTransportEngine.Lock (EngineLock). NextTickQpc snapshot
+// and per-stream due computation therefore use the same locked-state
+// view of the corrected deadline.
+//
+// Formula (resolved by step5.md D1):
+//   if (engine->TickCounter == 0)
+//       engine->BaselineQpc = nowQpcRaw;
+//   engine->NextTickQpc = engine->BaselineQpc
+//                       + ((TickCounter + 1) * PeriodQpc * 63) / 64;
+//   engine->LastTickQpc = nowQpcRaw;
+//   engine->TickCounter = (TickCounter + 1) % 100;
+//
+// Overflow check: (TickCounter + 1) <= 100; PeriodQpc at 1 ms / 48 kHz
+// ≈ QpcFrequency / 1000 (typically 1e4 on x64). Worst-case product
+// 100 * 1e4 * 63 = 6.3e7 frames, well within LONGLONG range.
+//
+// Behavior under TickCounter == 0:
+//   - First firing of a session: post-RtlZeroMemory state. BaselineQpc
+//     was 0 (now set to nowQpcRaw). NextTickQpc = nowQpcRaw + correction.
+//   - 100th firing wraps via (99 + 1) % 100 = 0; the next firing then
+//     re-arms BaselineQpc against fresh nowQpcRaw, capping integer
+//     growth and re-syncing against scheduler reality.
+//=============================================================================
+static VOID
+apply_drift_correction(PAO_TRANSPORT_ENGINE engine, LONGLONG nowQpcRaw)
+{
+    if (engine->TickCounter == 0)
+    {
+        engine->BaselineQpc = nowQpcRaw;
+    }
+
+    LONGLONG correctedDelta =
+        ((LONGLONG)(engine->TickCounter + 1) * engine->PeriodQpc * 63LL) / 64LL;
+    engine->NextTickQpc = engine->BaselineQpc + correctedDelta;
+    engine->LastTickQpc = nowQpcRaw;
+
+#if DBG
+    {
+        LONG remaining = InterlockedDecrement(&g_AoTeDbg6364Budget);
+        if (remaining >= 0)
+        {
+            DbgPrint("[AoTe6364] tick=%u base=%lld now=%lld next=%lld last=%lld\n",
+                     engine->TickCounter,
+                     engine->BaselineQpc,
+                     nowQpcRaw,
+                     engine->NextTickQpc,
+                     engine->LastTickQpc);
+        }
+    }
+#endif
+
+    engine->TickCounter = (engine->TickCounter + 1) % 100U;
+}
+
+//=============================================================================
 static VOID
 AoTransportTimerCallback(
     _In_ PEX_TIMER Timer,
@@ -782,6 +916,24 @@ AoTransportTimerCallback(
 
     LARGE_INTEGER now = KeQueryPerformanceCounter(NULL);
 
+    // Phase 3 Step 5: ADR-007 Decision 2 -- 63/64 phase correction.
+    // Apply BEFORE the active-list traversal, under EngineLock, so the
+    // updated NextTickQpc is the cadence reference for every per-stream
+    // due computation in this firing. apply_drift_correction is the
+    // sole mutator of BaselineQpc / TickCounter / LastTickQpc /
+    // NextTickQpc; the helper and query path do not touch them.
+    apply_drift_correction(&g_AoTransportEngine, now.QuadPart);
+
+    // Cadence reference for per-stream overdue computation. Was raw
+    // now.QuadPart prior to Step 5; rebound to the corrected engine
+    // deadline so per-stream cadence tracks the corrected engine
+    // cadence rather than raw scheduler jitter. Per-stream
+    // rt->NextEventQpc virtual-tick replay semantics are unchanged --
+    // the reference only changes WHICH wall-clock corresponds to the
+    // current firing, not how virtual ticks are budgeted from
+    // rt->NextEventQpc onward.
+    const LONGLONG cadenceRefQpc = g_AoTransportEngine.NextTickQpc;
+
     PLIST_ENTRY entry = g_AoTransportEngine.ActiveStreams.Flink;
     while (entry != &g_AoTransportEngine.ActiveStreams && dueCount < 16)
     {
@@ -804,7 +956,7 @@ AoTransportTimerCallback(
             continue;
         }
 
-        if (now.QuadPart < rt->NextEventQpc)
+        if (cadenceRefQpc < rt->NextEventQpc)
         {
             continue;
         }
@@ -816,9 +968,11 @@ AoTransportTimerCallback(
         LONGLONG baseTickQpc = rt->NextEventQpc;
 
         // Compute overdue ticks including the one we are about to run.
-        // `1 +` because at `now == NextEventQpc` exactly we still owe the
-        // stream one tick; anything past that is bonus catch-up.
-        LONGLONG behindQpc = now.QuadPart - rt->NextEventQpc;
+        // `1 +` because at `cadenceRefQpc == NextEventQpc` exactly we
+        // still owe the stream one tick; anything past that is bonus
+        // catch-up. cadenceRefQpc = corrected engine NextTickQpc
+        // (Step 5 rebind).
+        LONGLONG behindQpc = cadenceRefQpc - rt->NextEventQpc;
         ULONG    overdueTicks =
             1U + (ULONG)(behindQpc / rt->EventPeriodQpc);
 

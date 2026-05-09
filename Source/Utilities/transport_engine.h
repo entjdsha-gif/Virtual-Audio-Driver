@@ -393,8 +393,45 @@ typedef struct _AO_TRANSPORT_ENGINE {
     KSPIN_LOCK              Lock;
     BOOLEAN                 Initialized;
     BOOLEAN                 Running;
-    LONGLONG                PeriodQpc;          // default 20 ms in QPC ticks
+    LONGLONG                PeriodQpc;          // default 1 ms in QPC ticks (ADR-013)
+
+    //=========================================================================
+    // ADR-007 Decision 2 -- 63/64 per-tick phase correction state.
+    //
+    // Engine-global, timer-DPC-owned. Mutated only by AoTransportTimerCallback
+    // (via apply_drift_correction). Helper (AoCableAdvanceByQpc) and query
+    // path (GetPosition / GetPositions) MUST NOT advance these fields:
+    // the query path stays timer-cadence-neutral.
+    //
+    //   BaselineQpc  : raw QPC anchor for the current 100-tick correction
+    //                  window. Re-armed when TickCounter wraps to 0.
+    //   TickCounter  : "next corrected tick index" within the current
+    //                  100-tick window. Range [0, 99]. Wraps via
+    //                  (TickCounter + 1) % 100 after each firing.
+    //   LastTickQpc  : raw QPC of the previous timer firing. Diagnostic
+    //                  only -- not an input to the correction formula.
+    //   NextTickQpc  : corrected absolute QPC of the next tick deadline.
+    //                  Computed each firing as
+    //                      BaselineQpc + (TickCounter + 1) * PeriodQpc * 63 / 64
+    //                  Used by AoTransportTimerCallback as the per-stream
+    //                  overdue cadence reference (replaces raw nowQpcRaw).
+    //                  ExSetTimer arming convention (relative due +
+    //                  periodic period) is unchanged; NextTickQpc is the
+    //                  DPC virtual-deadline reference, NOT a re-arm input.
+    //
+    // Reset points:
+    //   - AoTransportEngineInit zeros via RtlZeroMemory (first init).
+    //   - At every timer-arm (Running == FALSE -> first active stream)
+    //     all four fields are zeroed BEFORE ExSetTimer so a new timer
+    //     session never inherits stale baseline from a previous session.
+    //     The first DPC firing in the new session sees TickCounter == 0
+    //     and arms BaselineQpc to the firing's nowQpcRaw uniformly.
+    //=========================================================================
+    LONGLONG                BaselineQpc;
+    ULONG                   TickCounter;
+    LONGLONG                LastTickQpc;
     LONGLONG                NextTickQpc;
+
     ULONG                   ActiveStreamCount;
     LIST_ENTRY              ActiveStreams;
 } AO_TRANSPORT_ENGINE, *PAO_TRANSPORT_ENGINE;
