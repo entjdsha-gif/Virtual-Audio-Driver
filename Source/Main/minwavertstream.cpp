@@ -13,6 +13,16 @@
 
 #pragma warning (disable : 4127)
 
+// File-local: cable device-type predicate.
+// Used by Phase 3 Step 2 query-path helper wiring.
+static __forceinline bool IsCableDeviceType(eDeviceType type)
+{
+    return type == eCableASpeaker
+        || type == eCableBSpeaker
+        || type == eCableAMic
+        || type == eCableBMic;
+}
+
 //=============================================================================
 // CMiniportWaveRTStream
 //=============================================================================
@@ -873,32 +883,24 @@ NTSTATUS CMiniportWaveRTStream::GetPosition
     KIRQL oldIrql;
     KeAcquireSpinLock(&m_PositionSpinLock, &oldIrql);
 
+    LARGE_INTEGER ilQPC = KeQueryPerformanceCounter(NULL);
+
+    // Phase 3 Step 2: canonical helper QUERY call source (single owner).
+    // Fires under m_PositionSpinLock before any legacy position read,
+    // independent of KSSTATE; see docs/AO_CABLE_V1_DESIGN.md section 5.1.
+    // Phase 4 retires the legacy publish below for cable streams.
+    if (m_pTransportRt && m_pMiniport &&
+        IsCableDeviceType(m_pMiniport->m_DeviceType))
+    {
+        AoCableAdvanceByQpc(m_pTransportRt,
+                            (ULONGLONG)ilQPC.QuadPart,
+                            AO_ADVANCE_QUERY,
+                            0);
+    }
+
     if (m_KsState == KSSTATE_RUN)
     {
-        //
-        // Get the current time and update position.
-        //
-        LARGE_INTEGER ilQPC = KeQueryPerformanceCounter(NULL);
         UpdatePosition(ilQPC);
-
-        // Phase 6 Y1C shadow hook-up: invoke the canonical cable advance
-        // helper in shadow mode so GetPosition becomes a visible Y1C
-        // call source. Cable streams only; non-cable MSVAD streams have
-        // no Y runtime fields populated. The helper's return values are
-        // intentionally NOT consumed — Position_->PlayOffset / WriteOffset
-        // below still reflect the legacy UpdatePosition output (legacy
-        // authoritative until Y2/Y3 retire the legacy path).
-        if (m_pTransportRt && m_pMiniport &&
-            (m_pMiniport->m_DeviceType == eCableASpeaker ||
-             m_pMiniport->m_DeviceType == eCableBSpeaker ||
-             m_pMiniport->m_DeviceType == eCableAMic      ||
-             m_pMiniport->m_DeviceType == eCableBMic))
-        {
-            AoCableAdvanceByQpc(m_pTransportRt,
-                                (ULONGLONG)ilQPC.QuadPart,
-                                AO_ADVANCE_QUERY,
-                                0);
-        }
     }
 
     Position_->PlayOffset = m_ullPlayPosition;
@@ -1169,6 +1171,20 @@ NTSTATUS CMiniportWaveRTStream::GetPositions(
     //
     KeAcquireSpinLock(&m_PositionSpinLock, &oldIrql);
     ilQPC = KeQueryPerformanceCounter(NULL);
+
+    // Phase 3 Step 2: canonical helper QUERY call source (single owner).
+    // Fires under m_PositionSpinLock before any legacy position read,
+    // independent of KSSTATE; see docs/AO_CABLE_V1_DESIGN.md section 5.1.
+    // Phase 4 retires the legacy publish below for cable streams.
+    if (m_pTransportRt && m_pMiniport &&
+        IsCableDeviceType(m_pMiniport->m_DeviceType))
+    {
+        AoCableAdvanceByQpc(m_pTransportRt,
+                            (ULONGLONG)ilQPC.QuadPart,
+                            AO_ADVANCE_QUERY,
+                            0);
+    }
+
     if (m_KsState == KSSTATE_RUN)
     {
         UpdatePosition(ilQPC);
@@ -1176,24 +1192,6 @@ NTSTATUS CMiniportWaveRTStream::GetPositions(
         // Same-call placement keeps m_ulLastUpdatePositionByteDisplacement
         // fresh and stays under m_PositionSpinLock. No transport mutation.
         PumpToCurrentPositionFromQuery(ilQPC);
-
-        // Phase 6 Y1C shadow hook-up: GetPositions is the confirmed hot
-        // query path. Invoke the canonical helper in shadow mode so Y1C
-        // diagnostic counters register this call source. Return values
-        // (*_pullLinearBufferPosition etc.) below still come from the
-        // legacy m_ullLinearPosition that UpdatePosition just updated —
-        // legacy authoritative until Y2/Y3 retire it.
-        if (m_pTransportRt && m_pMiniport &&
-            (m_pMiniport->m_DeviceType == eCableASpeaker ||
-             m_pMiniport->m_DeviceType == eCableBSpeaker ||
-             m_pMiniport->m_DeviceType == eCableAMic      ||
-             m_pMiniport->m_DeviceType == eCableBMic))
-        {
-            AoCableAdvanceByQpc(m_pTransportRt,
-                                (ULONGLONG)ilQPC.QuadPart,
-                                AO_ADVANCE_QUERY,
-                                0);
-        }
     }
     if (_pullLinearBufferPosition)
     {
@@ -1910,39 +1908,6 @@ VOID CMiniportWaveRTStream::UpdatePosition
     _In_ LARGE_INTEGER ilQPC
 )
 {
-    // Phase 6 Y1C shadow shim — cable streams only.
-    //
-    // UpdatePosition is the common funnel for every legacy query path
-    // (GetPosition, GetPositions, GetPacketCount, and the per-stream
-    // MSVAD notification timer TimerNotifyRT). Hook it here so any
-    // path that bypasses the explicit GetPosition/GetPositions hooks
-    // still routes through the canonical helper in shadow mode. In
-    // particular this catches the TimerNotifyRT code path which is
-    // retired in Y4 but still active in Y1C.
-    //
-    // Intentional double-count with GetPosition/GetPositions hooks:
-    // when called from those entry points the helper will be invoked
-    // twice per call (once from this shim, once from the caller-site
-    // hook). This is acceptable for shadow diagnostics — the counters
-    // are observability-only, not authoritative. Y4 retires the
-    // caller-site hooks along with the legacy body, leaving only this
-    // shim as the single funnel.
-    //
-    // The legacy body below still runs unchanged. No externally
-    // visible truth moves into the helper yet — that is Y2 (render)
-    // and Y3 (capture).
-    if (m_pTransportRt && m_pMiniport &&
-        (m_pMiniport->m_DeviceType == eCableASpeaker ||
-         m_pMiniport->m_DeviceType == eCableBSpeaker ||
-         m_pMiniport->m_DeviceType == eCableAMic      ||
-         m_pMiniport->m_DeviceType == eCableBMic))
-    {
-        AoCableAdvanceByQpc(m_pTransportRt,
-                            (ULONGLONG)ilQPC.QuadPart,
-                            AO_ADVANCE_QUERY,
-                            0);
-    }
-
     // Convert ticks to 100ns units.
     LONGLONG  hnsCurrentTime = KSCONVERT_PERFORMANCE_TIME(m_ullPerformanceCounterFrequency.QuadPart, ilQPC);
     
