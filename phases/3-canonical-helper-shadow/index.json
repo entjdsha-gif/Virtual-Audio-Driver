@@ -7,7 +7,9 @@
     {
       "step": 0,
       "name": "ao-stream-rt-fields",
-      "status": "pending"
+      "status": "completed",
+      "completed_at": "2026-05-09T14:29:05+0900",
+      "summary": "AO_STREAM_RT field freeze committed in 86dce72; administrative mark after Codex reconciliation."
     },
     {
       "step": 1,
