@@ -26,7 +26,9 @@
     {
       "step": 3,
       "name": "wire-timer-call-source",
-      "status": "pending"
+      "status": "completed",
+      "completed_at": "2026-05-09T14:24:23+0900",
+      "summary": "1 ms shared timer cadence per ADR-013; Codex review PASS."
     },
     {
       "step": 4,
