@@ -35,7 +35,9 @@
     {
       "step": 4,
       "name": "shadow-divergence-counter",
-      "status": "pending"
+      "status": "completed",
+      "completed_at": "2026-05-09T16:39:19+0900",
+      "summary": "Shadow divergence counter (Approach C, QUERY-after-legacy cumulative compare); helper agrees with legacy in steady state. Codex review PASS."
     },
     {
       "step": 5,
