@@ -885,10 +885,19 @@ NTSTATUS CMiniportWaveRTStream::GetPosition
 
     LARGE_INTEGER ilQPC = KeQueryPerformanceCounter(NULL);
 
-    // Phase 3 Step 2: canonical helper QUERY call source (single owner).
-    // Fires under m_PositionSpinLock before any legacy position read,
-    // independent of KSSTATE; see docs/AO_CABLE_V1_DESIGN.md section 5.1.
-    // Phase 4 retires the legacy publish below for cable streams.
+    // Phase 3 Step 4: UpdatePosition runs BEFORE the canonical helper
+    // QUERY call. UpdatePosition publishes the legacy DmaProducedMono
+    // for this ilQPC; the helper then consumes a freshly-published
+    // legacy frame total against the same QPC and can run a meaningful
+    // QUERY-only shadow divergence compare. The Step 2 invariant
+    // "helper runs before any legacy position READ returned to the
+    // caller" is preserved because Position_->{Play,Write}Offset is
+    // assigned after both calls under the same m_PositionSpinLock.
+    if (m_KsState == KSSTATE_RUN)
+    {
+        UpdatePosition(ilQPC);
+    }
+
     if (m_pTransportRt && m_pMiniport &&
         IsCableDeviceType(m_pMiniport->m_DeviceType))
     {
@@ -896,11 +905,6 @@ NTSTATUS CMiniportWaveRTStream::GetPosition
                             (ULONGLONG)ilQPC.QuadPart,
                             AO_ADVANCE_QUERY,
                             0);
-    }
-
-    if (m_KsState == KSSTATE_RUN)
-    {
-        UpdatePosition(ilQPC);
     }
 
     Position_->PlayOffset = m_ullPlayPosition;
@@ -1172,19 +1176,15 @@ NTSTATUS CMiniportWaveRTStream::GetPositions(
     KeAcquireSpinLock(&m_PositionSpinLock, &oldIrql);
     ilQPC = KeQueryPerformanceCounter(NULL);
 
-    // Phase 3 Step 2: canonical helper QUERY call source (single owner).
-    // Fires under m_PositionSpinLock before any legacy position read,
-    // independent of KSSTATE; see docs/AO_CABLE_V1_DESIGN.md section 5.1.
-    // Phase 4 retires the legacy publish below for cable streams.
-    if (m_pTransportRt && m_pMiniport &&
-        IsCableDeviceType(m_pMiniport->m_DeviceType))
-    {
-        AoCableAdvanceByQpc(m_pTransportRt,
-                            (ULONGLONG)ilQPC.QuadPart,
-                            AO_ADVANCE_QUERY,
-                            0);
-    }
-
+    // Phase 3 Step 4: UpdatePosition runs BEFORE the canonical helper
+    // QUERY call so DmaProducedMono is freshly published for this
+    // ilQPC; helper's QUERY-only shadow divergence compare then sees a
+    // matched anchor. PumpToCurrentPositionFromQuery still follows
+    // UpdatePosition immediately so its m_ulLastUpdatePositionByteDisplacement
+    // stash is fresh. The Step 2 invariant "helper runs before any
+    // legacy position READ returned to the caller" is preserved
+    // because *_pullLinearBufferPosition / Position_ writes occur
+    // after both calls under the same m_PositionSpinLock.
     if (m_KsState == KSSTATE_RUN)
     {
         UpdatePosition(ilQPC);
@@ -1192,6 +1192,15 @@ NTSTATUS CMiniportWaveRTStream::GetPositions(
         // Same-call placement keeps m_ulLastUpdatePositionByteDisplacement
         // fresh and stays under m_PositionSpinLock. No transport mutation.
         PumpToCurrentPositionFromQuery(ilQPC);
+    }
+
+    if (m_pTransportRt && m_pMiniport &&
+        IsCableDeviceType(m_pMiniport->m_DeviceType))
+    {
+        AoCableAdvanceByQpc(m_pTransportRt,
+                            (ULONGLONG)ilQPC.QuadPart,
+                            AO_ADVANCE_QUERY,
+                            0);
     }
     if (_pullLinearBufferPosition)
     {

@@ -340,6 +340,58 @@ AoTransportOnRunEx(const AO_STREAM_SNAPSHOT* snapshot)
 
     AO_STREAM_RT* rt = snapshot->Rt;
 
+    // Phase 3 Step 4 lifecycle: reset the helper / divergence anchor
+    // quartet on every RUN entry under PositionLock, BEFORE acquiring
+    // EngineLock and BEFORE Active flips TRUE. PAUSE -> RUN PRESERVES
+    // the legacy producer baseline (DmaProducedMono / DmaConsumedMono)
+    // -- those are STOP / destructor scope only, reset by
+    // AoCableResetRuntimeFields. The anchor quartet, however, MUST
+    // re-anchor on every RUN entry because legacy
+    // CMiniportWaveRTStream::SetState resets m_ullDmaTimeStamp to the
+    // current QPC on every KSSTATE_RUN entry (see minwavertstream.cpp
+    // ~ line 1621):
+    //
+    //     m_ullLastDPCTimeStamp = m_ullDmaTimeStamp =
+    //         KSCONVERT_PERFORMANCE_TIME(..., KeQueryPerformanceCounter(...));
+    //
+    // The first post-resume UpdatePosition therefore computes
+    //     elapsed = now - m_ullDmaTimeStamp (post-reset)
+    // = a small post-resume sliver, NOT the pause duration. Legacy's
+    // m_ullLinearPosition advances by ~pause_duration / ms × rate
+    // LESS than the helper's QPC-anchored "wall-time since anchor"
+    // would predict, on every PAUSE -> RUN cycle. Without an anchor
+    // reset here, the helper would carry the pre-pause anchor and
+    // accumulate `pause_duration × rate` of fictional drift relative
+    // to the legacy producer; every post-resume QUERY would bump
+    // ShadowDivergenceCount by ~one. Resetting the anchor at RUN
+    // entry aligns helper semantics with legacy "active-time since
+    // last RUN" semantics.
+    //
+    // Lock ordering: PositionLock first, then EngineLock. The reverse
+    // ordering does not exist in this TU, so this is safe. Releasing
+    // PositionLock before taking EngineLock keeps the rule "do not
+    // hold EngineLock across PositionLock" intact.
+    //
+    // The helper seed branch (AnchorQpc100ns == 0) on the next helper
+    // call captures `LegacyAnchorFrames = DmaProducedMono /
+    // BlockAlign` from the PRESERVED post-pause DmaProducedMono, so
+    // helperSinceAnchor and legacySinceAnchor both measure the same
+    // post-resume sliver and the cumulative compare matches.
+    //
+    // DbgShadowDivergenceHits is NOT reset here -- monotonic across
+    // PAUSE/RUN cycles, matches DbgShadow{Advance,Query,Timer}Hits
+    // policy, zeroed only at AoTransportAllocStreamRt via
+    // RtlZeroMemory.
+    {
+        KIRQL posOld;
+        KeAcquireSpinLock(&rt->PositionLock, &posOld);
+        rt->AnchorQpc100ns             = 0;
+        rt->PublishedFramesSinceAnchor = 0;
+        rt->LastAdvanceDelta           = 0;
+        rt->LegacyAnchorFrames         = 0;
+        KeReleaseSpinLock(&rt->PositionLock, posOld);
+    }
+
     KIRQL old;
     KeAcquireSpinLock(&g_AoTransportEngine.Lock, &old);
 
@@ -353,21 +405,21 @@ AoTransportOnRunEx(const AO_STREAM_SNAPSHOT* snapshot)
     rt->DmaBuffer     = snapshot->DmaBuffer;
     rt->DmaBufferSize = snapshot->DmaBufferSize;
 
-    // Fresh session -> reset monotonic cursors. Both render and capture
-    // anchor their event runners against rt->DmaProducedMono, which is
-    // published by the stream side via AoTransportPublishProducedBytes
-    // from within CMiniportWaveRTStream::UpdatePosition whenever the
-    // stream's LinearPosition advances.
+    // Phase 3 Step 4: PAUSE -> RUN preserves DmaProducedMono and
+    // DmaConsumedMono. Zeroing them here would create a phantom
+    // window before the first post-resume UpdatePosition publishes
+    // m_ullLinearPosition (which is preserved across PAUSE per
+    // PortCls/WaveRT contract). See the function header comment for
+    // the full ShadowDivergence rationale. Reset is STOP /
+    // destructor scope, performed by AoCableResetRuntimeFields.
     //
     // Phase 3 shadow-only baseline: legacy CMiniportWaveRTStream::
-    // UpdatePosition is the sole publisher of DmaProducedMono for both
-    // cable render AND cable capture. The canonical helper
+    // UpdatePosition is the sole publisher of DmaProducedMono for
+    // both cable render AND cable capture. The canonical helper
     // AoCableAdvanceByQpc is wired into the query and timer call
-    // sources but only computes diagnostic shadow state; it does NOT
-    // touch DmaProducedMono. Helper-owned producer ownership lands in
-    // Phase 4 (render) / Phase 5 (capture).
-    rt->DmaProducedMono  = 0;
-    rt->DmaConsumedMono  = 0;
+    // sources but only computes diagnostic shadow state; it does
+    // NOT touch DmaProducedMono. Helper-owned producer ownership
+    // lands in Phase 4 (render) / Phase 5 (capture).
 
     // Phase 3 shadow-only baseline: RenderAudibleActive is forced
     // FALSE for every stream. The Phase 6 Y2-2 audible-flip switch
@@ -1004,10 +1056,15 @@ AoResetFadeCounter(AO_STREAM_RT* rt)
 //-----------------------------------------------------------------------------
 // AoCableResetRuntimeFields — STOP/destructor reset of the Y cable
 // runtime state. Matches the VB 669c caller-side pattern: clears the
-// DMA cursor, monotonic counters, anchor QPC, published frames, and
-// fade state. Does NOT touch legacy Step 1 fields (DmaProducedMono,
-// DmaConsumedMono, NextEventQpc, LateEventCount, etc.) — those stay
-// owned by the Step 1 scaffold until Y2/Y3 retire it.
+// DMA cursor, monotonic counters, anchor QPC, published frames, fade
+// state, and the legacy producer/consumer baselines (DmaProducedMono,
+// DmaConsumedMono). Producer/consumer reset is STOP/destructor scope
+// only -- PAUSE -> RUN preserves both so the helper's first
+// post-resume seed captures LegacyAnchorFrames from the preserved
+// post-pause DmaProducedMono (Phase 3 Step 4 lifecycle, see
+// AoTransportOnRunEx). Does NOT touch other Step 1 scaffold fields
+// (NextEventQpc, LateEventCount, etc.) — those stay owned by the
+// Step 1 scaffold until Y2/Y3 retire it.
 //
 // Notification fields (NotifyBoundaryBytes, NotifyArmed, NotifyFired)
 // are ALL preserved across STOP. Verified against VB Ghidra decompile
@@ -1048,17 +1105,31 @@ AoCableResetRuntimeFields(AO_STREAM_RT* rt)
     rt->LastAdvanceDelta   = 0;
     rt->StatOverrunCounter = 0;
 
+    // Phase 3 Step 4: divergence anchor reset on STOP / destructor.
+    // RUN -> STOP -> RUN starts a fresh divergence window (next helper
+    // call will re-seed LegacyAnchorFrames in the AnchorQpc100ns == 0
+    // branch). DbgShadowDivergenceHits is intentionally NOT reset here
+    // -- monotonic diagnostic counter, matches DbgShadow{Advance,Query,
+    // Timer}Hits policy (zeroed only at AoTransportAllocStreamRt via
+    // RtlZeroMemory).
+    rt->LegacyAnchorFrames = 0;
+
     // Notification fields (NotifyBoundaryBytes, NotifyArmed, NotifyFired)
     // are intentionally NOT reset here — see function header comment for
     // the VB parity verification that led to this rule.
 
     // Phase 6 Y2-2: clear the render audible switch on STOP. OnRunEx
     // re-sets it for cable render streams on the next RUN. Also zero
-    // DmaProducedMono — helper is the sole writer for cable render in
-    // Y2-2, and a stale post-STOP value would make the helper read
-    // wrong DMA offsets after resume.
+    // DmaProducedMono and DmaConsumedMono so a fresh stream session
+    // (after STOP / destructor) starts with the legacy producer/
+    // consumer baselines aligned at zero. PAUSE -> RUN does NOT come
+    // through here: the legacy producer baseline must survive a
+    // pause/resume cycle so the helper's QPC-anchored elapsed and the
+    // legacy m_ullLinearPosition-anchored elapsed land on the same
+    // value (Phase 3 Step 4 lifecycle, see AoTransportOnRunEx).
     rt->RenderAudibleActive = FALSE;
     InterlockedExchange64(&rt->DmaProducedMono, 0);
+    rt->DmaConsumedMono     = 0;
 
     // Fade state — reset so the next audible run starts with a fresh
     // silence prefix. AoResetFadeCounter is intentionally inlined here
@@ -1313,8 +1384,58 @@ AoCableAdvanceByQpc(
         rt->AnchorQpc100ns             = nowQpc100ns;
         rt->PublishedFramesSinceAnchor = 0;
         rt->LastAdvanceDelta           = 0;
+        // Step 4: seed LegacyAnchorFrames from current legacy frames so
+        // the next QUERY compare measures helper/legacy advance against
+        // the same anchor. ULONGLONG to avoid 32-bit wrap on long
+        // sessions (4G frames at 48 kHz = ~25 hours). Skip compare on
+        // this seed tick.
+        if (rt->BlockAlign > 0)
+        {
+            rt->LegacyAnchorFrames =
+                (ULONGLONG)rt->DmaProducedMono / (ULONGLONG)rt->BlockAlign;
+        }
+        else
+        {
+            rt->LegacyAnchorFrames = 0;
+        }
         KeReleaseSpinLock(&rt->PositionLock, oldIrql);
         return;
+    }
+
+    // --- Phase 3 Step 4: Unexpected backwards-baseline defense ---
+    // PAUSE -> RUN preserves AO_STREAM_RT, the helper anchor quartet,
+    // and the legacy DmaProducedMono / DmaConsumedMono baselines (see
+    // AoTransportOnRunEx). The expected lifecycle therefore never
+    // makes legacyFramesAbs go below LegacyAnchorFrames -- legacy
+    // bytes are monotonic from STOP-reset (LegacyAnchorFrames seeded
+    // = current legacy at the next first-call seed) up to the next
+    // STOP / destructor.
+    //
+    // This branch is a defense-in-depth for unexpected backwards
+    // motion: a future cleanup path or refactor that resets
+    // DmaProducedMono outside AoCableResetRuntimeFields, an
+    // out-of-band InterlockedExchange64 that fires before the helper
+    // catches up, or a producer-side reorder that briefly publishes
+    // a smaller value. If observed, treat the tick like a fresh
+    // anchor seed: re-anchor QPC and both frame baselines, return
+    // without bump.
+    //
+    // EngineLock is NOT held here; this guard sits inside PositionLock
+    // only. AoCableResetRuntimeFields runs from OnStopEx after
+    // EngineLock release, so there is no lock-graph interaction.
+    if (rt->BlockAlign > 0)
+    {
+        ULONGLONG currentLegacyFrames =
+            (ULONGLONG)rt->DmaProducedMono / (ULONGLONG)rt->BlockAlign;
+        if (currentLegacyFrames < rt->LegacyAnchorFrames)
+        {
+            rt->AnchorQpc100ns             = nowQpc100ns;
+            rt->PublishedFramesSinceAnchor = 0;
+            rt->LegacyAnchorFrames         = currentLegacyFrames;
+            rt->LastAdvanceDelta           = 0;
+            KeReleaseSpinLock(&rt->PositionLock, oldIrql);
+            return;
+        }
     }
 
     // --- Backwards-clock defensive guard ---
@@ -1353,6 +1474,19 @@ AoCableAdvanceByQpc(
         rt->AnchorQpc100ns             = nowQpc100ns;
         rt->PublishedFramesSinceAnchor = 0;
         rt->LastAdvanceDelta           = 0;
+        // Step 4: re-seed LegacyAnchorFrames at the same point the helper
+        // resets PublishedFramesSinceAnchor so the next QUERY compare uses
+        // a consistent anchor pair. ULONGLONG, see seed branch comment
+        // above. Skip compare on this rebase tick.
+        if (rt->BlockAlign > 0)
+        {
+            rt->LegacyAnchorFrames =
+                (ULONGLONG)rt->DmaProducedMono / (ULONGLONG)rt->BlockAlign;
+        }
+        else
+        {
+            rt->LegacyAnchorFrames = 0;
+        }
         KeReleaseSpinLock(&rt->PositionLock, oldIrql);
         return;
     }
@@ -1395,17 +1529,18 @@ AoCableAdvanceByQpc(
     }
 
     // --- Y2-1.5 render byte diff diagnostic (cable render only) ---
-    // Bump helper's cumulative render-byte total and update the max
-    // |helper - legacy| diff observed so far. Legacy side is bumped by
-    // CMiniportWaveRTStream::UpdatePosition after its block-align step.
-    // See AO_STREAM_RT comments for interpretation rules. The helper
-    // runs for both query and timer reasons, so cumulative helper
-    // counter grows faster than legacy cumulative whenever a timer
-    // tick fires without a matching UpdatePosition -- that is normal
-    // and reflected in the diff reading. The meaningful signal is
-    // whether the two cumulatives converge over multi-second windows,
-    // not whether they match on any single advance call. Retained as
-    // Phase 6 cleanup target; not removed in Step 1.
+    // Phase 3 Step 4: the public divergence metric for Step 4 is the
+    // QUERY-only frame-cumulative compare against LegacyAnchorFrames,
+    // applied below at the end of the helper. The Y2 byte-cumulative
+    // diff (helper bytes vs UpdatePosition bytes) is retained for
+    // Phase 4 audible-flip rollback verification but its
+    // DbgY2RenderMismatchHits bump is suppressed -- having two
+    // similarly-named "mismatch" counters with different semantics
+    // confuses reviewers. helperBytes / legacyBytes / DiffMax are
+    // still updated so Phase 4 can compare cumulative byte totals
+    // before the audible flip; only the per-call mismatch counter is
+    // the no-op. ShDiv (DbgShadowDivergenceHits) is the single public
+    // helper-vs-legacy signal Step 4 onward.
     if (rt->IsCable && !rt->IsCapture && rt->BlockAlign > 0)
     {
         LONGLONG advanceBytes = (LONGLONG)advance * (LONGLONG)rt->BlockAlign;
@@ -1422,10 +1557,10 @@ AoCableAdvanceByQpc(
         {
             rt->DbgY2RenderByteDiffMax = absDiff;
         }
-        if (diff != 0)
-        {
-            InterlockedIncrement(&rt->DbgY2RenderMismatchHits);
-        }
+        // Phase 3 Step 4: per-call mismatch bump suppressed; see comment
+        // block above. The single public divergence signal is
+        // DbgShadowDivergenceHits, computed at the end of the helper
+        // for QUERY reasons only.
     }
 
     // --- Render audible path gate (scaffold, unreachable in Phase 3) ---
@@ -1474,6 +1609,71 @@ AoCableAdvanceByQpc(
 
     rt->LastAdvanceDelta           = advance;
     rt->PublishedFramesSinceAnchor = (ULONG)elapsedFrames64;
+
+    // --- Phase 3 Step 4: QUERY-only shadow divergence compare ---
+    // Reached only on the success path (after seed / rebase / gate /
+    // overrun bail-outs returned earlier), so housekeeping ticks are
+    // already excluded from the bump count.
+    //
+    // QUERY-after-legacy ordering invariant: GetPosition / GetPositions
+    // call UpdatePosition(ilQPC) BEFORE AoCableAdvanceByQpc(... QUERY ...)
+    // for cable streams, so DmaProducedMono is freshly published for
+    // the same QPC the helper just consumed.
+    //
+    // Tolerance:
+    //   toleranceFrames = ceil(SampleRate / 1000) + AO_CABLE_MIN_FRAMES_GATE
+    //
+    // Two terms with distinct meaning:
+    //   ceil(SampleRate / 1000) = 1 ms-worth of frames at the stream
+    //                              rate. Bounds legacy's
+    //                              m_hnsElapsedTimeCarryForward residual
+    //                              (legacy `UpdatePosition` accumulates
+    //                              `m_ullLinearPosition` via ms-quantized
+    //                              math; the carry holds < 1 ms of
+    //                              not-yet-applied wall time).
+    //   AO_CABLE_MIN_FRAMES_GATE = helper's 8-frame minimum gate
+    //                              (ADR-007), the per-call helper noise
+    //                              floor.
+    // Sum: 48 kHz -> 48 + 8 = 56, 44.1 kHz -> 45 + 8 = 53,
+    //      96 kHz -> 96 + 8 = 104.
+    //
+    // Helper is NOT pulled down to legacy's ms math; this is the
+    // measurement allowance for comparing two different time-quantization
+    // models. See AO_STREAM_RT field comments for the full rationale.
+    //
+    // Active gate: a non-RUN query (KSSTATE_PAUSE / KSSTATE_STOP) reads
+    // a stale `DmaProducedMono` while the helper continues advancing
+    // PublishedFramesSinceAnchor against a new QPC delta -- skip the
+    // compare so housekeeping queries during state transitions do not
+    // bump.
+    //
+    // TIMER / PACKET reasons skip the compare because legacy publish
+    // cadence is decoupled from the 1 ms transport timer; per-call
+    // helper-vs-legacy comparison would explode under cadence skew.
+    // Step 3 evidence covers timer cadence agreement separately.
+    if (reason == AO_ADVANCE_QUERY && rt->IsCable && rt->Active &&
+        rt->BlockAlign > 0)
+    {
+        ULONGLONG legacyFramesAbs =
+            (ULONGLONG)rt->DmaProducedMono / (ULONGLONG)rt->BlockAlign;
+        // Anchor-relative frame counts. Unsigned subtraction is fine:
+        // LegacyAnchorFrames was sampled <= legacyFramesAbs at seed /
+        // rebase, and DmaProducedMono is monotonic.
+        ULONGLONG legacySinceAnchor = legacyFramesAbs - rt->LegacyAnchorFrames;
+        ULONGLONG helperSinceAnchor = (ULONGLONG)rt->PublishedFramesSinceAnchor;
+
+        ULONGLONG absDiff = (helperSinceAnchor > legacySinceAnchor)
+            ? (helperSinceAnchor - legacySinceAnchor)
+            : (legacySinceAnchor - helperSinceAnchor);
+
+        ULONG toleranceFrames =
+            ((rt->SampleRate + 999U) / 1000U) + AO_CABLE_MIN_FRAMES_GATE;
+
+        if (absDiff > (ULONGLONG)toleranceFrames)
+        {
+            InterlockedIncrement(&rt->DbgShadowDivergenceHits);
+        }
+    }
 
     KeReleaseSpinLock(&rt->PositionLock, oldIrql);
 }
@@ -1569,6 +1769,11 @@ AoTransportSnapshotShadowCounters(AO_SHADOW_COUNTERS_SNAPSHOT* out)
                 &rt->DbgShadowQueryHits, 0, 0);
             slot->ShadowTimerHits += (ULONG)InterlockedCompareExchange(
                 &rt->DbgShadowTimerHits, 0, 0);
+            // Phase 3 Step 4: helper-vs-legacy divergence count. Aggregates
+            // per endpoint following the same multi-stream policy as the
+            // hit counters above.
+            slot->ShadowDivergenceHits += (ULONG)InterlockedCompareExchange(
+                &rt->DbgShadowDivergenceHits, 0, 0);
         }
     }
 

@@ -48,15 +48,19 @@ V1_STATUS_SIZE = 64
 # Underrun, RingFill, WrapBound, UnderrunFlag UCHAR + 3-byte pad) = 172.
 # Phase 3 Step 2 prep tail: +4 streams * 3 ULONGs (per-stream
 # Shadow{Advance,Query,Timer}Hits from AO_STREAM_RT) = 220.
+# Phase 3 Step 4 tail: +4 streams * 1 ULONG (per-stream
+# ShadowDivergenceCount from AO_STREAM_RT::DbgShadowDivergenceHits) = 236.
 V2_DIAG_SIZE_P1  = 4 + 4 * 7 * 4                 # 116
 V2_DIAG_SIZE_P5  = V2_DIAG_SIZE_P1 + 4 * 4       # 132
 V2_DIAG_SIZE_P6  = V2_DIAG_SIZE_P5 + 2 * 5 * 4   # 172
 V2_DIAG_SIZE_P7  = V2_DIAG_SIZE_P6 + 4 * 3 * 4   # 220
-V2_DIAG_SIZE     = V2_DIAG_SIZE_P7
+V2_DIAG_SIZE_P8  = V2_DIAG_SIZE_P7 + 4 * 1 * 4   # 236
+V2_DIAG_SIZE     = V2_DIAG_SIZE_P8
 V2_BUF_SIZE      = V1_STATUS_SIZE + V2_DIAG_SIZE
 V2_FIELDS_PER_BLOCK = 7
 RING_DIAG_BLOCK_BYTES   = 5 * 4                  # per-cable Phase 6 ring diag
 SHADOW_BLOCK_BYTES      = 3 * 4                  # per-stream Phase 3 prep shadow counters
+DIVERGENCE_BLOCK_BYTES  = 1 * 4                  # per-stream Phase 3 Step 4 ShadowDivergenceCount
 
 
 def open_device(name):
@@ -125,7 +129,8 @@ def get_stream_status(h):
         struct_size = struct.unpack_from('<I', buf.raw, v2_offset)[0]
 
         if struct_size in (V2_DIAG_SIZE_P1, V2_DIAG_SIZE_P5,
-                           V2_DIAG_SIZE_P6, V2_DIAG_SIZE_P7):
+                           V2_DIAG_SIZE_P6, V2_DIAG_SIZE_P7,
+                           V2_DIAG_SIZE_P8):
             def read_block(offset):
                 fields = struct.unpack_from('<IIIIIII', buf.raw, offset)
                 return {
@@ -150,7 +155,8 @@ def get_stream_status(h):
 
             # Phase 5 tail: 4 ULONGs of render-side drive counters.
             # Present iff the driver returned the 132-byte shape or larger.
-            if struct_size in (V2_DIAG_SIZE_P5, V2_DIAG_SIZE_P6, V2_DIAG_SIZE_P7):
+            if struct_size in (V2_DIAG_SIZE_P5, V2_DIAG_SIZE_P6,
+                               V2_DIAG_SIZE_P7, V2_DIAG_SIZE_P8):
                 a_r_pump, a_r_legacy, b_r_pump, b_r_legacy = struct.unpack_from(
                     '<IIII', buf.raw, cursor)
                 result['CableA_Render']['RenderPumpDriveCount']   = a_r_pump
@@ -168,7 +174,8 @@ def get_stream_status(h):
             # RingFillFrames, WrapBoundFrames, UnderrunFlag (UCHAR) + 3-byte
             # Reserved pad. Layout = '<IIIIB3x' per cable. Present iff the
             # driver returned the 172-byte shape or larger.
-            if struct_size in (V2_DIAG_SIZE_P6, V2_DIAG_SIZE_P7):
+            if struct_size in (V2_DIAG_SIZE_P6, V2_DIAG_SIZE_P7,
+                               V2_DIAG_SIZE_P8):
                 ovA, urA, fillA, wrapA, ufA = struct.unpack_from(
                     '<IIIIB3x', buf.raw, cursor)
                 cursor += RING_DIAG_BLOCK_BYTES
@@ -197,7 +204,7 @@ def get_stream_status(h):
             # B_Render, B_Capture. Fields per stream: ShadowAdvanceHits,
             # ShadowQueryHits, ShadowTimerHits (sourced from AO_STREAM_RT
             # DbgShadow*Hits via AoTransportSnapshotShadowCounters).
-            if struct_size == V2_DIAG_SIZE_P7:
+            if struct_size in (V2_DIAG_SIZE_P7, V2_DIAG_SIZE_P8):
                 for key in ('CableA_Render', 'CableA_Capture',
                             'CableB_Render', 'CableB_Capture'):
                     sha, shq, sht = struct.unpack_from('<III', buf.raw, cursor)
@@ -211,6 +218,27 @@ def get_stream_status(h):
                     result[key]['ShadowAdvanceHits'] = None
                     result[key]['ShadowQueryHits']   = None
                     result[key]['ShadowTimerHits']   = None
+
+            # Phase 3 Step 4 tail: per-stream ShadowDivergenceCount.
+            # 4 streams * 1 ULONG = 16 bytes. Present iff driver returned
+            # the 236-byte (P8) shape. Bumped by helper only on
+            # AO_ADVANCE_QUERY (and only while the stream is Active=RUN)
+            # when |helper - legacy| frame-anchor cumulative exceeds
+            # ((SampleRate + 999) / 1000) + AO_CABLE_MIN_FRAMES_GATE
+            # (legacy 1 ms quantization envelope + helper 8-frame gate;
+            # 56 frames at 48 kHz). Distinct from PumpShadowDivergenceCount
+            # in the per-direction P1 block above (force-zeroed; source
+            # retired).
+            if struct_size == V2_DIAG_SIZE_P8:
+                for key in ('CableA_Render', 'CableA_Capture',
+                            'CableB_Render', 'CableB_Capture'):
+                    shdiv, = struct.unpack_from('<I', buf.raw, cursor)
+                    result[key]['ShadowDivergenceCount'] = shdiv
+                    cursor += DIVERGENCE_BLOCK_BYTES
+            else:
+                for key in ('CableA_Render', 'CableA_Capture',
+                            'CableB_Render', 'CableB_Capture'):
+                    result[key]['ShadowDivergenceCount'] = None
 
     return result
 
@@ -279,6 +307,19 @@ def print_status(cable_label, handle):
             sht = block.get('ShadowTimerHits')
             if sha is not None and shq is not None and sht is not None:
                 line += f" | Shadow=Adv{sha}/Q{shq}/T{sht}"
+            # Phase 3 Step 4 helper-vs-legacy divergence counter.
+            # ShDiv=N means the helper's frame-anchor cumulative differed
+            # from the legacy DmaProducedMono / BlockAlign cumulative by
+            # more than the rate-aware tolerance
+            #   ((SampleRate + 999) / 1000) + AO_CABLE_MIN_FRAMES_GATE
+            # (legacy 1 ms quantization envelope + helper 8-frame gate;
+            # 56 frames at 48 kHz) on N AO_ADVANCE_QUERY invocations
+            # since the last anchor seed / rebase / backwards-baseline
+            # re-seed. None means the driver is on a pre-P8 layout and
+            # this metric is not exposed yet.
+            shdiv = block.get('ShadowDivergenceCount')
+            if shdiv is not None:
+                line += f" ShDiv={shdiv}"
             return line
 
         print(fmt_block("Render ", render, is_render=True))

@@ -365,6 +365,40 @@ typedef struct _AO_STREAM_RT {
     volatile LONG           DbgShadowAdvanceHits;
     volatile LONG           DbgShadowQueryHits;
     volatile LONG           DbgShadowTimerHits;
+
+    // Shadow divergence anchor + counter (Phase 3 Step 4).
+    // LegacyAnchorFrames is ULONGLONG to avoid 32-bit wrap on multi-
+    // hour sessions (4 G frames at 48 kHz ≈ 25 hours). Lifecycle:
+    //   - AoTransportOnRunEx zeros the anchor quartet on every RUN
+    //     entry under PositionLock (BEFORE EngineLock, BEFORE
+    //     Active=TRUE). Required because legacy SetState resets
+    //     m_ullDmaTimeStamp on every KSSTATE_RUN entry
+    //     (minwavertstream.cpp ~line 1621), so legacy
+    //     m_ullLinearPosition counts only active-time since the most
+    //     recent RUN. Helper anchor must align to the same semantics
+    //     or every PAUSE→RUN cycle injects pause_duration × rate of
+    //     fictional drift.
+    //   - PAUSE→RUN PRESERVES DmaProducedMono and DmaConsumedMono
+    //     (STOP / destructor scope only). The next first-call seed
+    //     captures LegacyAnchorFrames from the preserved post-pause
+    //     value.
+    //   - first-call seed (AnchorQpc100ns == 0): seeds
+    //     LegacyAnchorFrames from current DmaProducedMono / BlockAlign.
+    //   - long-window QPC rebase (~128 s): ADR-007 drift correction.
+    //   - helper-side backwards-baseline guard: defense-in-depth for
+    //     unexpected DmaProducedMono regression. Not exercised by
+    //     current PAUSE→RUN.
+    //   - AoCableResetRuntimeFields on STOP / destructor wipes the
+    //     anchor quartet, DmaProducedMono, and DmaConsumedMono.
+    // DbgShadowDivergenceHits bumps only on AO_ADVANCE_QUERY (and
+    // only when rt->Active is TRUE) when
+    // |helperFramesSinceAnchor - legacyFramesSinceAnchor| exceeds
+    //   ceil(SampleRate / 1000) + AO_CABLE_MIN_FRAMES_GATE
+    // = 1 ms quantization envelope of legacy UpdatePosition + 8-frame
+    // helper gate (ADR-007). TIMER / PACKET reasons skip the compare.
+    // DbgShadowDivergenceHits is monotonic across PAUSE/RUN cycles.
+    ULONGLONG               LegacyAnchorFrames;
+    volatile LONG           DbgShadowDivergenceHits;
 } AO_STREAM_RT, *PAO_STREAM_RT;
 ```
 
@@ -826,11 +860,18 @@ typedef struct _AO_STREAM_STATUS {
     AO_ENDPOINT_STATUS CableB_Mic;
 } AO_STREAM_STATUS;
 
-// V2 portion (AO_V2_DIAG) — present iff caller buffer is large enough
+// V2 portion (AO_V2_DIAG) — present iff caller buffer is large enough.
+// Tail is partial-write keyed off OutputBufferLength so older consumers
+// keep working as the schema grows. Current size is P8 (236 bytes); tier
+// thresholds: P1 116, P5 132, P6 172, P7 220, P8 236.
 typedef struct _AO_V2_DIAG {
     ULONG StructSize;
 
-    // Per Cable * Direction: 7 ULONGs each
+    // P1 tier: per Cable * Direction, 7 ULONGs each.
+    // PumpShadowDivergenceCount here is the LEGACY pump-window divergence
+    // (Phase 1 design). Source FRAME_PIPE counter retired in Phase 1
+    // cleanup; adapter.cpp force-zeroes this slot. Distinct from the
+    // P8-tier per-stream ShadowDivergenceCount below.
     ULONG  A_R_GatedSkipCount;
     ULONG  A_R_OverJumpCount;
     ULONG  A_R_FramesProcessedLow;
@@ -840,11 +881,43 @@ typedef struct _AO_V2_DIAG {
     ULONG  A_R_PumpFeatureFlags;
     // ...same for A_C, B_R, B_C
 
-    // Stage 4+ render-side drive counters
+    // P5 tier: render-side drive counters (4 ULONGs).
     ULONG  A_R_PumpDriveCount;
     ULONG  A_R_LegacyDriveCount;
     ULONG  B_R_PumpDriveCount;
     ULONG  B_R_LegacyDriveCount;
+
+    // P6 tier: per-cable canonical FRAME_PIPE ring diag
+    // (Overflow/Underrun/UnderrunFlag/Fill/WrapBound).
+
+    // P7 tier: per-stream Phase 3 shadow helper hit counters
+    // (ShadowAdvanceHits / ShadowQueryHits / ShadowTimerHits).
+    // Block order A_Render, A_Capture, B_Render, B_Capture.
+
+    // P8 tier (Phase 3 Step 4): per-stream Shadow divergence counter.
+    // Bumped by AoCableAdvanceByQpc only on AO_ADVANCE_QUERY (and only
+    // when the stream is Active = RUN) when helper-vs-legacy
+    // frame-anchor cumulative differs by more than the rate-aware
+    // tolerance:
+    //   ((SampleRate + 999) / 1000) + AO_CABLE_MIN_FRAMES_GATE
+    // = legacy 1 ms quantization envelope + helper 8-frame gate.
+    // 48 kHz -> 56, 44.1 kHz -> 53, 96 kHz -> 104.
+    //
+    // Source field is AO_STREAM_RT::DbgShadowDivergenceHits.
+    //
+    // CAPTURE-SIDE CAVEAT: WASAPI capture clients do not call
+    // GetPosition on the capture stream, so the helper QUERY call
+    // source never fires for capture. <Cable>_C_ShadowDivergenceCount
+    // staying at 0 means the metric was NOT EXERCISED, not that helper
+    // and legacy agree. <Cable>_C_ShadowQueryHits == 0 is the direct
+    // signal for "not exercised". Phase 5 capture audible flip needs
+    // its own capture-side evidence gate.
+    //
+    // One ULONG per stream, same A_R / A_C / B_R / B_C order as P7.
+    ULONG  A_R_ShadowDivergenceCount;
+    ULONG  A_C_ShadowDivergenceCount;
+    ULONG  B_R_ShadowDivergenceCount;
+    ULONG  B_C_ShadowDivergenceCount;
 } AO_V2_DIAG;
 ```
 

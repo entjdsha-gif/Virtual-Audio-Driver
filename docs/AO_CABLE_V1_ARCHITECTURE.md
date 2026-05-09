@@ -432,7 +432,7 @@ The IOCTL `IOCTL_AO_GET_STREAM_STATUS` returns:
   | `<Cable>_<R/C>_UnderrunFlag` | UCHAR; 1 = drained recovery, 0 = normal (50%-`WrapBound` hysteresis observable) | Phase 1 Step 5 |
   | `<Cable>_<R/C>_RingFillFrames` | Live `(WritePos − ReadPos)` wrap-corrected | Phase 1 Step 5 |
   | `<Cable>_<R/C>_WrapBoundFrames` | Current `WrapBound` (= `TargetLatencyFrames` after reconcile settles) | Phase 1 Step 5 |
-  | `<Cable>_<R/C>_ShadowDivergenceCount` | Helper-vs-legacy advance disagreement count (8-frame tolerance) | Phase 3 Step 4 |
+  | `<Cable>_<R/C>_ShadowDivergenceCount` | Helper-vs-legacy frame-anchor cumulative disagreement count, QUERY-only and Active-only. Tolerance = `ceil(SampleRate/1000) + AO_CABLE_MIN_FRAMES_GATE` (legacy 1 ms quantization envelope + helper 8-frame gate). `AoTransportOnRunEx` resets the anchor quartet (`AnchorQpc100ns`, `PublishedFramesSinceAnchor`, `LastAdvanceDelta`, `LegacyAnchorFrames`) on every RUN entry to align with legacy's "active-time since last RUN" semantics (legacy `m_ullDmaTimeStamp` is reset on every `KSSTATE_RUN` per `minwavertstream.cpp:1621`). The legacy producer baseline (`DmaProducedMono`, `DmaConsumedMono`) is PRESERVED across PAUSE→RUN; reset is STOP / destructor scope only via `AoCableResetRuntimeFields`. First-call seed / long-window QPC rebase / helper-side backwards-baseline guard cover the remaining re-anchor cases. Counter itself is monotonic across PAUSE/RUN cycles. Capture side reports 0 = NOT EXERCISED (no QUERY path). | Phase 3 Step 4 |
   | (legacy / pre-rewrite) | `GatedSkip`, `OverJump`, `FramesProcessed`, `PumpInvocation`, etc. | Pre-Phase 1 fields; zero-filled until Phase 6 retires them |
 
   `RingFillFrames` is the steady-state live-latency band, **not** a

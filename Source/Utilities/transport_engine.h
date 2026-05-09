@@ -207,6 +207,102 @@ typedef struct _AO_STREAM_RT {
     volatile LONG           DbgShadowTimerHits;
 
     //=========================================================================
+    // Phase 3 Step 4 -- Shadow divergence (helper vs legacy) cumulative
+    // anchor + counter. Approach C, QUERY-after-legacy cumulative compare.
+    //
+    // Compare model:
+    //   helperFramesSinceAnchor = PublishedFramesSinceAnchor (just-updated
+    //                              by this helper invocation)
+    //   legacyFramesSinceAnchor = (DmaProducedMono / BlockAlign)
+    //                              - LegacyAnchorFrames
+    //   toleranceFrames =
+    //       ((SampleRate + 999U) / 1000U) + AO_CABLE_MIN_FRAMES_GATE
+    //   if abs(helper - legacy) > toleranceFrames:
+    //       DbgShadowDivergenceHits++
+    //
+    // Tolerance rationale (Phase 3 Step 4 measurement, 2026-05-09):
+    // legacy `CMiniportWaveRTStream::UpdatePosition` accumulates
+    // `m_ullLinearPosition` via ms-quantized arithmetic with a sub-ms
+    // residual carry forward (`m_hnsElapsedTimeCarryForward` in
+    // [0, 9999] units of 100 ns). At any instant the published
+    // `DmaProducedMono` therefore lags an ideal QPC-based cumulative
+    // by up to 1 ms = `ceil(SampleRate / 1000)` frames. The 8-frame
+    // helper gate (ADR-007) is the per-call helper noise floor. The
+    // tolerance is the sum: legacy's 1 ms quantization envelope plus
+    // helper's 8-frame floor. Within this band the two cumulatives
+    // are considered to agree. Helper is NOT pulled down to legacy's
+    // ms math; this is the measurement allowance for comparing two
+    // different time-quantization models.
+    //
+    // Compare runs only on AO_ADVANCE_QUERY because GetPosition /
+    // GetPositions reorder UpdatePosition BEFORE the QUERY helper call
+    // (Step 4 reorder), so legacy DmaProducedMono is freshly published
+    // for the same QPC. TIMER / PACKET reasons do NOT compare -- legacy
+    // cadence is independent of the 1 ms timer and per-call comparison
+    // would explode under cadence skew. Timer cadence agreement is
+    // proven separately by Step 3 evidence.
+    //
+    // Capture-side caveat: WASAPI capture clients do not call
+    // GetPosition / GetPositions on the capture stream, so the helper
+    // QUERY call source never fires for capture. ShadowDivergenceCount
+    // staying at 0 on capture means the metric was NOT EXERCISED, not
+    // that helper and legacy agree. Phase 5 capture flip needs a
+    // separate capture-side evidence gate.
+    //
+    // LegacyAnchorFrames is ULONGLONG (frame-cumulative absolute) so
+    // it does not 32-bit wrap during a multi-hour live session
+    // (4 G frames at 48 kHz = ~25 hours). Lifecycle:
+    //
+    //   - AoTransportOnRunEx zeros the anchor quartet (AnchorQpc100ns,
+    //     PublishedFramesSinceAnchor, LastAdvanceDelta,
+    //     LegacyAnchorFrames) on every RUN entry under PositionLock,
+    //     BEFORE acquiring EngineLock and BEFORE Active flips TRUE.
+    //     This is required because legacy CMiniportWaveRTStream::
+    //     SetState resets m_ullDmaTimeStamp to current QPC on every
+    //     KSSTATE_RUN entry (minwavertstream.cpp ~line 1621), which
+    //     means legacy m_ullLinearPosition counts only "active time
+    //     since the most recent RUN" -- pause time is dropped, not
+    //     accumulated. Helper QPC math, by contrast, would carry
+    //     pause time if the original anchor were preserved. Resetting
+    //     the helper anchor at every RUN entry aligns the two sides
+    //     to the same "active-time since last RUN" semantics. The
+    //     legacy producer baseline (DmaProducedMono / DmaConsumedMono)
+    //     is NOT reset by OnRunEx -- it survives PAUSE -> RUN so the
+    //     next first-call seed captures LegacyAnchorFrames from the
+    //     preserved post-pause DmaProducedMono.
+    //   - first-call anchor seed (AnchorQpc100ns == 0): seeds
+    //     LegacyAnchorFrames from current DmaProducedMono / BlockAlign
+    //     and returns without compare. Reached on every RUN entry
+    //     thanks to the OnRunEx anchor reset above, plus on the
+    //     initial allocation (RtlZeroMemory).
+    //   - long-window QPC rebase (elapsed >= sampleRate <<
+    //     REBASE_SHIFT): re-seeds for ADR-007 long-call drift.
+    //   - helper-side backwards-baseline guard (defense-in-depth):
+    //     covers any unexpected DmaProducedMono regression (future
+    //     cleanup path, out-of-band reorder, etc.). Detects
+    //     currentLegacyFrames < LegacyAnchorFrames and re-seeds the
+    //     anchor pair without bump. Not exercised by the current
+    //     PAUSE -> RUN lifecycle because OnRunEx anchor reset handles
+    //     that path; kept as a safety net for future paths.
+    //   - AoCableResetRuntimeFields on STOP / destructor wipes the
+    //     anchor quartet, DmaProducedMono, and DmaConsumedMono back
+    //     to 0 so the next first-call seed (after a fresh RUN) anchors
+    //     against a clean baseline.
+    //
+    // Bump is also suppressed when rt->Active is FALSE so a non-RUN
+    // query reading a stale legacy publish does not spuriously bump.
+    // DbgShadowDivergenceHits is NOT reset across RUN cycles
+    // (monotonic, matches DbgShadow{Advance,Query,Timer}Hits policy);
+    // it is cleared only at AoTransportAllocStreamRt via RtlZeroMemory.
+    //
+    // Wire-up: written by helper (under PositionLock); read-only export
+    // via AoTransportSnapshotShadowCounters into AO_V2_DIAG P8 tail.
+    // Removed in Y4 with the rest of the DbgShadow* counters.
+    //=========================================================================
+    ULONGLONG               LegacyAnchorFrames;
+    volatile LONG           DbgShadowDivergenceHits;
+
+    //=========================================================================
     // Render audible-flip scaffold (Phase 6 Y2-1 / Y2-2 origin)
     //
     // When TRUE, AoCableAdvanceByQpc's render branch does the actual
@@ -467,9 +563,11 @@ extern "C" VOID AoCableApplyRenderFadeInScratch(PVOID rtOpaque,
 // has no use for the kernel-side debug-build trace marker.
 //=============================================================================
 typedef struct _AO_SHADOW_COUNTERS_PER_STREAM {
-    ULONG ShadowAdvanceHits;   // <- AO_STREAM_RT::DbgShadowAdvanceHits
-    ULONG ShadowQueryHits;     // <- AO_STREAM_RT::DbgShadowQueryHits
-    ULONG ShadowTimerHits;     // <- AO_STREAM_RT::DbgShadowTimerHits
+    ULONG ShadowAdvanceHits;       // <- AO_STREAM_RT::DbgShadowAdvanceHits
+    ULONG ShadowQueryHits;         // <- AO_STREAM_RT::DbgShadowQueryHits
+    ULONG ShadowTimerHits;         // <- AO_STREAM_RT::DbgShadowTimerHits
+    ULONG ShadowDivergenceHits;    // <- AO_STREAM_RT::DbgShadowDivergenceHits
+                                   //    (Phase 3 Step 4, AO_V2_DIAG P8 tail)
 } AO_SHADOW_COUNTERS_PER_STREAM;
 
 typedef struct _AO_SHADOW_COUNTERS_SNAPSHOT {

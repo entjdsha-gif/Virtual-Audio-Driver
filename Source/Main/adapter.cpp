@@ -44,7 +44,9 @@ C_ASSERT(FIELD_OFFSET(LOOPBACK_BUFFER, InternalBlockAlign) == 0x4D8);
 // Phase 3 Step 2 prep (2026-05-09): bumped from 172 to 220 after
 // appending per-stream shadow helper counters (4 streams * 3 ULONGs)
 // for live observability of canonical helper call sources. P7 layout.
-C_ASSERT(sizeof(AO_V2_DIAG) == 220);
+// Phase 3 Step 4 (2026-05-09): bumped from 220 to 236 after appending
+// per-stream shadow divergence counter (4 streams * 1 ULONG). P8 layout.
+C_ASSERT(sizeof(AO_V2_DIAG) == 236);
 
 typedef void (*fnPcDriverUnload) (PDRIVER_OBJECT);
 fnPcDriverUnload gPCDriverUnloadRoutine = NULL;
@@ -1808,10 +1810,12 @@ AoDeviceControlHandler(
         const ULONG kP1Size  = 116;
         const ULONG kP5Size  = 132;
         const ULONG kP6Size  = 172;
-        const ULONG kP7Size  = sizeof(AO_V2_DIAG);  // 220, guarded by C_ASSERT above
+        const ULONG kP7Size  = 220;                  // shadow helper counters
+        const ULONG kP8Size  = sizeof(AO_V2_DIAG);   // 236, guarded by C_ASSERT above
 
         ULONG diagWriteSize = 0;
-        if      (outBufLen >= v2Offset + kP7Size) diagWriteSize = kP7Size;
+        if      (outBufLen >= v2Offset + kP8Size) diagWriteSize = kP8Size;
+        else if (outBufLen >= v2Offset + kP7Size) diagWriteSize = kP7Size;
         else if (outBufLen >= v2Offset + kP6Size) diagWriteSize = kP6Size;
         else if (outBufLen >= v2Offset + kP5Size) diagWriteSize = kP5Size;
         else if (outBufLen >= v2Offset + kP1Size) diagWriteSize = kP1Size;
@@ -1909,16 +1913,20 @@ AoDeviceControlHandler(
 
             if (diagWriteSize >= kP7Size)
             {
-                // P7 tier: per-stream shadow helper counters.
-                // AoTransportSnapshotShadowCounters takes the engine list
-                // lock for ActiveStreams stability and reads each
-                // AO_STREAM_RT's DbgShadow*Hits via no-op
-                // InterlockedCompareExchange. Streams not currently
-                // registered contribute zero (snapshot is zero-initialized
-                // on entry). Counters aggregate per endpoint when more
-                // than one active stream maps to the same (cable,
-                // direction) slot -- see AoTransportSnapshotShadowCounters
-                // body for rationale.
+                // P7+P8 tier: per-stream shadow helper counters
+                // (P7 = Advance/Query/Timer hits) plus shadow divergence
+                // counter (P8 tail). AoTransportSnapshotShadowCounters
+                // takes the engine list lock for ActiveStreams stability
+                // and reads each AO_STREAM_RT's DbgShadow*Hits and
+                // DbgShadowDivergenceHits via no-op
+                // InterlockedCompareExchange in a single pass, so a P8-
+                // sized client gets a self-consistent shadow tier with
+                // one lock acquisition. Streams not currently registered
+                // contribute zero (snapshot is zero-initialized on
+                // entry). Counters aggregate per endpoint when more than
+                // one active stream maps to the same (cable, direction)
+                // slot -- see AoTransportSnapshotShadowCounters body for
+                // rationale.
                 AO_SHADOW_COUNTERS_SNAPSHOT shadow;
                 AoTransportSnapshotShadowCounters(&shadow);
 
@@ -1937,6 +1945,26 @@ AoDeviceControlHandler(
                 pDiag->B_C_ShadowAdvanceHits = shadow.B_Capture.ShadowAdvanceHits;
                 pDiag->B_C_ShadowQueryHits   = shadow.B_Capture.ShadowQueryHits;
                 pDiag->B_C_ShadowTimerHits   = shadow.B_Capture.ShadowTimerHits;
+
+                if (diagWriteSize >= kP8Size)
+                {
+                    // P8 tail: ShadowDivergenceCount per stream. Bumped
+                    // by the helper only on AO_ADVANCE_QUERY (and only
+                    // when the stream is Active=RUN) when the helper-
+                    // vs-legacy frame-anchor cumulative differs by
+                    // more than the rate-aware tolerance
+                    //   ((SampleRate + 999) / 1000) + AO_CABLE_MIN_FRAMES_GATE
+                    // (legacy 1 ms quantization envelope + helper
+                    // 8-frame gate; 56 frames at 48 kHz). See
+                    // AO_STREAM_RT::DbgShadowDivergenceHits comments
+                    // for the full lifecycle. Distinct from
+                    // PumpShadowDivergenceCount in the P1 block above
+                    // (force-zeroed; source retired).
+                    pDiag->A_R_ShadowDivergenceCount = shadow.A_Render.ShadowDivergenceHits;
+                    pDiag->A_C_ShadowDivergenceCount = shadow.A_Capture.ShadowDivergenceHits;
+                    pDiag->B_R_ShadowDivergenceCount = shadow.B_Render.ShadowDivergenceHits;
+                    pDiag->B_C_ShadowDivergenceCount = shadow.B_Capture.ShadowDivergenceHits;
+                }
             }
 
             bytesReturned = v2Offset + diagWriteSize;
