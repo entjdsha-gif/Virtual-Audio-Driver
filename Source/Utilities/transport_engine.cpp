@@ -6,7 +6,7 @@
 // the full design.
 //
 // Step 1 behavior:
-//   - engine singleton with a high-resolution periodic timer (20 ms default)
+//   - engine singleton with a high-resolution periodic timer (1 ms default)
 //   - AoTransportRegisterStream allocates and links per-stream runtime
 //   - AoTransportOnRun/OnPause/OnStop flip the Active flag and arm startup
 //   - the timer callback iterates the active list and does NOTHING — it is a
@@ -36,9 +36,9 @@
 // clients negotiate 48 kHz; the engine scales to non-48k streams at RUN time.
 //
 // AO_TE_EVENT_FRAMES_AT_REF is the shared-timer event quantum at the
-// reference rate. 960 frames @ 48000 Hz is the VB-Cable-equivalent cadence
-// step; expressing it as frames keeps the constant invariant under rate
-// changes.
+// reference rate. 48 frames @ 48000 Hz is the 1 ms VB-Cable-equivalent
+// cadence step per ADR-013; expressing it as frames keeps the constant
+// invariant under rate changes.
 //
 // AO_TE_STARTUP_THRESHOLD_FRAMES_AT_REF / AO_TE_STARTUP_TARGET_FRAMES_AT_REF
 // are the capture startup cushion values from PHASE6_PLAN.md §6, also in
@@ -46,7 +46,7 @@
 // sensible defaults for the no-op callback path.
 //
 #define AO_TE_REFERENCE_RATE                 48000U
-#define AO_TE_EVENT_FRAMES_AT_REF              960U   // 20 ms-equivalent @ 48k, stored as frames
+#define AO_TE_EVENT_FRAMES_AT_REF               48U   // 1 ms-equivalent @ 48k, stored as frames
 #define AO_TE_STARTUP_THRESHOLD_FRAMES_AT_REF  960U
 #define AO_TE_STARTUP_TARGET_FRAMES_AT_REF    1440U
 
@@ -54,7 +54,7 @@
 // load, hibernation resume, etc.) the callback will run multiple virtual
 // ticks per real tick to drain the backlog. This constant caps the per-
 // callback drain so one real tick can never spend an unbounded amount of
-// time at DISPATCH_LEVEL. 8 × 20 ms = 160 ms max catch-up per callback.
+// time at DISPATCH_LEVEL. 8 × 1 ms = 8 ms max catch-up per callback.
 //
 // IMPORTANT: the cap does NOT drop the excess backlog. NextEventQpc only
 // advances by the capped count, so the remaining (overdueTicks - cap)
