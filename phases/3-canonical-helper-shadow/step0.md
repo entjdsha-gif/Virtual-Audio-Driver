@@ -2,7 +2,7 @@
 
 ## Read First
 
-- `docs/AO_CABLE_V1_DESIGN.md` § 3 (per-stream runtime).
+- `docs/AO_CABLE_V1_DESIGN.md` section 3 (per-stream runtime).
 - `docs/ADR.md` ADR-006 (canonical helper).
 - Current `Source/Utilities/transport_engine.h` `AO_STREAM_RT` shape.
 
@@ -16,20 +16,20 @@ remove any retired fields from earlier Phase 6 Y attempts.
 
 Edit only:
 
-- `Source/Utilities/transport_engine.h` — `AO_STREAM_RT` field set
-  matching `docs/AO_CABLE_V1_DESIGN.md` § 3.1.
-- `Source/Utilities/transport_engine.cpp` — adjust
+- `Source/Utilities/transport_engine.h` -- `AO_STREAM_RT` field set
+  matching `docs/AO_CABLE_V1_DESIGN.md` section 3.1.
+- `Source/Utilities/transport_engine.cpp` -- adjust
   `AoTransportAllocStreamRt` / `AoTransportFreeStreamRt` /
   `AoCableResetRuntimeFields` to match the new field set.
 
 Do not touch:
 
-- `Source/Main/minwavertstream.*` — call sites are wired in Steps 2/3.
-- `Source/Utilities/loopback.*` — Phase 1/2 fields stay.
+- `Source/Main/minwavertstream.*` -- call sites are wired in Steps 2/3.
+- `Source/Utilities/loopback.*` -- Phase 1/2 fields stay.
 
 ## Required Edits
 
-Reconcile current `AO_STREAM_RT` against § 3.1:
+Reconcile current `AO_STREAM_RT` against section 3.1:
 
 - Keep: `Link`, `RefCount`, `Stream`, `IsCable`, `IsCapture`,
   `IsSpeakerSide`, `Active`, `SampleRate`, `Channels`, `BlockAlign`,
@@ -42,14 +42,14 @@ Reconcile current `AO_STREAM_RT` against § 3.1:
   `EventPeriodQpc`, `NextEventQpc`, `StatOverrunCounter`,
   `DbgShadowAdvanceHits`, `DbgShadowQueryHits`, `DbgShadowTimerHits`.
 
-- Add `PositionLock` (`KSPIN_LOCK`) — protects all advance state when
+- Add `PositionLock` (`KSPIN_LOCK`) -- protects all advance state when
   acquired by the helper.
 
 - Remove (Phase 6 Y2-2 leftovers no longer needed):
   - `RenderAudibleActive`, `DbgY2*` fields (these belonged to the
     intermediate Y2 audible-flip switch; Phase 4 in V1 design uses a
     different mechanism).
-  - Any other field present in current code but not in § 3.1.
+  - Any other field present in current code but not in section 3.1.
 
 If a field cannot be removed without breaking compilation of legacy
 code paths that haven't been retired yet, leave it temporarily and
@@ -63,13 +63,13 @@ the future phase that retires it.
   caller (if any) and which future phase retires that caller.
 - If `RefCount` discipline (engine `RefCount++` on snapshot,
   `RefCount--` after) is not yet in the engine timer DPC, that is
-  acceptable — Steps 3 / 4 wire it. Step 0 only freezes the field
+  acceptable -- Steps 3 / 4 wire it. Step 0 only freezes the field
   shape.
 
 ## Acceptance Criteria
 
 - [ ] Build clean.
-- [ ] `AO_STREAM_RT` matches `docs/AO_CABLE_V1_DESIGN.md` § 3.1
+- [ ] `AO_STREAM_RT` matches `docs/AO_CABLE_V1_DESIGN.md` section 3.1
       exactly. Any deviation is a TODO with a documented caller and
       retirement-phase target.
 - [ ] No regression in non-cable streams.

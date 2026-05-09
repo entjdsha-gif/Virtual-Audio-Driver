@@ -1,33 +1,51 @@
 {
   "phase": "3-canonical-helper-shadow",
   "project": "AO Cable V1",
-  "status": "planned",
+  "status": "completed",
+  "completed_at": "2026-05-09",
   "summary": "Canonical AoCableAdvanceByQpc helper body (drift correction, gate, overrun guard, scratch linearization), wired in shadow mode. Audible transport stays on legacy until Phases 4/5.",
   "steps": [
     {
       "step": 0,
       "name": "ao-stream-rt-fields",
-      "status": "pending"
+      "status": "completed",
+      "completed_at": "2026-05-09T14:29:05+0900",
+      "summary": "AO_STREAM_RT field freeze committed in 86dce72; administrative mark after Codex reconciliation."
     },
     {
       "step": 1,
       "name": "helper-body-shadow",
-      "status": "pending"
+      "status": "completed",
+      "completed_at": "2026-05-09T02:55:50+0900",
+      "summary": "AoCableAdvanceByQpc shadow body aligned: PositionLock, long-window rebase before advance, MonoFrames mutation removed, same audible ownership preserved."
     },
     {
       "step": 2,
       "name": "wire-query-call-source",
-      "status": "pending"
+      "status": "completed",
+      "completed_at": "2026-05-09T13:44:17+0900",
+      "summary": "GetPosition/GetPositions wired to helper (shadow mode)."
     },
     {
       "step": 3,
       "name": "wire-timer-call-source",
-      "status": "pending"
+      "status": "completed",
+      "completed_at": "2026-05-09T14:24:23+0900",
+      "summary": "1 ms shared timer cadence per ADR-013; Codex review PASS."
     },
     {
       "step": 4,
       "name": "shadow-divergence-counter",
-      "status": "pending"
+      "status": "completed",
+      "completed_at": "2026-05-09T16:39:19+0900",
+      "summary": "Shadow divergence counter (Approach C, QUERY-after-legacy cumulative compare); helper agrees with legacy in steady state. Codex review PASS."
+    },
+    {
+      "step": 5,
+      "name": "timer-63-64-phase-correction",
+      "status": "completed",
+      "completed_at": "2026-05-09T17:19:06+0900",
+      "summary": "Timer-DPC-owned 63/64 phase correction (ADR-007 D2). 120 bounded DbgPrint ticks observed with cycle 0..99 + re-baseline event. Codex review PASS."
     }
   ]
 }

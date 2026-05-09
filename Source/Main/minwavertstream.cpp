@@ -13,6 +13,16 @@
 
 #pragma warning (disable : 4127)
 
+// File-local: cable device-type predicate.
+// Used by Phase 3 Step 2 query-path helper wiring.
+static __forceinline bool IsCableDeviceType(eDeviceType type)
+{
+    return type == eCableASpeaker
+        || type == eCableBSpeaker
+        || type == eCableAMic
+        || type == eCableBMic;
+}
+
 //=============================================================================
 // CMiniportWaveRTStream
 //=============================================================================
@@ -873,32 +883,28 @@ NTSTATUS CMiniportWaveRTStream::GetPosition
     KIRQL oldIrql;
     KeAcquireSpinLock(&m_PositionSpinLock, &oldIrql);
 
+    LARGE_INTEGER ilQPC = KeQueryPerformanceCounter(NULL);
+
+    // Phase 3 Step 4: UpdatePosition runs BEFORE the canonical helper
+    // QUERY call. UpdatePosition publishes the legacy DmaProducedMono
+    // for this ilQPC; the helper then consumes a freshly-published
+    // legacy frame total against the same QPC and can run a meaningful
+    // QUERY-only shadow divergence compare. The Step 2 invariant
+    // "helper runs before any legacy position READ returned to the
+    // caller" is preserved because Position_->{Play,Write}Offset is
+    // assigned after both calls under the same m_PositionSpinLock.
     if (m_KsState == KSSTATE_RUN)
     {
-        //
-        // Get the current time and update position.
-        //
-        LARGE_INTEGER ilQPC = KeQueryPerformanceCounter(NULL);
         UpdatePosition(ilQPC);
+    }
 
-        // Phase 6 Y1C shadow hook-up: invoke the canonical cable advance
-        // helper in shadow mode so GetPosition becomes a visible Y1C
-        // call source. Cable streams only; non-cable MSVAD streams have
-        // no Y runtime fields populated. The helper's return values are
-        // intentionally NOT consumed — Position_->PlayOffset / WriteOffset
-        // below still reflect the legacy UpdatePosition output (legacy
-        // authoritative until Y2/Y3 retire the legacy path).
-        if (m_pTransportRt && m_pMiniport &&
-            (m_pMiniport->m_DeviceType == eCableASpeaker ||
-             m_pMiniport->m_DeviceType == eCableBSpeaker ||
-             m_pMiniport->m_DeviceType == eCableAMic      ||
-             m_pMiniport->m_DeviceType == eCableBMic))
-        {
-            AoCableAdvanceByQpc(m_pTransportRt,
-                                (ULONGLONG)ilQPC.QuadPart,
-                                AO_ADVANCE_QUERY,
-                                0);
-        }
+    if (m_pTransportRt && m_pMiniport &&
+        IsCableDeviceType(m_pMiniport->m_DeviceType))
+    {
+        AoCableAdvanceByQpc(m_pTransportRt,
+                            (ULONGLONG)ilQPC.QuadPart,
+                            AO_ADVANCE_QUERY,
+                            0);
     }
 
     Position_->PlayOffset = m_ullPlayPosition;
@@ -1169,6 +1175,16 @@ NTSTATUS CMiniportWaveRTStream::GetPositions(
     //
     KeAcquireSpinLock(&m_PositionSpinLock, &oldIrql);
     ilQPC = KeQueryPerformanceCounter(NULL);
+
+    // Phase 3 Step 4: UpdatePosition runs BEFORE the canonical helper
+    // QUERY call so DmaProducedMono is freshly published for this
+    // ilQPC; helper's QUERY-only shadow divergence compare then sees a
+    // matched anchor. PumpToCurrentPositionFromQuery still follows
+    // UpdatePosition immediately so its m_ulLastUpdatePositionByteDisplacement
+    // stash is fresh. The Step 2 invariant "helper runs before any
+    // legacy position READ returned to the caller" is preserved
+    // because *_pullLinearBufferPosition / Position_ writes occur
+    // after both calls under the same m_PositionSpinLock.
     if (m_KsState == KSSTATE_RUN)
     {
         UpdatePosition(ilQPC);
@@ -1176,24 +1192,15 @@ NTSTATUS CMiniportWaveRTStream::GetPositions(
         // Same-call placement keeps m_ulLastUpdatePositionByteDisplacement
         // fresh and stays under m_PositionSpinLock. No transport mutation.
         PumpToCurrentPositionFromQuery(ilQPC);
+    }
 
-        // Phase 6 Y1C shadow hook-up: GetPositions is the confirmed hot
-        // query path. Invoke the canonical helper in shadow mode so Y1C
-        // diagnostic counters register this call source. Return values
-        // (*_pullLinearBufferPosition etc.) below still come from the
-        // legacy m_ullLinearPosition that UpdatePosition just updated —
-        // legacy authoritative until Y2/Y3 retire it.
-        if (m_pTransportRt && m_pMiniport &&
-            (m_pMiniport->m_DeviceType == eCableASpeaker ||
-             m_pMiniport->m_DeviceType == eCableBSpeaker ||
-             m_pMiniport->m_DeviceType == eCableAMic      ||
-             m_pMiniport->m_DeviceType == eCableBMic))
-        {
-            AoCableAdvanceByQpc(m_pTransportRt,
-                                (ULONGLONG)ilQPC.QuadPart,
-                                AO_ADVANCE_QUERY,
-                                0);
-        }
+    if (m_pTransportRt && m_pMiniport &&
+        IsCableDeviceType(m_pMiniport->m_DeviceType))
+    {
+        AoCableAdvanceByQpc(m_pTransportRt,
+                            (ULONGLONG)ilQPC.QuadPart,
+                            AO_ADVANCE_QUERY,
+                            0);
     }
     if (_pullLinearBufferPosition)
     {
@@ -1910,39 +1917,6 @@ VOID CMiniportWaveRTStream::UpdatePosition
     _In_ LARGE_INTEGER ilQPC
 )
 {
-    // Phase 6 Y1C shadow shim — cable streams only.
-    //
-    // UpdatePosition is the common funnel for every legacy query path
-    // (GetPosition, GetPositions, GetPacketCount, and the per-stream
-    // MSVAD notification timer TimerNotifyRT). Hook it here so any
-    // path that bypasses the explicit GetPosition/GetPositions hooks
-    // still routes through the canonical helper in shadow mode. In
-    // particular this catches the TimerNotifyRT code path which is
-    // retired in Y4 but still active in Y1C.
-    //
-    // Intentional double-count with GetPosition/GetPositions hooks:
-    // when called from those entry points the helper will be invoked
-    // twice per call (once from this shim, once from the caller-site
-    // hook). This is acceptable for shadow diagnostics — the counters
-    // are observability-only, not authoritative. Y4 retires the
-    // caller-site hooks along with the legacy body, leaving only this
-    // shim as the single funnel.
-    //
-    // The legacy body below still runs unchanged. No externally
-    // visible truth moves into the helper yet — that is Y2 (render)
-    // and Y3 (capture).
-    if (m_pTransportRt && m_pMiniport &&
-        (m_pMiniport->m_DeviceType == eCableASpeaker ||
-         m_pMiniport->m_DeviceType == eCableBSpeaker ||
-         m_pMiniport->m_DeviceType == eCableAMic      ||
-         m_pMiniport->m_DeviceType == eCableBMic))
-    {
-        AoCableAdvanceByQpc(m_pTransportRt,
-                            (ULONGLONG)ilQPC.QuadPart,
-                            AO_ADVANCE_QUERY,
-                            0);
-    }
-
     // Convert ticks to 100ns units.
     LONGLONG  hnsCurrentTime = KSCONVERT_PERFORMANCE_TIME(m_ullPerformanceCounterFrequency.QuadPart, ilQPC);
     
@@ -2035,21 +2009,20 @@ VOID CMiniportWaveRTStream::UpdatePosition
         }
 
         {
-            // Phase 6 Y2-2: cable render audible ownership now lives in
-            // AoCableAdvanceByQpc -> AoCableWriteRenderFromDma inside the
-            // transport engine. The helper reads DMA bytes via its own
-            // DmaProducedMono cursor, applies the fade envelope on the
-            // scratch buffer, and publishes to FRAME_PIPE. Skip the
-            // legacy ReadBytes path for cable render streams.
+            // Phase 3 shadow-only baseline: legacy ReadBytes is the
+            // sole audible owner for cable render. AoCableAdvanceByQpc
+            // is invoked from the query and timer call sources (Phase
+            // 3 step 2 / step 3 wiring) but operates in shadow mode
+            // only -- it never touches the audible cable render data
+            // flow during Phase 3. The Phase 6 Y2-2 audible-flip
+            // (helper-owned ReadBytes replacement) is rolled back for
+            // Phase 3 baseline; it lands in Phase 4 in a single
+            // ownership-flip commit per ADR-006.
             //
-            // Non-cable streams (file-save diagnostic) keep ReadBytes
-            // when g_DoNotCreateDataFiles is FALSE, same as Phase 4
-            // baseline — their transport and the file-save path are
-            // unrelated to the cable audible switch.
-            CMiniportWaveRT* pMp = m_pMiniport;
-            BOOL isCable = (pMp && (pMp->m_DeviceType == eCableASpeaker ||
-                                     pMp->m_DeviceType == eCableBSpeaker));
-            if (!isCable && !g_DoNotCreateDataFiles)
+            // file-save diagnostic gate g_DoNotCreateDataFiles is
+            // independent of the cable audible owner and is preserved
+            // unchanged.
+            if (!g_DoNotCreateDataFiles)
             {
                 ReadBytes(ByteDisplacement);
             }
@@ -2067,22 +2040,29 @@ VOID CMiniportWaveRTStream::UpdatePosition
     //
     m_ullLinearPosition += ByteDisplacement;
 
-    // Phase 6 Y2-2: publish the new monotonic position for cable
-    // CAPTURE streams only. Cable render DmaProducedMono is now
-    // helper-owned (AoCableWriteRenderFromDma publishes after each
-    // successful pipe write), so the legacy publish must NOT touch
-    // it or we create a dual-writer race on the render cursor.
+    // Phase 3 shadow-only baseline: publish the monotonic position
+    // for every cable stream (render AND capture). Legacy
+    // UpdatePosition is the sole publisher of DmaProducedMono in
+    // Phase 3; AoCableAdvanceByQpc is a shadow reader only. The
+    // helper's render branch reads DmaProducedMono for diagnostic
+    // advance computation but never writes it during Phase 3 (the
+    // Y2-2 helper-owned writer was rolled back to restore the
+    // single-publisher invariant).
     //
-    // Cable capture is still legacy-owned until Y3 — WriteBytes runs
-    // in the m_bCapture branch above and the capture runner (still
-    // a no-op under Option Z) needs the published linear position
-    // to drive its DMA fill logic.
+    // Cable capture retains its legacy owner unchanged through
+    // Phase 5; cable render returns to legacy owner here for
+    // Phase 3 and through Phase 4 entry. Phase 4 audible flip will
+    // retire this publish for cable render in the same commit that
+    // promotes the helper to producer ownership (ADR-006: no
+    // dual-publisher window).
     //
-    // Non-cable streams skip this entirely — they still run on the
+    // Non-cable streams skip this entirely -- they still run on the
     // legacy ReadBytes/WriteBytes diagnostic path and have no engine
     // runtime attached.
     if (m_pTransportRt && m_pMiniport &&
-        (m_pMiniport->m_DeviceType == eCableAMic ||
+        (m_pMiniport->m_DeviceType == eCableASpeaker ||
+         m_pMiniport->m_DeviceType == eCableBSpeaker ||
+         m_pMiniport->m_DeviceType == eCableAMic ||
          m_pMiniport->m_DeviceType == eCableBMic))
     {
         AoTransportPublishProducedBytes(m_pTransportRt, m_ullLinearPosition);

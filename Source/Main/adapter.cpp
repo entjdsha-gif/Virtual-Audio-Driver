@@ -41,7 +41,12 @@ C_ASSERT(FIELD_OFFSET(LOOPBACK_BUFFER, InternalBlockAlign) == 0x4D8);
 // Phase 1 Step 6 (2026-05-08): bumped from 132 to 172 after appending
 // per-cable FRAME_PIPE ring diagnostics (Overflow / Underrun /
 // UnderrunFlag / RingFill / WrapBound).
-C_ASSERT(sizeof(AO_V2_DIAG) == 172);
+// Phase 3 Step 2 prep (2026-05-09): bumped from 172 to 220 after
+// appending per-stream shadow helper counters (4 streams * 3 ULONGs)
+// for live observability of canonical helper call sources. P7 layout.
+// Phase 3 Step 4 (2026-05-09): bumped from 220 to 236 after appending
+// per-stream shadow divergence counter (4 streams * 1 ULONG). P8 layout.
+C_ASSERT(sizeof(AO_V2_DIAG) == 236);
 
 typedef void (*fnPcDriverUnload) (PDRIVER_OBJECT);
 fnPcDriverUnload gPCDriverUnloadRoutine = NULL;
@@ -1783,34 +1788,52 @@ AoDeviceControlHandler(
         pStatus->CableB_Mic.Channels         = g_CableBLoopback.MicFormat.nChannels;
 #endif
 
-        // Phase 1: V2 diagnostic extension. V1 clients pass
-        // sizeof(AO_STREAM_STATUS); they get only the V1 block and
-        // bytesReturned stays at sizeof(AO_STREAM_STATUS). V2 clients pass
-        // sizeof(AO_STREAM_STATUS) + sizeof(AO_V2_DIAG) and get both.
-        // All new counters are sourced from FRAME_PIPE (g_CableAPipe /
-        // g_CableBPipe), not the legacy LOOPBACK_BUFFER globals.
-        ULONG v2Offset = sizeof(AO_STREAM_STATUS);
-        if (irpSp->Parameters.DeviceIoControl.OutputBufferLength >=
-            v2Offset + sizeof(AO_V2_DIAG))
+        // V2 diagnostic extension. AO_V2_DIAG has grown across phases
+        // (P1=116 -> P5=132 -> P6=172 -> P7=220 bytes). To stay
+        // backwards compatible with consumers that pass an older-tier
+        // sized buffer, the handler does a partial write: it picks
+        // the largest tier that fits in the caller's buffer, zeros
+        // exactly that many bytes, fills only the fields inside that
+        // tier, sets StructSize = chosen size, and returns
+        // v2Offset + chosen size. A V1-only buffer (sizeof(AO_STREAM_STATUS))
+        // gets bytesReturned = sizeof(AO_STREAM_STATUS).
+        //
+        // Tier sizes are derived from the documented layout in ioctl.h:
+        //   P1 = StructSize (1) + 4 blocks * 7 ULONGs (28)         = 116
+        //   P5 = P1 + 4 render-drive ULONGs                         = 132
+        //   P6 = P5 + 2 cables * 5 ring-diag ULONG-equivs           = 172
+        //   P7 = P6 + 4 streams * 3 shadow-counter ULONGs           = 220
+        // sizeof(AO_V2_DIAG) is the current (P7) size and is the C_ASSERT
+        // anchor up at the top of this TU.
+        ULONG v2Offset       = sizeof(AO_STREAM_STATUS);
+        ULONG outBufLen      = irpSp->Parameters.DeviceIoControl.OutputBufferLength;
+        const ULONG kP1Size  = 116;
+        const ULONG kP5Size  = 132;
+        const ULONG kP6Size  = 172;
+        const ULONG kP7Size  = 220;                  // shadow helper counters
+        const ULONG kP8Size  = sizeof(AO_V2_DIAG);   // 236, guarded by C_ASSERT above
+
+        ULONG diagWriteSize = 0;
+        if      (outBufLen >= v2Offset + kP8Size) diagWriteSize = kP8Size;
+        else if (outBufLen >= v2Offset + kP7Size) diagWriteSize = kP7Size;
+        else if (outBufLen >= v2Offset + kP6Size) diagWriteSize = kP6Size;
+        else if (outBufLen >= v2Offset + kP5Size) diagWriteSize = kP5Size;
+        else if (outBufLen >= v2Offset + kP1Size) diagWriteSize = kP1Size;
+
+        if (diagWriteSize > 0)
         {
             AO_V2_DIAG* pDiag = (AO_V2_DIAG*)((BYTE*)pStatus + v2Offset);
-            RtlZeroMemory(pDiag, sizeof(AO_V2_DIAG));
-            pDiag->StructSize = sizeof(AO_V2_DIAG);
+            RtlZeroMemory(pDiag, diagWriteSize);
+            pDiag->StructSize = diagWriteSize;
 
-            // Phase 1 Step 1 (ADR-014 phase/1-int32-ring):
-            // The legacy FRAME_PIPE shape carried per-direction pump
-            // / drive / shadow counters that no longer exist on the
-            // canonical V1 shape (DESIGN § 2.1). The AO_V2_DIAG
-            // schema fields stay as ABI for existing user-mode
-            // callers, but their source members are gone; per
-            // step1.md plan they are zero-filled here. Phase 1 Step
-            // 6 plumbs the new diagnostics surface (Overflow /
-            // Underrun / UnderrunFlag / RingFill / WrapBound).
-            // Phase 6 cleanup retires these AO_V2_DIAG fields
-            // entirely.
-            // RtlZeroMemory above already zeroed the entire
-            // AO_V2_DIAG; these explicit assignments document each
-            // removed-source field for the reviewer.
+            // P1 tier: legacy per-direction pump counter blocks. The
+            // canonical V1 shape (DESIGN § 2.1) no longer carries these
+            // source members, so they are zero-filled. RtlZeroMemory
+            // above already cleared the whole region; the explicit
+            // assignments document each removed-source field for
+            // reviewers and are guaranteed to fit because P1 fields
+            // sit entirely inside [0, kP1Size). Phase 6 cleanup retires
+            // these schema fields entirely.
             pDiag->A_R_GatedSkipCount            = 0;
             pDiag->A_R_OverJumpCount             = 0;
             pDiag->A_R_FramesProcessedLow        = 0;
@@ -1843,47 +1866,108 @@ AoDeviceControlHandler(
             pDiag->B_C_PumpShadowDivergenceCount = 0;
             pDiag->B_C_PumpFeatureFlags          = 0;
 
-            // Phase 5 render-side drive counters — same status:
-            // source members removed from FRAME_PIPE in Step 1,
-            // zero-filled here.
-            pDiag->A_R_PumpDriveCount            = 0;
-            pDiag->A_R_LegacyDriveCount          = 0;
-            pDiag->B_R_PumpDriveCount            = 0;
-            pDiag->B_R_LegacyDriveCount          = 0;
-
-            // Phase 1 Step 6: per-cable canonical FRAME_PIPE ring
-            // diagnostics. AoSnapshotFramePipeDiag takes pipe->Lock
-            // for a single-shot consistent five-tuple per cable.
-            // <Cable>_Reserved* pad bytes already zeroed by the
-            // RtlZeroMemory above. UCHAR locals live inside their own
-            // #if so a single-cable build does not warn on the unused
-            // variable for the absent cable.
-#if defined(CABLE_A) || !defined(CABLE_B)
+            if (diagWriteSize >= kP5Size)
             {
-                UCHAR ufA = 0;
-                AoSnapshotFramePipeDiag(&g_CableAPipe,
-                                        &pDiag->A_OverflowCount,
-                                        &pDiag->A_UnderrunCount,
-                                        &ufA,
-                                        &pDiag->A_RingFillFrames,
-                                        &pDiag->A_WrapBoundFrames);
-                pDiag->A_UnderrunFlag = ufA;
+                // P5 tier: render-side drive counters. Source members
+                // removed from FRAME_PIPE in Phase 1 Step 1; zero-filled
+                // here for ABI continuity.
+                pDiag->A_R_PumpDriveCount            = 0;
+                pDiag->A_R_LegacyDriveCount          = 0;
+                pDiag->B_R_PumpDriveCount            = 0;
+                pDiag->B_R_LegacyDriveCount          = 0;
             }
+
+            if (diagWriteSize >= kP6Size)
+            {
+                // P6 tier: per-cable canonical FRAME_PIPE ring diag.
+                // AoSnapshotFramePipeDiag takes pipe->Lock for a single-
+                // shot consistent five-tuple per cable. Reserved pad
+                // bytes already zeroed above. UCHAR locals stay inside
+                // the build guard so single-cable builds do not warn
+                // on the unused variable for the absent cable.
+#if defined(CABLE_A) || !defined(CABLE_B)
+                {
+                    UCHAR ufA = 0;
+                    AoSnapshotFramePipeDiag(&g_CableAPipe,
+                                            &pDiag->A_OverflowCount,
+                                            &pDiag->A_UnderrunCount,
+                                            &ufA,
+                                            &pDiag->A_RingFillFrames,
+                                            &pDiag->A_WrapBoundFrames);
+                    pDiag->A_UnderrunFlag = ufA;
+                }
 #endif
 #if defined(CABLE_B) || !defined(CABLE_A)
-            {
-                UCHAR ufB = 0;
-                AoSnapshotFramePipeDiag(&g_CableBPipe,
-                                        &pDiag->B_OverflowCount,
-                                        &pDiag->B_UnderrunCount,
-                                        &ufB,
-                                        &pDiag->B_RingFillFrames,
-                                        &pDiag->B_WrapBoundFrames);
-                pDiag->B_UnderrunFlag = ufB;
-            }
+                {
+                    UCHAR ufB = 0;
+                    AoSnapshotFramePipeDiag(&g_CableBPipe,
+                                            &pDiag->B_OverflowCount,
+                                            &pDiag->B_UnderrunCount,
+                                            &ufB,
+                                            &pDiag->B_RingFillFrames,
+                                            &pDiag->B_WrapBoundFrames);
+                    pDiag->B_UnderrunFlag = ufB;
+                }
 #endif
+            }
 
-            bytesReturned = v2Offset + sizeof(AO_V2_DIAG);
+            if (diagWriteSize >= kP7Size)
+            {
+                // P7+P8 tier: per-stream shadow helper counters
+                // (P7 = Advance/Query/Timer hits) plus shadow divergence
+                // counter (P8 tail). AoTransportSnapshotShadowCounters
+                // takes the engine list lock for ActiveStreams stability
+                // and reads each AO_STREAM_RT's DbgShadow*Hits and
+                // DbgShadowDivergenceHits via no-op
+                // InterlockedCompareExchange in a single pass, so a P8-
+                // sized client gets a self-consistent shadow tier with
+                // one lock acquisition. Streams not currently registered
+                // contribute zero (snapshot is zero-initialized on
+                // entry). Counters aggregate per endpoint when more than
+                // one active stream maps to the same (cable, direction)
+                // slot -- see AoTransportSnapshotShadowCounters body for
+                // rationale.
+                AO_SHADOW_COUNTERS_SNAPSHOT shadow;
+                AoTransportSnapshotShadowCounters(&shadow);
+
+                pDiag->A_R_ShadowAdvanceHits = shadow.A_Render.ShadowAdvanceHits;
+                pDiag->A_R_ShadowQueryHits   = shadow.A_Render.ShadowQueryHits;
+                pDiag->A_R_ShadowTimerHits   = shadow.A_Render.ShadowTimerHits;
+
+                pDiag->A_C_ShadowAdvanceHits = shadow.A_Capture.ShadowAdvanceHits;
+                pDiag->A_C_ShadowQueryHits   = shadow.A_Capture.ShadowQueryHits;
+                pDiag->A_C_ShadowTimerHits   = shadow.A_Capture.ShadowTimerHits;
+
+                pDiag->B_R_ShadowAdvanceHits = shadow.B_Render.ShadowAdvanceHits;
+                pDiag->B_R_ShadowQueryHits   = shadow.B_Render.ShadowQueryHits;
+                pDiag->B_R_ShadowTimerHits   = shadow.B_Render.ShadowTimerHits;
+
+                pDiag->B_C_ShadowAdvanceHits = shadow.B_Capture.ShadowAdvanceHits;
+                pDiag->B_C_ShadowQueryHits   = shadow.B_Capture.ShadowQueryHits;
+                pDiag->B_C_ShadowTimerHits   = shadow.B_Capture.ShadowTimerHits;
+
+                if (diagWriteSize >= kP8Size)
+                {
+                    // P8 tail: ShadowDivergenceCount per stream. Bumped
+                    // by the helper only on AO_ADVANCE_QUERY (and only
+                    // when the stream is Active=RUN) when the helper-
+                    // vs-legacy frame-anchor cumulative differs by
+                    // more than the rate-aware tolerance
+                    //   ((SampleRate + 999) / 1000) + AO_CABLE_MIN_FRAMES_GATE
+                    // (legacy 1 ms quantization envelope + helper
+                    // 8-frame gate; 56 frames at 48 kHz). See
+                    // AO_STREAM_RT::DbgShadowDivergenceHits comments
+                    // for the full lifecycle. Distinct from
+                    // PumpShadowDivergenceCount in the P1 block above
+                    // (force-zeroed; source retired).
+                    pDiag->A_R_ShadowDivergenceCount = shadow.A_Render.ShadowDivergenceHits;
+                    pDiag->A_C_ShadowDivergenceCount = shadow.A_Capture.ShadowDivergenceHits;
+                    pDiag->B_R_ShadowDivergenceCount = shadow.B_Render.ShadowDivergenceHits;
+                    pDiag->B_C_ShadowDivergenceCount = shadow.B_Capture.ShadowDivergenceHits;
+                }
+            }
+
+            bytesReturned = v2Offset + diagWriteSize;
         }
         else
         {

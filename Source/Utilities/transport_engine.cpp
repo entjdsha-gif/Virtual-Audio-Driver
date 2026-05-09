@@ -6,7 +6,7 @@
 // the full design.
 //
 // Step 1 behavior:
-//   - engine singleton with a high-resolution periodic timer (20 ms default)
+//   - engine singleton with a high-resolution periodic timer (1 ms default)
 //   - AoTransportRegisterStream allocates and links per-stream runtime
 //   - AoTransportOnRun/OnPause/OnStop flip the Active flag and arm startup
 //   - the timer callback iterates the active list and does NOTHING — it is a
@@ -36,9 +36,9 @@
 // clients negotiate 48 kHz; the engine scales to non-48k streams at RUN time.
 //
 // AO_TE_EVENT_FRAMES_AT_REF is the shared-timer event quantum at the
-// reference rate. 960 frames @ 48000 Hz is the VB-Cable-equivalent cadence
-// step; expressing it as frames keeps the constant invariant under rate
-// changes.
+// reference rate. 48 frames @ 48000 Hz is the 1 ms VB-Cable-equivalent
+// cadence step per ADR-013; expressing it as frames keeps the constant
+// invariant under rate changes.
 //
 // AO_TE_STARTUP_THRESHOLD_FRAMES_AT_REF / AO_TE_STARTUP_TARGET_FRAMES_AT_REF
 // are the capture startup cushion values from PHASE6_PLAN.md §6, also in
@@ -46,7 +46,7 @@
 // sensible defaults for the no-op callback path.
 //
 #define AO_TE_REFERENCE_RATE                 48000U
-#define AO_TE_EVENT_FRAMES_AT_REF              960U   // 20 ms-equivalent @ 48k, stored as frames
+#define AO_TE_EVENT_FRAMES_AT_REF               48U   // 1 ms-equivalent @ 48k, stored as frames
 #define AO_TE_STARTUP_THRESHOLD_FRAMES_AT_REF  960U
 #define AO_TE_STARTUP_TARGET_FRAMES_AT_REF    1440U
 
@@ -54,7 +54,7 @@
 // load, hibernation resume, etc.) the callback will run multiple virtual
 // ticks per real tick to drain the backlog. This constant caps the per-
 // callback drain so one real tick can never spend an unbounded amount of
-// time at DISPATCH_LEVEL. 8 × 20 ms = 160 ms max catch-up per callback.
+// time at DISPATCH_LEVEL. 8 × 1 ms = 8 ms max catch-up per callback.
 //
 // IMPORTANT: the cap does NOT drop the excess backlog. NextEventQpc only
 // advances by the capped count, so the remaining (overdueTicks - cap)
@@ -85,6 +85,58 @@ static AO_TRANSPORT_ENGINE g_AoTransportEngine;
 // Forward declarations
 //=============================================================================
 static EXT_CALLBACK AoTransportTimerCallback;
+
+//=============================================================================
+// Phase 3 Step 5 -- DBG-bounded DbgPrint budget for apply_drift_correction.
+//
+// Reset to AO_TE_DBG_6364_BUDGET ticks at every timer arm site
+// (Running == FALSE -> active stream arms, in AoTransportOnRunEx).
+// Decremented in apply_drift_correction; lines are only emitted while
+// the budget is positive. 120 ticks covers one full TickCounter
+// 0..99 cycle plus the first re-baseline event of the next cycle,
+// which is sufficient evidence for Step 5 acceptance and avoids
+// flooding DebugView in long live calls.
+//
+// Declared here (above first use site in OnRunEx) so the AO_TE_DBG_*
+// macro and storage are visible at every reference. Compiled out in
+// Release (#if DBG).
+//=============================================================================
+#if DBG
+#define AO_TE_DBG_6364_BUDGET 120
+static volatile LONG g_AoTeDbg6364Budget = 0;
+#endif
+
+//=============================================================================
+// Phase 3 Step 5 -- ADR-007 Decision 2 (63/64 phase correction).
+//
+// Engine-global state lives on AO_TRANSPORT_ENGINE (BaselineQpc /
+// TickCounter / LastTickQpc / NextTickQpc). apply_drift_correction is
+// the SOLE mutator and is called only from AoTransportTimerCallback,
+// once per firing, BEFORE the active-stream traversal, while holding
+// EngineLock. NextTickQpc snapshot and per-stream due computation
+// therefore land in the same lock window.
+//
+// The query path (GetPosition / GetPositions) and the helper
+// (AoCableAdvanceByQpc) MUST NOT call this function -- the query path
+// stays timer-cadence-neutral, helper anchors are per-stream and run
+// under PositionLock. ADR-007 Decision 2 explicitly separates
+// timer-DPC-owned 63/64 phase correction from helper-owned long-window
+// QPC rebase.
+//
+// ExSetTimer arming convention (relative due + periodic period in
+// 100ns units; see AoTransportEngineInit / OnRunEx) is NOT changed by
+// Step 5. NextTickQpc is the DPC virtual-deadline reference for
+// per-stream overdue computation, NOT a re-arm input. Each ExSetTimer
+// firing wakes the DPC; the DPC then computes corrected NextTickQpc
+// and uses it as the cadence reference inside its own body.
+//
+// First-tick semantics: TickCounter == 0 uniformly arms BaselineQpc =
+// nowQpcRaw. This handles both the initial ExSetTimer firing
+// (RtlZeroMemory + arm-site reset both leave TickCounter at 0) and
+// the wrap-around at every 100th firing.
+//=============================================================================
+static VOID
+apply_drift_correction(PAO_TRANSPORT_ENGINE engine, LONGLONG nowQpcRaw);
 
 //=============================================================================
 // Helper: QPC frequency is constant for the life of the system — we query it
@@ -238,6 +290,7 @@ AoTransportAllocStreamRt(CMiniportWaveRTStream* stream)
     }
 
     RtlZeroMemory(rt, sizeof(*rt));
+    KeInitializeSpinLock(&rt->PositionLock);
     InitializeListHead(&rt->Link);
     rt->Stream = stream;
     rt->Active = FALSE;
@@ -339,6 +392,58 @@ AoTransportOnRunEx(const AO_STREAM_SNAPSHOT* snapshot)
 
     AO_STREAM_RT* rt = snapshot->Rt;
 
+    // Phase 3 Step 4 lifecycle: reset the helper / divergence anchor
+    // quartet on every RUN entry under PositionLock, BEFORE acquiring
+    // EngineLock and BEFORE Active flips TRUE. PAUSE -> RUN PRESERVES
+    // the legacy producer baseline (DmaProducedMono / DmaConsumedMono)
+    // -- those are STOP / destructor scope only, reset by
+    // AoCableResetRuntimeFields. The anchor quartet, however, MUST
+    // re-anchor on every RUN entry because legacy
+    // CMiniportWaveRTStream::SetState resets m_ullDmaTimeStamp to the
+    // current QPC on every KSSTATE_RUN entry (see minwavertstream.cpp
+    // ~ line 1621):
+    //
+    //     m_ullLastDPCTimeStamp = m_ullDmaTimeStamp =
+    //         KSCONVERT_PERFORMANCE_TIME(..., KeQueryPerformanceCounter(...));
+    //
+    // The first post-resume UpdatePosition therefore computes
+    //     elapsed = now - m_ullDmaTimeStamp (post-reset)
+    // = a small post-resume sliver, NOT the pause duration. Legacy's
+    // m_ullLinearPosition advances by ~pause_duration / ms × rate
+    // LESS than the helper's QPC-anchored "wall-time since anchor"
+    // would predict, on every PAUSE -> RUN cycle. Without an anchor
+    // reset here, the helper would carry the pre-pause anchor and
+    // accumulate `pause_duration × rate` of fictional drift relative
+    // to the legacy producer; every post-resume QUERY would bump
+    // ShadowDivergenceCount by ~one. Resetting the anchor at RUN
+    // entry aligns helper semantics with legacy "active-time since
+    // last RUN" semantics.
+    //
+    // Lock ordering: PositionLock first, then EngineLock. The reverse
+    // ordering does not exist in this TU, so this is safe. Releasing
+    // PositionLock before taking EngineLock keeps the rule "do not
+    // hold EngineLock across PositionLock" intact.
+    //
+    // The helper seed branch (AnchorQpc100ns == 0) on the next helper
+    // call captures `LegacyAnchorFrames = DmaProducedMono /
+    // BlockAlign` from the PRESERVED post-pause DmaProducedMono, so
+    // helperSinceAnchor and legacySinceAnchor both measure the same
+    // post-resume sliver and the cumulative compare matches.
+    //
+    // DbgShadowDivergenceHits is NOT reset here -- monotonic across
+    // PAUSE/RUN cycles, matches DbgShadow{Advance,Query,Timer}Hits
+    // policy, zeroed only at AoTransportAllocStreamRt via
+    // RtlZeroMemory.
+    {
+        KIRQL posOld;
+        KeAcquireSpinLock(&rt->PositionLock, &posOld);
+        rt->AnchorQpc100ns             = 0;
+        rt->PublishedFramesSinceAnchor = 0;
+        rt->LastAdvanceDelta           = 0;
+        rt->LegacyAnchorFrames         = 0;
+        KeReleaseSpinLock(&rt->PositionLock, posOld);
+    }
+
     KIRQL old;
     KeAcquireSpinLock(&g_AoTransportEngine.Lock, &old);
 
@@ -352,34 +457,34 @@ AoTransportOnRunEx(const AO_STREAM_SNAPSHOT* snapshot)
     rt->DmaBuffer     = snapshot->DmaBuffer;
     rt->DmaBufferSize = snapshot->DmaBufferSize;
 
-    // Fresh session → reset monotonic cursors. Both render and capture
-    // anchor their event runners against rt->DmaProducedMono, which is
-    // published by the stream side via AoTransportPublishProducedBytes
-    // from within CMiniportWaveRTStream::UpdatePosition whenever the
-    // stream's LinearPosition advances.
+    // Phase 3 Step 4: PAUSE -> RUN preserves DmaProducedMono and
+    // DmaConsumedMono. Zeroing them here would create a phantom
+    // window before the first post-resume UpdatePosition publishes
+    // m_ullLinearPosition (which is preserved across PAUSE per
+    // PortCls/WaveRT contract). See the function header comment for
+    // the full ShadowDivergence rationale. Reset is STOP /
+    // destructor scope, performed by AoCableResetRuntimeFields.
     //
-    // Phase 6 Y2-2: for cable render the writer of DmaProducedMono is
-    // now AoCableWriteRenderFromDma (helper-owned). Legacy publish is
-    // retired for cable render; cable capture still publishes here
-    // until Y3. Zero-reset on RUN is still correct — both writers
-    // expect a fresh 0 baseline per stream session.
-    rt->DmaProducedMono  = 0;
-    rt->DmaConsumedMono  = 0;
+    // Phase 3 shadow-only baseline: legacy CMiniportWaveRTStream::
+    // UpdatePosition is the sole publisher of DmaProducedMono for
+    // both cable render AND cable capture. The canonical helper
+    // AoCableAdvanceByQpc is wired into the query and timer call
+    // sources but only computes diagnostic shadow state; it does
+    // NOT touch DmaProducedMono. Helper-owned producer ownership
+    // lands in Phase 4 (render) / Phase 5 (capture).
 
-    // Phase 6 Y2-2: flip the render audible switch on cable render
-    // streams. This promotes AoCableWriteRenderFromDma to the sole
-    // owner of DMA -> FRAME_PIPE transfer for cable render, replacing
-    // the legacy ReadBytes path in CMiniportWaveRTStream::UpdatePosition.
-    // Cleared on STOP via AoCableResetRuntimeFields so pause/resume
-    // cycles re-enable the switch on the next RUN.
-    if (rt->IsCable && !rt->IsCapture)
-    {
-        rt->RenderAudibleActive = TRUE;
-    }
-    else
-    {
-        rt->RenderAudibleActive = FALSE;
-    }
+    // Phase 3 shadow-only baseline: RenderAudibleActive is forced
+    // FALSE for every stream. The Phase 6 Y2-2 audible-flip switch
+    // (which would have promoted AoCableWriteRenderFromDma to the
+    // sole DMA -> FRAME_PIPE owner for cable render) is intentionally
+    // kept off for the entirety of Phase 3. Helper body's render gate
+    // (see AoCableAdvanceByQpc cpp:~1397) reads this flag; with the
+    // flag forced FALSE the gate is unreachable and AoCableWriteRender
+    // FromDma is dead in the running driver. The function body is
+    // retained as scaffold for Phase 4. Legacy ReadBytes in
+    // CMiniportWaveRTStream::UpdatePosition remains the cable render
+    // audible owner.
+    rt->RenderAudibleActive = FALSE;
 
     // Samples-only seeding: scale the reference frame constants to this
     // stream's actual rate. The engine period in QPC is the same for every
@@ -431,6 +536,27 @@ AoTransportOnRunEx(const AO_STREAM_SNAPSHOT* snapshot)
     // this line is in frames or QPC ticks.
     if (!g_AoTransportEngine.Running && g_AoTransportEngine.Timer != NULL)
     {
+        // Phase 3 Step 5 -- ADR-007 Decision 2: reset engine 63/64 state
+        // BEFORE arming the timer. ExCancelTimer in OnStopEx leaves
+        // BaselineQpc / TickCounter / LastTickQpc / NextTickQpc holding
+        // stale values from the previous timer session; the first DPC of
+        // the new session would otherwise compute NextTickQpc against an
+        // anchor that no longer matches reality, breaking per-stream
+        // overdue computation. Zero them under EngineLock so the first
+        // post-arm firing hits the TickCounter == 0 baseline-arm path
+        // and re-anchors against fresh nowQpcRaw.
+        g_AoTransportEngine.BaselineQpc = 0;
+        g_AoTransportEngine.TickCounter = 0;
+        g_AoTransportEngine.LastTickQpc = 0;
+        g_AoTransportEngine.NextTickQpc = 0;
+#if DBG
+        // Reset DBG-bounded DbgPrint budget so each timer session can
+        // produce its own first ~120 ticks of evidence. Compiled out in
+        // Release. AO_TE_DBG_6364_BUDGET = 120 covers one full
+        // TickCounter cycle (100) plus the first re-baseline event.
+        InterlockedExchange(&g_AoTeDbg6364Budget, AO_TE_DBG_6364_BUDGET);
+#endif
+
         LARGE_INTEGER dueTime;
         dueTime.QuadPart = -g_AoTeEventPeriod100ns;
         (VOID)ExSetTimer(
@@ -652,10 +778,9 @@ AoRunRenderEvent(AO_STREAM_RT* rt, LONGLONG qpc)
 // cursor is NOT advanced. Once the cushion is ready, StartupArmed is
 // dropped.
 //
-// Partial read / tail zero fill: ring underruns are detected before the
-// read and counted in rt->UnderrunEvents. FramePipeReadToDma already
-// silence-fills any shortfall internally so the DMA tail is guaranteed
-// clean regardless.
+// Partial read / tail zero fill: ring underruns are detected before
+// the read. FramePipeReadToDma already silence-fills any shortfall
+// internally so the DMA tail is guaranteed clean regardless.
 //
 // Runs at DISPATCH_LEVEL. Acquires PipeLock via FramePipeReadToDma.
 static VOID
@@ -694,6 +819,67 @@ AoRunCaptureEvent(AO_STREAM_RT* rt, LONGLONG qpc)
 // collected into the snapshot but their events are still no-ops — Step 4
 // fills in the capture runner.
 //=============================================================================
+
+//=============================================================================
+// apply_drift_correction -- ADR-007 Decision 2 timer-DPC body.
+//
+// Called once per AoTransportTimerCallback firing, after
+// KeQueryPerformanceCounter and BEFORE active-list traversal, while
+// holding g_AoTransportEngine.Lock (EngineLock). NextTickQpc snapshot
+// and per-stream due computation therefore use the same locked-state
+// view of the corrected deadline.
+//
+// Formula (resolved by step5.md D1):
+//   if (engine->TickCounter == 0)
+//       engine->BaselineQpc = nowQpcRaw;
+//   engine->NextTickQpc = engine->BaselineQpc
+//                       + ((TickCounter + 1) * PeriodQpc * 63) / 64;
+//   engine->LastTickQpc = nowQpcRaw;
+//   engine->TickCounter = (TickCounter + 1) % 100;
+//
+// Overflow check: (TickCounter + 1) <= 100; PeriodQpc at 1 ms / 48 kHz
+// ≈ QpcFrequency / 1000 (typically 1e4 on x64). Worst-case product
+// 100 * 1e4 * 63 = 6.3e7 frames, well within LONGLONG range.
+//
+// Behavior under TickCounter == 0:
+//   - First firing of a session: post-RtlZeroMemory state. BaselineQpc
+//     was 0 (now set to nowQpcRaw). NextTickQpc = nowQpcRaw + correction.
+//   - 100th firing wraps via (99 + 1) % 100 = 0; the next firing then
+//     re-arms BaselineQpc against fresh nowQpcRaw, capping integer
+//     growth and re-syncing against scheduler reality.
+//=============================================================================
+static VOID
+apply_drift_correction(PAO_TRANSPORT_ENGINE engine, LONGLONG nowQpcRaw)
+{
+    if (engine->TickCounter == 0)
+    {
+        engine->BaselineQpc = nowQpcRaw;
+    }
+
+    LONGLONG correctedDelta =
+        ((LONGLONG)(engine->TickCounter + 1) * engine->PeriodQpc * 63LL) / 64LL;
+    engine->NextTickQpc = engine->BaselineQpc + correctedDelta;
+    engine->LastTickQpc = nowQpcRaw;
+
+#if DBG
+    {
+        LONG remaining = InterlockedDecrement(&g_AoTeDbg6364Budget);
+        if (remaining >= 0)
+        {
+            DbgPrint("[AoTe6364] tick=%u base=%lld now=%lld next=%lld last=%lld\n",
+                     engine->TickCounter,
+                     engine->BaselineQpc,
+                     nowQpcRaw,
+                     engine->NextTickQpc,
+                     engine->LastTickQpc);
+        }
+    }
+#endif
+
+    engine->TickCounter = (engine->TickCounter + 1) % 100U;
+}
+
+//=============================================================================
 static VOID
 AoTransportTimerCallback(
     _In_ PEX_TIMER Timer,
@@ -730,6 +916,24 @@ AoTransportTimerCallback(
 
     LARGE_INTEGER now = KeQueryPerformanceCounter(NULL);
 
+    // Phase 3 Step 5: ADR-007 Decision 2 -- 63/64 phase correction.
+    // Apply BEFORE the active-list traversal, under EngineLock, so the
+    // updated NextTickQpc is the cadence reference for every per-stream
+    // due computation in this firing. apply_drift_correction is the
+    // sole mutator of BaselineQpc / TickCounter / LastTickQpc /
+    // NextTickQpc; the helper and query path do not touch them.
+    apply_drift_correction(&g_AoTransportEngine, now.QuadPart);
+
+    // Cadence reference for per-stream overdue computation. Was raw
+    // now.QuadPart prior to Step 5; rebound to the corrected engine
+    // deadline so per-stream cadence tracks the corrected engine
+    // cadence rather than raw scheduler jitter. Per-stream
+    // rt->NextEventQpc virtual-tick replay semantics are unchanged --
+    // the reference only changes WHICH wall-clock corresponds to the
+    // current firing, not how virtual ticks are budgeted from
+    // rt->NextEventQpc onward.
+    const LONGLONG cadenceRefQpc = g_AoTransportEngine.NextTickQpc;
+
     PLIST_ENTRY entry = g_AoTransportEngine.ActiveStreams.Flink;
     while (entry != &g_AoTransportEngine.ActiveStreams && dueCount < 16)
     {
@@ -752,7 +956,7 @@ AoTransportTimerCallback(
             continue;
         }
 
-        if (now.QuadPart < rt->NextEventQpc)
+        if (cadenceRefQpc < rt->NextEventQpc)
         {
             continue;
         }
@@ -764,9 +968,11 @@ AoTransportTimerCallback(
         LONGLONG baseTickQpc = rt->NextEventQpc;
 
         // Compute overdue ticks including the one we are about to run.
-        // `1 +` because at `now == NextEventQpc` exactly we still owe the
-        // stream one tick; anything past that is bonus catch-up.
-        LONGLONG behindQpc = now.QuadPart - rt->NextEventQpc;
+        // `1 +` because at `cadenceRefQpc == NextEventQpc` exactly we
+        // still owe the stream one tick; anything past that is bonus
+        // catch-up. cadenceRefQpc = corrected engine NextTickQpc
+        // (Step 5 rebind).
+        LONGLONG behindQpc = cadenceRefQpc - rt->NextEventQpc;
         ULONG    overdueTicks =
             1U + (ULONG)(behindQpc / rt->EventPeriodQpc);
 
@@ -1004,10 +1210,15 @@ AoResetFadeCounter(AO_STREAM_RT* rt)
 //-----------------------------------------------------------------------------
 // AoCableResetRuntimeFields — STOP/destructor reset of the Y cable
 // runtime state. Matches the VB 669c caller-side pattern: clears the
-// DMA cursor, monotonic counters, anchor QPC, published frames, and
-// fade state. Does NOT touch legacy Step 1 fields (DmaProducedMono,
-// DmaConsumedMono, NextEventQpc, LateEventCount, etc.) — those stay
-// owned by the Step 1 scaffold until Y2/Y3 retire it.
+// DMA cursor, monotonic counters, anchor QPC, published frames, fade
+// state, and the legacy producer/consumer baselines (DmaProducedMono,
+// DmaConsumedMono). Producer/consumer reset is STOP/destructor scope
+// only -- PAUSE -> RUN preserves both so the helper's first
+// post-resume seed captures LegacyAnchorFrames from the preserved
+// post-pause DmaProducedMono (Phase 3 Step 4 lifecycle, see
+// AoTransportOnRunEx). Does NOT touch other Step 1 scaffold fields
+// (NextEventQpc, LateEventCount, etc.) — those stay owned by the
+// Step 1 scaffold until Y2/Y3 retire it.
 //
 // Notification fields (NotifyBoundaryBytes, NotifyArmed, NotifyFired)
 // are ALL preserved across STOP. Verified against VB Ghidra decompile
@@ -1048,17 +1259,31 @@ AoCableResetRuntimeFields(AO_STREAM_RT* rt)
     rt->LastAdvanceDelta   = 0;
     rt->StatOverrunCounter = 0;
 
+    // Phase 3 Step 4: divergence anchor reset on STOP / destructor.
+    // RUN -> STOP -> RUN starts a fresh divergence window (next helper
+    // call will re-seed LegacyAnchorFrames in the AnchorQpc100ns == 0
+    // branch). DbgShadowDivergenceHits is intentionally NOT reset here
+    // -- monotonic diagnostic counter, matches DbgShadow{Advance,Query,
+    // Timer}Hits policy (zeroed only at AoTransportAllocStreamRt via
+    // RtlZeroMemory).
+    rt->LegacyAnchorFrames = 0;
+
     // Notification fields (NotifyBoundaryBytes, NotifyArmed, NotifyFired)
     // are intentionally NOT reset here — see function header comment for
     // the VB parity verification that led to this rule.
 
     // Phase 6 Y2-2: clear the render audible switch on STOP. OnRunEx
     // re-sets it for cable render streams on the next RUN. Also zero
-    // DmaProducedMono — helper is the sole writer for cable render in
-    // Y2-2, and a stale post-STOP value would make the helper read
-    // wrong DMA offsets after resume.
+    // DmaProducedMono and DmaConsumedMono so a fresh stream session
+    // (after STOP / destructor) starts with the legacy producer/
+    // consumer baselines aligned at zero. PAUSE -> RUN does NOT come
+    // through here: the legacy producer baseline must survive a
+    // pause/resume cycle so the helper's QPC-anchored elapsed and the
+    // legacy m_ullLinearPosition-anchored elapsed land on the same
+    // value (Phase 3 Step 4 lifecycle, see AoTransportOnRunEx).
     rt->RenderAudibleActive = FALSE;
     InterlockedExchange64(&rt->DmaProducedMono, 0);
+    rt->DmaConsumedMono     = 0;
 
     // Fade state — reset so the next audible run starts with a fresh
     // silence prefix. AoResetFadeCounter is intentionally inlined here
@@ -1212,22 +1437,39 @@ AoCableWriteRenderFromDma(AO_STREAM_RT* rt, ULONG advanceFrames)
 }
 
 //-----------------------------------------------------------------------------
-// AoCableAdvanceByQpc — Y1B shadow body.
+// AoCableAdvanceByQpc -- Phase 3 Step 1 shadow body.
 //
-// Direct translation of VB FUN_140006320 per results/phase6_vb_verification.md
-// §2. Runs at any IRQL ≤ DISPATCH_LEVEL. Not called from anywhere in
-// Y1B — Y1C wires GetPosition / GetPositions / shared timer DPC.
+// Direct translation of VB FUN_140006320 per
+// results/phase6_vb_verification.md section 2. Runs at any IRQL
+// <= DISPATCH_LEVEL.
 //
-// SHADOW RULE: this function writes ONLY the Y-specific shadow fields
-// listed in the file header comment above. It never writes
-// DmaProducedMono, DmaConsumedMono, NextEventQpc, or any legacy
-// authoritative state. It never calls into FRAME_PIPE.
+// SHADOW RULE: this function writes ONLY shadow fields
+// (LastAdvanceDelta, PublishedFramesSinceAnchor, AnchorQpc100ns on
+// rebase, DmaCursorFrames / DmaCursorFramesPrev shadow cursor,
+// DbgShadow*Hits, StatOverrunCounter, retained scaffold fields)
+// inside the per-stream PositionLock. It never writes
+// MonoFramesLow / MonoFramesMirror -- audible owner is the legacy
+// CMiniportWaveRTStream::UpdatePosition path until Phase 4 (render
+// flip) and Phase 5 (capture flip). It never writes DmaProducedMono,
+// DmaConsumedMono, NextEventQpc, or any other authoritative state.
 //
-// Race discipline in Y1B: single-threaded shadow updates are good
-// enough (double counting would only affect DbgShadow* diagnostics).
-// Y2 will wrap real cursor advancement in a per-stream spinlock when
-// audible ownership arrives. For now we rely on Interlocked* on the
-// volatile counters and tolerate minor races on ULONGLONG cursors.
+// In Phase 3 the retained RenderAudibleActive scaffold below is
+// unreachable because RenderAudibleActive is forced FALSE in
+// AoTransportOnRunEx. The scaffold's AoCableWriteRenderFromDma
+// call would touch FRAME_PIPE / DMA / scratch linearization; this
+// body must not run that scaffold under PositionLock. Phase 4 must
+// re-author that call path (move it outside PositionLock or
+// redesign locking) BEFORE enabling the gate. The 63/64 phase
+// correction is timer-DPC-owned (ADR-007 Decision 2, Phase 3
+// Step 5) and is not invoked from this body.
+//
+// PositionLock discipline: KeAcquireSpinLockRaiseToDpc on entry,
+// KeReleaseSpinLock on every return path. DbgShadow*Hits is bumped
+// immediately after lock acquisition and counts every effective
+// helper invocation -- anchor-seed, qpc-backwards, rebase,
+// gate-fail, overrun-bail, and main-success. The pre-lock guards
+// (null rt, SampleRate==0, invalid QPC frequency) do not bump
+// DbgShadow*Hits because the helper is not effectively reached.
 //-----------------------------------------------------------------------------
 extern "C" VOID
 AoCableAdvanceByQpc(
@@ -1238,14 +1480,28 @@ AoCableAdvanceByQpc(
 {
     UNREFERENCED_PARAMETER(flags);
 
+    // Pre-lock guards. The helper cannot execute meaningfully when any
+    // of these holds, so DbgShadow*Hits stays unbumped and the lock is
+    // not acquired.
     if (rt == NULL || rt->SampleRate == 0)
     {
         return;
     }
+    if (g_AoTeQpcFrequency <= 0)
+    {
+        return;
+    }
 
-    // Unconditional "helper was reached" counter — Y1C gate uses the
-    // per-reason counters below for a finer breakdown, this one is the
-    // aggregate.
+    // Acquire per-stream PositionLock for all advance state reads and
+    // writes below. KeAcquireSpinLockRaiseToDpc returns the prior IRQL
+    // -- capture it so KeReleaseSpinLock restores correctly on every
+    // return path.
+    KIRQL oldIrql = KeAcquireSpinLockRaiseToDpc(&rt->PositionLock);
+
+    // Helper invocation counter -- bumped immediately after lock
+    // acquisition so Phase 3 Step 2 / Step 3 can prove every query /
+    // timer call source reached the helper. Includes every path past
+    // the pre-lock guards.
     InterlockedIncrement(&rt->DbgShadowAdvanceHits);
 
     switch (reason)
@@ -1265,40 +1521,127 @@ AoCableAdvanceByQpc(
     // --- QPC raw -> 100ns conversion ---
     // VB 6320 does ((arg_r8 * 10M) + (arg_rdx * 10M)) / freq. The
     // caller passes a single monotonic QPC counter so we collapse to
-    // one 10M-scale conversion. Use the cached QPC frequency captured
-    // at engine init.
-    if (g_AoTeQpcFrequency <= 0)
-    {
-        return;
-    }
-
+    // one 10M-scale conversion against the cached QPC frequency from
+    // engine init.
     ULONGLONG nowQpc100ns =
         (nowQpcRaw * 10000000ULL) / (ULONGLONG)g_AoTeQpcFrequency;
 
-    // --- Elapsed frames since anchor ---
-    // First invocation (anchor == 0) seeds the anchor and bails out
-    // without recording a frame delta — the next call will establish
-    // the real baseline. This matches VB's startup gate behavior in
-    // FUN_1400068ac (+0x190 == 0 branch).
+    // --- First-call anchor seed (explicit branch) ---
+    // Seed the anchor and bail; the next call establishes the real
+    // baseline. Kept as a separate branch rather than folded into the
+    // long-window rebase below: relying on the unsigned subtraction
+    // (nowQpc100ns - 0 == nowQpc100ns) to fall into rebase risks
+    // multiplication overflow in the elapsed-frames probe and obscures
+    // intent.
     if (rt->AnchorQpc100ns == 0)
     {
         rt->AnchorQpc100ns             = nowQpc100ns;
         rt->PublishedFramesSinceAnchor = 0;
+        rt->LastAdvanceDelta           = 0;
+        // Step 4: seed LegacyAnchorFrames from current legacy frames so
+        // the next QUERY compare measures helper/legacy advance against
+        // the same anchor. ULONGLONG to avoid 32-bit wrap on long
+        // sessions (4G frames at 48 kHz = ~25 hours). Skip compare on
+        // this seed tick.
+        if (rt->BlockAlign > 0)
+        {
+            rt->LegacyAnchorFrames =
+                (ULONGLONG)rt->DmaProducedMono / (ULONGLONG)rt->BlockAlign;
+        }
+        else
+        {
+            rt->LegacyAnchorFrames = 0;
+        }
+        KeReleaseSpinLock(&rt->PositionLock, oldIrql);
         return;
     }
 
-    LONGLONG  qpc100nsDelta    = (LONGLONG)(nowQpc100ns - rt->AnchorQpc100ns);
+    // --- Phase 3 Step 4: Unexpected backwards-baseline defense ---
+    // PAUSE -> RUN preserves AO_STREAM_RT, the helper anchor quartet,
+    // and the legacy DmaProducedMono / DmaConsumedMono baselines (see
+    // AoTransportOnRunEx). The expected lifecycle therefore never
+    // makes legacyFramesAbs go below LegacyAnchorFrames -- legacy
+    // bytes are monotonic from STOP-reset (LegacyAnchorFrames seeded
+    // = current legacy at the next first-call seed) up to the next
+    // STOP / destructor.
+    //
+    // This branch is a defense-in-depth for unexpected backwards
+    // motion: a future cleanup path or refactor that resets
+    // DmaProducedMono outside AoCableResetRuntimeFields, an
+    // out-of-band InterlockedExchange64 that fires before the helper
+    // catches up, or a producer-side reorder that briefly publishes
+    // a smaller value. If observed, treat the tick like a fresh
+    // anchor seed: re-anchor QPC and both frame baselines, return
+    // without bump.
+    //
+    // EngineLock is NOT held here; this guard sits inside PositionLock
+    // only. AoCableResetRuntimeFields runs from OnStopEx after
+    // EngineLock release, so there is no lock-graph interaction.
+    if (rt->BlockAlign > 0)
+    {
+        ULONGLONG currentLegacyFrames =
+            (ULONGLONG)rt->DmaProducedMono / (ULONGLONG)rt->BlockAlign;
+        if (currentLegacyFrames < rt->LegacyAnchorFrames)
+        {
+            rt->AnchorQpc100ns             = nowQpc100ns;
+            rt->PublishedFramesSinceAnchor = 0;
+            rt->LegacyAnchorFrames         = currentLegacyFrames;
+            rt->LastAdvanceDelta           = 0;
+            KeReleaseSpinLock(&rt->PositionLock, oldIrql);
+            return;
+        }
+    }
+
+    // --- Backwards-clock defensive guard ---
+    // KeQueryPerformanceCounter is expected to be monotonic. If it
+    // ever isn't (clock retrograde, QPC source change), bail without
+    // advancing state. DbgShadow*Hits is already bumped above.
+    LONGLONG qpc100nsDelta = (LONGLONG)(nowQpc100ns - rt->AnchorQpc100ns);
     if (qpc100nsDelta <= 0)
     {
-        // Clock went backwards or stayed put — nothing to advance.
+        KeReleaseSpinLock(&rt->PositionLock, oldIrql);
         return;
     }
 
-    LONGLONG  elapsedFrames64  =
+    // --- Elapsed frames probe ---
+    LONGLONG elapsedFrames64 =
         (qpc100nsDelta * (LONGLONG)rt->SampleRate) / 10000000LL;
 
     if (elapsedFrames64 < 0)
     {
+        KeReleaseSpinLock(&rt->PositionLock, oldIrql);
+        return;
+    }
+
+    // --- Long-window rebase BEFORE advance compute ---
+    // ADR-007 helper-owned drift mechanism. When elapsed frames exceed
+    // sampleRate << 7 (~128 s of stream time at any rate), reset the
+    // anchor to the current QPC and zero PublishedFramesSinceAnchor.
+    // The rebase tick consumes itself: release the lock and return so
+    // the next call computes a fresh, small elapsed against the new
+    // anchor. Earlier code performed the rebase AFTER advance compute
+    // and fell through; that republished the OLD elapsed into
+    // PublishedFramesSinceAnchor and made the next call see an
+    // underflowed advance.
+    if (elapsedFrames64 >= ((LONGLONG)rt->SampleRate << AO_CABLE_REBASE_SHIFT))
+    {
+        rt->AnchorQpc100ns             = nowQpc100ns;
+        rt->PublishedFramesSinceAnchor = 0;
+        rt->LastAdvanceDelta           = 0;
+        // Step 4: re-seed LegacyAnchorFrames at the same point the helper
+        // resets PublishedFramesSinceAnchor so the next QUERY compare uses
+        // a consistent anchor pair. ULONGLONG, see seed branch comment
+        // above. Skip compare on this rebase tick.
+        if (rt->BlockAlign > 0)
+        {
+            rt->LegacyAnchorFrames =
+                (ULONGLONG)rt->DmaProducedMono / (ULONGLONG)rt->BlockAlign;
+        }
+        else
+        {
+            rt->LegacyAnchorFrames = 0;
+        }
+        KeReleaseSpinLock(&rt->PositionLock, oldIrql);
         return;
     }
 
@@ -1307,36 +1650,27 @@ AoCableAdvanceByQpc(
     // --- 8-frame minimum gate (VB: cmp ebx,8; jl end) ---
     if (advance < (LONG)AO_CABLE_MIN_FRAMES_GATE)
     {
+        KeReleaseSpinLock(&rt->PositionLock, oldIrql);
         return;
-    }
-
-    // --- 127-frame rebase (VB: elapsed >= sampleRate << 7) ---
-    // Reset the anchor once the accumulated frame count exceeds
-    // ~2.7 seconds (at 48 kHz) to prevent the 100ns arithmetic from
-    // losing precision over long-running streams.
-    if (elapsedFrames64 >= ((LONGLONG)rt->SampleRate << AO_CABLE_REBASE_SHIFT))
-    {
-        rt->PublishedFramesSinceAnchor = 0;
-        rt->AnchorQpc100ns             = nowQpc100ns;
     }
 
     // --- 0.5s overrun reject (VB: advance > sampleRate/2) ---
     // If this single advance would move more than half a second of
     // frames, treat it as a stall recovery and reject the move. Bump
-    // the overrun stat so Y1C shadow diagnostics show how often the
-    // path would have bailed if audible ownership were active.
+    // the overrun stat so shadow diagnostics show how often the path
+    // would have bailed if audible ownership were active.
     if ((ULONG)advance > (rt->SampleRate / AO_CABLE_OVERRUN_DIVISOR))
     {
         rt->StatOverrunCounter++;
+        KeReleaseSpinLock(&rt->PositionLock, oldIrql);
         return;
     }
 
     // --- Shadow cursor update ---
     // VB 6320 advances +0xD0 by `advance` frames modulo buffer size.
-    // In Y1B the wrap uses RingSizeFrames which is still zero (Y1A
-    // didn't populate it — Y1C seeds it from the stream format). Fall
-    // back to unwrapped advancement when ring size is unknown so the
-    // shadow cursor still grows monotonically for observation.
+    // RingSizeFrames is seeded from the stream format; fall back to
+    // unwrapped advancement when ring size is unknown so the shadow
+    // cursor still grows monotonically for observation.
     rt->DmaCursorFramesPrev = rt->DmaCursorFrames;
     if (rt->RingSizeFrames > 0)
     {
@@ -1349,82 +1683,253 @@ AoCableAdvanceByQpc(
     }
 
     // --- Y2-1.5 render byte diff diagnostic (cable render only) ---
-    // Bump helper's cumulative render-byte total and update the max
-    // |helper - legacy| diff observed so far. Legacy side is bumped by
-    // CMiniportWaveRTStream::UpdatePosition after its block-align step.
-    // See AO_STREAM_RT comments for interpretation rules. The helper
-    // runs for both query and timer reasons, so cumulative helper
-    // counter grows faster than legacy cumulative whenever a timer
-    // tick fires without a matching UpdatePosition — that is normal
-    // and reflected in the diff reading. The meaningful signal is
-    // whether the two cumulatives converge over multi-second windows,
-    // not whether they match on any single advance call.
+    // Phase 3 Step 4: the public divergence metric for Step 4 is the
+    // QUERY-only frame-cumulative compare against LegacyAnchorFrames,
+    // applied below at the end of the helper. The Y2 byte-cumulative
+    // diff (helper bytes vs UpdatePosition bytes) is retained for
+    // Phase 4 audible-flip rollback verification but its
+    // DbgY2RenderMismatchHits bump is suppressed -- having two
+    // similarly-named "mismatch" counters with different semantics
+    // confuses reviewers. helperBytes / legacyBytes / DiffMax are
+    // still updated so Phase 4 can compare cumulative byte totals
+    // before the audible flip; only the per-call mismatch counter is
+    // the no-op. ShDiv (DbgShadowDivergenceHits) is the single public
+    // helper-vs-legacy signal Step 4 onward.
     if (rt->IsCable && !rt->IsCapture && rt->BlockAlign > 0)
     {
         LONGLONG advanceBytes = (LONGLONG)advance * (LONGLONG)rt->BlockAlign;
         LONGLONG newHelper    =
             InterlockedAdd64(&rt->DbgY2HelperRenderBytes, advanceBytes);
 
-        // Volatile read of the legacy counter — single 64-bit load on
-        // x64 is atomic enough for a diagnostic snapshot. We do not
-        // need a strict happens-before edge here; worst case the diff
-        // reads a slightly stale legacy total and the next helper
-        // entry records a more up-to-date one.
+        // Volatile read of the legacy counter -- single 64-bit load on
+        // x64 is atomic enough for a diagnostic snapshot.
         LONGLONG legacy  = rt->DbgY2LegacyRenderBytes;
         LONGLONG diff    = newHelper - legacy;
         LONGLONG absDiff = (diff < 0) ? -diff : diff;
 
-        // Max update is best-effort — a racing writer could overwrite
-        // with a smaller value, but over time the true max will land.
         if (absDiff > rt->DbgY2RenderByteDiffMax)
         {
             rt->DbgY2RenderByteDiffMax = absDiff;
         }
-        if (diff != 0)
-        {
-            InterlockedIncrement(&rt->DbgY2RenderMismatchHits);
-        }
+        // Phase 3 Step 4: per-call mismatch bump suppressed; see comment
+        // block above. The single public divergence signal is
+        // DbgShadowDivergenceHits, computed at the end of the helper
+        // for QUERY reasons only.
     }
 
-    // --- Y2-1 render audible path (switch off by default) ---
-    // When RenderAudibleActive is TRUE, the helper owns the DMA ->
-    // FRAME_PIPE transfer for cable render streams. In Y2-1 this flag
-    // is never set, so the call is dead code for diagnostic build
-    // purposes — compiles, links, passes kernel verifier, but never
-    // executes. Y2-2 is the commit that flips the switch and retires
-    // legacy ReadBytes ownership. Gated on IsCable && !IsCapture so
-    // capture streams (which enter the same helper) skip it.
+    // --- Render audible path gate (scaffold, unreachable in Phase 3) ---
+    // RenderAudibleActive is forced FALSE in AoTransportOnRunEx for
+    // every stream during Phase 3, so this gate never enters and
+    // AoCableWriteRenderFromDma is dead in the running driver. Helper
+    // operates in shadow mode only; cable render audible ownership
+    // remains on the legacy CMiniportWaveRTStream::UpdatePosition ->
+    // ReadBytes path. The gate and the function body are retained as
+    // scaffold for Phase 4, where the audible flip lands in a single
+    // commit per ADR-006 / REVIEW_POLICY (no two-commit ownership
+    // split). Not removed in Step 1.
+    //
+    // LOCK BOUNDARY WARNING: this gate runs while PositionLock is held.
+    // AoCableWriteRenderFromDma touches FRAME_PIPE / DMA / scratch
+    // linearization, none of which is presently designed to execute
+    // inside per-stream PositionLock. Phase 4 must re-author this
+    // call path (move it outside PositionLock or redesign locking)
+    // BEFORE enabling RenderAudibleActive. Failing to do so risks
+    // holding PositionLock across blocking ring operations.
     if (rt->RenderAudibleActive && rt->IsCable && !rt->IsCapture)
     {
         AoCableWriteRenderFromDma(rt, (ULONG)advance);
     }
 
     // --- Packet notification check (shadow only) ---
-    // VB fires [+0x8188] when the cursor crosses +0x7C. In Y1B we do
-    // NOT dispatch the callback — shared-mode clients never arm this
-    // path (NotifyArmed stays 0), and event-driven clients are still
-    // served by the legacy PortCls contract. We keep the predicate
-    // here so Y1C can observe boundary crossings in diagnostic logs
-    // without calling into portcls.
+    // VB fires [+0x8188] when the cursor crosses +0x7C. We do NOT
+    // dispatch the callback in Phase 3 -- shared-mode clients never
+    // arm this path (NotifyArmed stays 0), and event-driven clients
+    // are still served by the legacy PortCls contract. The predicate
+    // is kept so Step 4 / Phase 7 can observe boundary crossings in
+    // diagnostic logs without calling into portcls.
     if (rt->NotifyArmed && !rt->NotifyFired && rt->RingSizeFrames > 0)
     {
         if ((rt->DmaCursorFrames % rt->RingSizeFrames) == rt->NotifyBoundaryBytes)
         {
             rt->NotifyFired = 1;
-            // Intentionally no call-through in Y1B. Y3 will decide
-            // whether event-driven clients need direct dispatch here
-            // or whether the portcls contract handles it upstream.
         }
     }
 
-    // --- Monotonic counter mirror (VB +0xE0/+0xE8) ---
-    // Both counters receive the same delta. Volatile + interlocked
-    // add so a concurrent shadow reader cannot observe a torn 64-bit
-    // mid-write value — matches VB's single-writer-under-lock pattern
-    // without needing the per-stream spinlock Y2 will introduce.
-    InterlockedAdd64(&rt->MonoFramesLow,    (LONGLONG)advance);
-    InterlockedAdd64(&rt->MonoFramesMirror, (LONGLONG)advance);
+    // MonoFramesLow / MonoFramesMirror mutation: REMOVED per Phase 3
+    // shadow invariant (step1.md "What This Step Does NOT Do").
+    // GetPosition continues to read these fields from the legacy
+    // UpdatePosition path until Phase 4 (render flip) / Phase 5
+    // (capture flip).
 
     rt->LastAdvanceDelta           = advance;
     rt->PublishedFramesSinceAnchor = (ULONG)elapsedFrames64;
+
+    // --- Phase 3 Step 4: QUERY-only shadow divergence compare ---
+    // Reached only on the success path (after seed / rebase / gate /
+    // overrun bail-outs returned earlier), so housekeeping ticks are
+    // already excluded from the bump count.
+    //
+    // QUERY-after-legacy ordering invariant: GetPosition / GetPositions
+    // call UpdatePosition(ilQPC) BEFORE AoCableAdvanceByQpc(... QUERY ...)
+    // for cable streams, so DmaProducedMono is freshly published for
+    // the same QPC the helper just consumed.
+    //
+    // Tolerance:
+    //   toleranceFrames = ceil(SampleRate / 1000) + AO_CABLE_MIN_FRAMES_GATE
+    //
+    // Two terms with distinct meaning:
+    //   ceil(SampleRate / 1000) = 1 ms-worth of frames at the stream
+    //                              rate. Bounds legacy's
+    //                              m_hnsElapsedTimeCarryForward residual
+    //                              (legacy `UpdatePosition` accumulates
+    //                              `m_ullLinearPosition` via ms-quantized
+    //                              math; the carry holds < 1 ms of
+    //                              not-yet-applied wall time).
+    //   AO_CABLE_MIN_FRAMES_GATE = helper's 8-frame minimum gate
+    //                              (ADR-007), the per-call helper noise
+    //                              floor.
+    // Sum: 48 kHz -> 48 + 8 = 56, 44.1 kHz -> 45 + 8 = 53,
+    //      96 kHz -> 96 + 8 = 104.
+    //
+    // Helper is NOT pulled down to legacy's ms math; this is the
+    // measurement allowance for comparing two different time-quantization
+    // models. See AO_STREAM_RT field comments for the full rationale.
+    //
+    // Active gate: a non-RUN query (KSSTATE_PAUSE / KSSTATE_STOP) reads
+    // a stale `DmaProducedMono` while the helper continues advancing
+    // PublishedFramesSinceAnchor against a new QPC delta -- skip the
+    // compare so housekeeping queries during state transitions do not
+    // bump.
+    //
+    // TIMER / PACKET reasons skip the compare because legacy publish
+    // cadence is decoupled from the 1 ms transport timer; per-call
+    // helper-vs-legacy comparison would explode under cadence skew.
+    // Step 3 evidence covers timer cadence agreement separately.
+    if (reason == AO_ADVANCE_QUERY && rt->IsCable && rt->Active &&
+        rt->BlockAlign > 0)
+    {
+        ULONGLONG legacyFramesAbs =
+            (ULONGLONG)rt->DmaProducedMono / (ULONGLONG)rt->BlockAlign;
+        // Anchor-relative frame counts. Unsigned subtraction is fine:
+        // LegacyAnchorFrames was sampled <= legacyFramesAbs at seed /
+        // rebase, and DmaProducedMono is monotonic.
+        ULONGLONG legacySinceAnchor = legacyFramesAbs - rt->LegacyAnchorFrames;
+        ULONGLONG helperSinceAnchor = (ULONGLONG)rt->PublishedFramesSinceAnchor;
+
+        ULONGLONG absDiff = (helperSinceAnchor > legacySinceAnchor)
+            ? (helperSinceAnchor - legacySinceAnchor)
+            : (legacySinceAnchor - helperSinceAnchor);
+
+        ULONG toleranceFrames =
+            ((rt->SampleRate + 999U) / 1000U) + AO_CABLE_MIN_FRAMES_GATE;
+
+        if (absDiff > (ULONGLONG)toleranceFrames)
+        {
+            InterlockedIncrement(&rt->DbgShadowDivergenceHits);
+        }
+    }
+
+    KeReleaseSpinLock(&rt->PositionLock, oldIrql);
+}
+
+//=============================================================================
+// AoTransportSnapshotShadowCounters -- read-only telemetry export of
+// AO_STREAM_RT::DbgShadow{Advance,Query,Timer}Hits for every currently
+// registered cable stream. Called from adapter.cpp's
+// IOCTL_AO_GET_STREAM_STATUS handler at PASSIVE_LEVEL but is itself
+// DISPATCH_LEVEL safe (takes g_AoTransportEngine.Lock at DPC IRQL).
+//
+// Stream identity mapping:
+//   - rt->Pipe == &g_CableAPipe  -> A side
+//   - rt->Pipe == &g_CableBPipe  -> B side
+//   - rt->IsCapture              -> _Capture vs _Render slot
+//
+// Counter read uses InterlockedCompareExchange(&val, 0, 0) so the read is
+// atomic against the InterlockedIncrement writers in AoCableAdvanceByQpc;
+// g_AoTransportEngine.Lock is held only for ActiveStreams list stability,
+// not for serializing the counter values themselves.
+//
+// Single-cable build guard mirrors the adapter.cpp ring-snapshot pattern
+// (lines ~1861/1873 of adapter.cpp). loopback.cpp defines both globals
+// unconditionally, but mirroring the existing guard keeps the symbol
+// reference rules consistent across the driver.
+//=============================================================================
+extern "C" VOID
+AoTransportSnapshotShadowCounters(AO_SHADOW_COUNTERS_SNAPSHOT* out)
+{
+    if (out == NULL)
+    {
+        return;
+    }
+    RtlZeroMemory(out, sizeof(*out));
+
+    if (!g_AoTransportEngine.Initialized)
+    {
+        return;
+    }
+
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&g_AoTransportEngine.Lock, &oldIrql);
+
+    for (PLIST_ENTRY entry = g_AoTransportEngine.ActiveStreams.Flink;
+         entry != &g_AoTransportEngine.ActiveStreams;
+         entry = entry->Flink)
+    {
+        AO_STREAM_RT* rt = CONTAINING_RECORD(entry, AO_STREAM_RT, Link);
+
+        if (!rt->IsCable)
+        {
+            continue;
+        }
+
+        AO_SHADOW_COUNTERS_PER_STREAM* slot = NULL;
+
+#if defined(CABLE_A) || !defined(CABLE_B)
+        if (rt->Pipe == &g_CableAPipe)
+        {
+            slot = rt->IsCapture ? &out->A_Capture : &out->A_Render;
+        }
+#endif
+#if defined(CABLE_B) || !defined(CABLE_A)
+        if (rt->Pipe == &g_CableBPipe)
+        {
+            slot = rt->IsCapture ? &out->B_Capture : &out->B_Render;
+        }
+#endif
+
+        if (slot != NULL)
+        {
+            // Endpoint-aggregate policy: the ABI surface
+            // (A_R_ShadowQueryHits etc.) reads as per-endpoint totals,
+            // so when more than one active AO_STREAM_RT maps to the
+            // same (cable, direction) slot -- e.g. concurrent client
+            // opens against the same endpoint, or a paused stream
+            // that is still on the engine ActiveStreams list while a
+            // new live stream registers -- the counters sum into the
+            // slot. The earlier last-write-wins variant let iteration
+            // order silently mask one of the streams' counters; the
+            // aggregate keeps the per-endpoint reading honest.
+            //
+            // The += sequence is single-threaded against itself: the
+            // snapshot runs inside g_AoTransportEngine.Lock so no
+            // other call to AoTransportSnapshotShadowCounters can
+            // interleave with this loop. 32-bit unsigned wraparound
+            // matches the wrap semantics of the underlying volatile
+            // LONG DbgShadow*Hits counters (monotonic increment with
+            // implicit wrap).
+            slot->ShadowAdvanceHits += (ULONG)InterlockedCompareExchange(
+                &rt->DbgShadowAdvanceHits, 0, 0);
+            slot->ShadowQueryHits += (ULONG)InterlockedCompareExchange(
+                &rt->DbgShadowQueryHits, 0, 0);
+            slot->ShadowTimerHits += (ULONG)InterlockedCompareExchange(
+                &rt->DbgShadowTimerHits, 0, 0);
+            // Phase 3 Step 4: helper-vs-legacy divergence count. Aggregates
+            // per endpoint following the same multi-stream policy as the
+            // hit counters above.
+            slot->ShadowDivergenceHits += (ULONG)InterlockedCompareExchange(
+                &rt->DbgShadowDivergenceHits, 0, 0);
+        }
+    }
+
+    KeReleaseSpinLock(&g_AoTransportEngine.Lock, oldIrql);
 }

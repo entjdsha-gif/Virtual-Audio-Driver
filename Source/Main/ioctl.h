@@ -182,6 +182,65 @@ typedef struct _AO_V2_DIAG {
     ULONG   B_WrapBoundFrames;
     UCHAR   B_UnderrunFlag;
     UCHAR   B_Reserved1[3];
+
+    // Phase 3 Step 2 prep: per-stream shadow helper counters.
+    // Sourced from AO_STREAM_RT::DbgShadow{Advance,Query,Timer}Hits via
+    // AoTransportSnapshotShadowCounters() in transport_engine.cpp. The
+    // "Dbg" prefix is dropped on this ABI surface; runtime fields keep
+    // the prefix as a debug-build trace marker.
+    //
+    // Block order matches the Phase 1 V2 diag block order: A_Render,
+    // A_Capture, B_Render, B_Capture. 4 streams * 3 ULONGs = 48 bytes
+    // appended at the V2 tail.
+    //
+    // Backwards compatibility: callers that still pass a Phase 1 / Phase 5
+    // / Phase 6 sized output buffer (116 / 132 / 172 bytes after V1) keep
+    // working because the IOCTL_AO_GET_STREAM_STATUS handler in
+    // adapter.cpp does a partial-write keyed off OutputBufferLength.
+    // StructSize reports the actual bytes written so a consumer can tell
+    // which tier it received.
+    ULONG   A_R_ShadowAdvanceHits;
+    ULONG   A_R_ShadowQueryHits;
+    ULONG   A_R_ShadowTimerHits;
+
+    ULONG   A_C_ShadowAdvanceHits;
+    ULONG   A_C_ShadowQueryHits;
+    ULONG   A_C_ShadowTimerHits;
+
+    ULONG   B_R_ShadowAdvanceHits;
+    ULONG   B_R_ShadowQueryHits;
+    ULONG   B_R_ShadowTimerHits;
+
+    ULONG   B_C_ShadowAdvanceHits;
+    ULONG   B_C_ShadowQueryHits;
+    ULONG   B_C_ShadowTimerHits;
+
+    // Phase 3 Step 4 tail: per-stream shadow divergence counter.
+    // Sourced from AO_STREAM_RT::DbgShadowDivergenceHits via
+    // AoTransportSnapshotShadowCounters. Bumped only on AO_ADVANCE_QUERY
+    // helper invocations (and only while the stream is Active = RUN)
+    // where the helper-vs-legacy frame-anchor cumulative differs by
+    // more than the rate-aware tolerance
+    //   ((SampleRate + 999) / 1000) + AO_CABLE_MIN_FRAMES_GATE
+    // = legacy 1 ms quantization envelope + helper 8-frame gate.
+    // 48 kHz -> 56, 44.1 kHz -> 53, 96 kHz -> 104.
+    // Distinct from the Phase 1 PumpShadowDivergenceCount above
+    // (window-sliding pump-vs-legacy comparison, force-zeroed by
+    // adapter.cpp since the source FRAME_PIPE counter was retired in
+    // Phase 1).
+    //
+    // Block order matches the V2 diag block convention: A_Render,
+    // A_Capture, B_Render, B_Capture. 4 streams * 1 ULONG = 16 bytes
+    // appended at the V2 tail (P8 layout).
+    //
+    // Backwards compatibility: callers that pass a Phase 1 / 5 / 6 / 7
+    // sized output buffer (116 / 132 / 172 / 220 bytes after V1) keep
+    // working because IOCTL_AO_GET_STREAM_STATUS does partial-write keyed
+    // off OutputBufferLength.
+    ULONG   A_R_ShadowDivergenceCount;
+    ULONG   A_C_ShadowDivergenceCount;
+    ULONG   B_R_ShadowDivergenceCount;
+    ULONG   B_C_ShadowDivergenceCount;
 } AO_V2_DIAG;
 
 // Compile-time shape guard. Bump this C_ASSERT whenever AO_V2_DIAG grows.
@@ -189,7 +248,12 @@ typedef struct _AO_V2_DIAG {
 // 4 render-side drive counters (4) + 2 cables * 5 ring-diag ULONG-equivs (10)
 // = 43 ULONGs = 172 bytes. Each cable's UCHAR UnderrunFlag + 3-byte
 // Reserved pad together occupy one ULONG slot.
-C_ASSERT(sizeof(AO_V2_DIAG) == (1 + 4 * 7 + 4 + 2 * 5) * sizeof(ULONG));
+// Phase 3 Step 2 prep tail: 4 streams * 3 shadow-helper-counter ULONGs
+// (12) = 55 ULONGs = 220 bytes (P7 layout).
+// Phase 3 Step 4 tail: 4 streams * 1 ShadowDivergenceCount ULONG (4)
+// = 59 ULONGs = 236 bytes (P8 layout).
+C_ASSERT(sizeof(AO_V2_DIAG) ==
+         (1 + 4 * 7 + 4 + 2 * 5 + 4 * 3 + 4) * sizeof(ULONG));
 
 // Registry value names for persistent settings (stored under service Parameters key)
 // e.g. HKLM\SYSTEM\CurrentControlSet\Services\AOCableA\Parameters
