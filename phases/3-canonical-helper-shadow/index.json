@@ -19,7 +19,9 @@
     {
       "step": 2,
       "name": "wire-query-call-source",
-      "status": "pending"
+      "status": "completed",
+      "completed_at": "2026-05-09T13:44:17+0900",
+      "summary": "GetPosition/GetPositions wired to helper (shadow mode)."
     },
     {
       "step": 3,
