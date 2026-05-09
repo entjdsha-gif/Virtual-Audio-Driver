@@ -1,7 +1,8 @@
 {
   "phase": "3-canonical-helper-shadow",
   "project": "AO Cable V1",
-  "status": "planned",
+  "status": "completed",
+  "completed_at": "2026-05-09",
   "summary": "Canonical AoCableAdvanceByQpc helper body (drift correction, gate, overrun guard, scratch linearization), wired in shadow mode. Audible transport stays on legacy until Phases 4/5.",
   "steps": [
     {
